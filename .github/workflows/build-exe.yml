@@ -25,7 +25,7 @@ jobs:
         run: npm install --legacy-peer-deps
 
       - name: Build Windows Installer (.exe)
-        run: npm run dist
+        run: npm run dist -- --publish never
 
       - name: Publish Release with EXE
         shell: pwsh
@@ -34,7 +34,8 @@ jobs:
         run: |
           $tag = "${{ github.ref_name }}"
           if (-not $tag.StartsWith("v")) { $tag = "v1.0.0" }
-          if (gh release view $tag 2>$null) {
+          gh release view $tag >$null 2>&1
+          if ($LASTEXITCODE -eq 0) {
             gh release upload $tag "release/Crackpilot-Setup.exe" --clobber
           } else {
             gh release create $tag "release/Crackpilot-Setup.exe" --title "Crackpilot $tag" --notes "Windows Installer"
