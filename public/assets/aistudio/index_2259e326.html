@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Crackpilot — Live AI Interview Assist & Prep Workspace</title>
+    <meta
+      name="description"
+      content="Real-time interview preparation and live-assist workspace for Windows, macOS, and Android. Resume-aware suggestions, mobile QR remote, and pay-per-use credits."
+    />
+    <meta property="og:title" content="Crackpilot — Live AI Interview Assist & Prep Workspace" />
+    <meta
+      property="og:description"
+      content="Real-time interview preparation and live-assist workspace for Windows, macOS, and Android. Resume-aware suggestions, mobile QR remote, and pay-per-use credits."
+    />
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="Crackpilot" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Crackpilot — Live AI Interview Assist & Prep Workspace" />
+    <meta
+      name="twitter:description"
+      content="Real-time interview preparation and live-assist workspace for Windows, macOS, and Android. Pay only for the interview hours you use."
+    />
+    <meta name="theme-color" content="#f3f5ee" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Geist+Mono:wght@400;500&family=Inter:wght@400;500;600;700;800&display=swap"
+      rel="stylesheet"
+    />
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "SoftwareApplication",
+        "name": "Crackpilot",
+        "applicationCategory": "BusinessApplication",
+        "operatingSystem": "Windows, macOS, Android",
+        "description": "Real-time AI interview preparation and live-assist tool with resume-aware suggestions, screen capture, and mobile remote control.",
+        "offers": {
+          "@type": "Offer",
+          "price": "799",
+          "priceCurrency": "INR"
+        }
+      }
+    </script>
+    <script>
+      (function () {
+        try {
+          var stored = localStorage.getItem('crackpilot-theme-v2');
+          if (stored !== 'light') {
+            document.documentElement.classList.add('dark');
+          } else {
+            document.documentElement.classList.remove('dark');
+          }
+        } catch (e) {}
+      })();
+    </script>
+  </head>
+  <body class="bg-canvas text-ink antialiased selection:bg-accent/40 selection:text-ink">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

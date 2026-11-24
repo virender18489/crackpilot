@@ -1,0 +1,11 @@
+# APP_URL: Public URL of the deployed Crackpilot web app (used for canonical URLs & sitemap)
+APP_URL="http://localhost:3000"
+
+# SESSION_SECRET: Secret string used to sign session cookies (replace in production)
+SESSION_SECRET="change-me-in-production"
+
+# WHATSAPP_NUMBER: Support WhatsApp number in international format without +
+VITE_WHATSAPP_NUMBER="919876543210"
+
+# DEMO_WEBHOOK_URL: Optional webhook/CRM endpoint for Book a Demo submissions
+DEMO_WEBHOOK_URL=""

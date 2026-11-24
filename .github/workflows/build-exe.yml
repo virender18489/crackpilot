@@ -1,0 +1,41 @@
+name: Build Windows EXE
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build Windows Installer (.exe)
+        run: npm run dist
+
+      - name: Publish Release with EXE
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          if (-not $tag.StartsWith("v")) { $tag = "v1.0.0" }
+          if (gh release view $tag 2>$null) {
+            gh release upload $tag "release/Crackpilot-Setup.exe" --clobber
+          } else {
+            gh release create $tag "release/Crackpilot-Setup.exe" --title "Crackpilot $tag" --notes "Windows Installer"
+          }
