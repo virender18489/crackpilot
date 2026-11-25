@@ -21,6 +21,14 @@
   font-variant-numeric: tabular-nums;
 }
 
+/* Native frameless Electron window dragging */
+.app-drag {
+  -webkit-app-region: drag;
+}
+.app-no-drag {
+  -webkit-app-region: no-drag;
+}
+
 /* Subtle dark scrollbar for the HUD feed */
 .hud-scroll::-webkit-scrollbar {
   width: 6px;

@@ -12,14 +12,14 @@ import {
   LayoutDashboard,
   RefreshCw,
   Shield,
-  Terminal,
   X,
 } from "lucide-react";
 import {
-  downloadCrackpilotDesktopKit,
-  downloadCrackpilotExtension,
+  WINDOWS_EXE_FILENAME,
+  WINDOWS_EXE_URL,
   type DownloadPlatform,
 } from "../data/crackpilotPackages";
+import { apiUrl } from "../lib/api";
 import type { SessionTokenState } from "../types";
 
 interface InstallerModalProps {
@@ -43,8 +43,6 @@ export function InstallerModal({
   onOpenDashboard,
   onOpenTestingLab,
 }: InstallerModalProps) {
-  // Stage 0 = Download Complete + Prominent clickable Crackpilot Icon
-  // Stage 1 = Step-by-step Guided Installation Wizard
   const [stage, setStage] = useState<"icon" | "wizard">("icon");
   const [step, setStep] = useState<1 | 2 | 3>(1);
   const [installProgress, setInstallProgress] = useState(0);
@@ -59,12 +57,11 @@ export function InstallerModal({
     }
   }, [open, platform]);
 
-  // Smooth interactive progress animation when user clicks the Crackpilot Icon
   useEffect(() => {
     if (stage !== "wizard" || step !== 1) return;
-    setInstallProgress(15);
-    const t1 = window.setTimeout(() => setInstallProgress(58), 350);
-    const t2 = window.setTimeout(() => setInstallProgress(100), 850);
+    setInstallProgress(20);
+    const t1 = window.setTimeout(() => setInstallProgress(65), 320);
+    const t2 = window.setTimeout(() => setInstallProgress(100), 800);
     return () => {
       window.clearTimeout(t1);
       window.clearTimeout(t2);
@@ -74,9 +71,7 @@ export function InstallerModal({
   if (!open) return null;
 
   const isExtension = platform === "extension";
-  const fileName = isExtension
-    ? "Crackpilot-Browser-Extension.zip"
-    : "Crackpilot-Desktop-Installer-Kit.zip";
+  const fileName = WINDOWS_EXE_FILENAME;
 
   const copyText = async (id: string, text: string) => {
     try {
@@ -91,7 +86,7 @@ export function InstallerModal({
   const handleGenerateTokenInline = async () => {
     setGeneratingToken(true);
     try {
-      const resp = await fetch("/api/token/generate", { method: "POST" });
+      const resp = await fetch(apiUrl("/api/token/generate"), { method: "POST" });
       const data = (await resp.json()) as { token?: SessionTokenState };
       if (resp.ok && data.token) {
         onTokenChange(data.token);
@@ -114,7 +109,7 @@ export function InstallerModal({
               Crackpilot Installer
             </span>
             <span className="font-mono text-[10px] text-[#c6f527] bg-[#1a2210] px-2 py-0.5 rounded">
-              {isExtension ? "Extension" : platform === "macos" ? "macOS" : "Windows 10/11"}
+              {isExtension ? "Extension" : "Windows .exe"}
             </span>
           </div>
           <button
@@ -127,7 +122,7 @@ export function InstallerModal({
           </button>
         </div>
 
-        {/* STAGE 1: Prominent Clickable Crackpilot Icon after Download */}
+        {/* STAGE 1: Prominent Clickable Crackpilot Icon */}
         {stage === "icon" ? (
           <div className="p-6 sm:p-8 text-center space-y-6">
             <div className="inline-flex items-center gap-2 rounded-full border border-emerald-500/30 bg-emerald-500/10 px-3.5 py-1 text-xs font-medium text-emerald-300">
@@ -137,14 +132,12 @@ export function InstallerModal({
 
             <div className="space-y-1.5">
               <h2 className="text-xl font-extrabold text-white">
-                Click the Crackpilot icon to continue installation
+                Click the Crackpilot icon to continue setup
               </h2>
               <p className="text-xs text-zinc-400 max-w-md mx-auto leading-relaxed">
-                Your package includes the branded{" "}
-                <strong className="text-zinc-200">Crackpilot</strong> Desktop
-                icon (<code className="text-[#c6f527]">crackpilot.ico</code>).
-                Click the icon below to walk through the installation &amp;
-                token activation steps.
+                {isExtension
+                  ? "Your browser extension package has downloaded. Click the Crackpilot icon below for quick setup."
+                  : "Crackpilot-Setup.exe (native Windows installer with the Crackpilot icon) has started downloading. Double-click it in your Downloads bar or click the icon below to continue."}
               </p>
             </div>
 
@@ -159,9 +152,11 @@ export function InstallerModal({
                   C
                 </span>
                 <div className="space-y-0.5">
-                  <p className="text-base font-bold text-white">crackpilot</p>
+                  <p className="text-base font-bold text-white">
+                    {isExtension ? "crackpilot" : "Crackpilot-Setup.exe"}
+                  </p>
                   <p className="font-mono text-[11px] text-[#c6f527] inline-flex items-center gap-1">
-                    <span>Click to Install &amp; Setup</span>
+                    <span>Click to Continue Setup</span>
                     <ArrowRight className="h-3 w-3" />
                   </p>
                 </div>
@@ -169,18 +164,14 @@ export function InstallerModal({
             </div>
 
             <div className="flex flex-wrap items-center justify-center gap-3 pt-2 border-t border-white/[0.07]">
-              <button
-                type="button"
-                onClick={() =>
-                  isExtension
-                    ? void downloadCrackpilotExtension()
-                    : void downloadCrackpilotDesktopKit(tokenState?.token)
-                }
+              <a
+                href={WINDOWS_EXE_URL}
+                download={WINDOWS_EXE_FILENAME}
                 className="inline-flex items-center gap-1.5 rounded-lg border border-white/12 bg-white/[0.04] px-3.5 py-2 text-xs text-zinc-300 hover:bg-white/[0.08] cursor-pointer"
               >
                 <Download className="h-3.5 w-3.5" />
-                <span>Download Again</span>
-              </button>
+                <span>Download for Windows (.exe)</span>
+              </a>
               <button
                 type="button"
                 onClick={() => {
@@ -190,18 +181,17 @@ export function InstallerModal({
                 className="inline-flex items-center gap-1.5 rounded-lg border border-white/12 bg-white/[0.04] px-3.5 py-2 text-xs text-[#c6f527] hover:bg-white/[0.08] cursor-pointer"
               >
                 <ExternalLink className="h-3.5 w-3.5" />
-                <span>Launch Web Software Now</span>
+                <span>Open Software Now</span>
               </button>
             </div>
           </div>
         ) : (
           /* STAGE 2: Interactive 3-Step Installation Wizard */
           <div className="p-6 space-y-5">
-            {/* Step Progress Tabs */}
             <div className="grid grid-cols-3 gap-2 text-xs">
               {[
-                { id: 1 as const, label: "1. Install & Icon" },
-                { id: 2 as const, label: "2. Audio & Privacy" },
+                { id: 1 as const, label: "1. Run .exe Setup" },
+                { id: 2 as const, label: "2. Audio & Overlay" },
                 { id: 3 as const, label: "3. Token & Launch" },
               ].map((s) => (
                 <button
@@ -221,15 +211,14 @@ export function InstallerModal({
               ))}
             </div>
 
-            {/* STEP 1: Extract & Run Setup Script / Extension */}
             {step === 1 && (
               <div className="space-y-4">
                 <div className="rounded-xl border border-white/[0.08] bg-[#070a0e] p-4 space-y-2.5">
                   <div className="flex items-center justify-between text-xs">
                     <span className="font-semibold text-white">
                       {installProgress < 100
-                        ? "Preparing Crackpilot installer package..."
-                        : "Package ready for installation"}
+                        ? `Verifying ${fileName}...`
+                        : `${fileName} is ready to run`}
                     </span>
                     <span className="font-mono text-[#c6f527]">
                       {installProgress}%
@@ -250,98 +239,42 @@ export function InstallerModal({
                       <span>Install Browser Extension (Chrome / Edge)</span>
                     </p>
                     <ol className="list-decimal pl-4 space-y-1.5 text-zinc-400">
-                      <li>
-                        Extract <code className="text-zinc-200">{fileName}</code>.
-                      </li>
+                      <li>Extract {fileName}.</li>
                       <li>
                         Open <code className="text-[#c6f527]">chrome://extensions</code> and enable{" "}
                         <strong className="text-white">Developer mode</strong>.
                       </li>
                       <li>
-                        Click <strong className="text-white">Load unpacked</strong> and select the extracted folder.
-                      </li>
-                      <li>
-                        Pin the lime <strong className="text-white">Crackpilot</strong> icon in your toolbar (or press <code className="text-zinc-200">Alt+Shift+C</code>).
+                        Click <strong className="text-white">Load unpacked</strong> and select the folder.
                       </li>
                     </ol>
                   </div>
                 ) : (
-                  <div className="rounded-xl border border-white/[0.08] bg-[#10151c] p-4 space-y-3 text-xs text-zinc-300">
+                  <div className="rounded-xl border border-white/[0.08] bg-[#10151c] p-4 space-y-2.5 text-xs text-zinc-300">
                     <p className="font-semibold text-white flex items-center gap-2">
                       <FolderOpen className="h-4 w-4 text-[#c6f527]" />
-                      <span>
-                        {platform === "macos"
-                          ? "Install on macOS"
-                          : "Install on Windows & Create Desktop Icon"}
-                      </span>
+                      <span>Install Crackpilot-Setup.exe (No ZIP Needed)</span>
                     </p>
                     <ol className="list-decimal pl-4 space-y-2 text-zinc-400">
                       <li>
-                        Right-click{" "}
-                        <code className="text-zinc-200">{fileName}</code> in
-                        your Downloads folder and select{" "}
-                        <strong className="text-white">Extract All</strong>.
+                        Double-click{" "}
+                        <strong className="text-[#c6f527]">
+                          Crackpilot-Setup.exe
+                        </strong>{" "}
+                        in your browser Downloads list.
                       </li>
                       <li>
-                        {platform === "macos" ? (
-                          <span>
-                            Open Terminal in the extracted folder and run{" "}
-                            <code className="text-[#c6f527]">
-                              npm install &amp;&amp; npm start
-                            </code>
-                            .
-                          </span>
-                        ) : (
-                          <span>
-                            Double-click{" "}
-                            <code className="text-[#c6f527]">
-                              INSTALL_AND_CREATE_SHORTCUT_WINDOWS.bat
-                            </code>{" "}
-                            — this installs Electron and places the branded{" "}
-                            <strong className="text-white">Crackpilot</strong>{" "}
-                            icon directly on your Desktop.
-                          </span>
-                        )}
+                        If Windows SmartScreen appears, click{" "}
+                        <strong className="text-white">More info</strong> →{" "}
+                        <strong className="text-white">Run anyway</strong>.
                       </li>
                       <li>
-                        Optional: Build a standalone{" "}
-                        <code className="text-zinc-200">
-                          {platform === "macos"
-                            ? "Crackpilot.dmg"
-                            : "Crackpilot Setup 1.0.0.exe"}
-                        </code>{" "}
-                        installer:
+                        Click <strong className="text-white">OK</strong> —
+                        Crackpilot installs automatically, creates the{" "}
+                        <strong className="text-white">Crackpilot</strong> icon
+                        on your Desktop, and launches the app window!
                       </li>
                     </ol>
-
-                    <div className="flex items-center justify-between gap-2 rounded-lg border border-white/10 bg-[#070a0e] px-3 py-2 font-mono text-[11px] text-[#c6f527]">
-                      <span className="inline-flex items-center gap-2">
-                        <Terminal className="h-3.5 w-3.5 text-zinc-500" />
-                        <span>
-                          {platform === "macos"
-                            ? "npm install && npm run build:mac"
-                            : "npm install && npm run build:win"}
-                        </span>
-                      </span>
-                      <button
-                        type="button"
-                        onClick={() =>
-                          void copyText(
-                            "build",
-                            platform === "macos"
-                              ? "npm install && npm run build:mac"
-                              : "npm install && npm run build:win"
-                          )
-                        }
-                        className="rounded px-2 py-0.5 bg-white/[0.06] text-zinc-200 hover:bg-white/[0.12] cursor-pointer"
-                      >
-                        {copiedCmd === "build" ? (
-                          <Check className="h-3.5 w-3.5 text-[#c6f527]" />
-                        ) : (
-                          <Copy className="h-3.5 w-3.5" />
-                        )}
-                      </button>
-                    </div>
                   </div>
                 )}
 
@@ -358,73 +291,39 @@ export function InstallerModal({
                     onClick={() => setStep(2)}
                     className="inline-flex items-center gap-1.5 rounded-full bg-[#c6f527] px-5 py-2 text-xs font-bold text-[#050709] hover:bg-[#b5e41c] cursor-pointer"
                   >
-                    <span>Next: Audio &amp; Privacy</span>
+                    <span>Next: Audio &amp; Overlay</span>
                     <ArrowRight className="h-3.5 w-3.5" />
                   </button>
                 </div>
               </div>
             )}
 
-            {/* STEP 2: Headphone Audio + OS Screen-Share Privacy */}
             {step === 2 && (
               <div className="space-y-4">
-                <div className="rounded-xl border border-white/[0.08] bg-[#10151c] p-4 space-y-2.5 text-xs">
+                <div className="rounded-xl border border-white/[0.08] bg-[#10151c] p-4 space-y-2 text-xs">
                   <p className="font-semibold text-white flex items-center gap-2">
                     <Headphones className="h-4 w-4 text-[#c6f527]" />
-                    <span>Headphone / WhatsApp / Meet Audio Loopback</span>
+                    <span>Headphone / WhatsApp / Meet Audio</span>
                   </p>
                   <p className="text-zinc-400 leading-relaxed">
-                    To capture interviewer audio even when wearing headphones on
-                    WhatsApp Desktop, Google Meet, Zoom, or Teams, run the
-                    included Python loopback script (or click{" "}
+                    Inside the Crackpilot window, click{" "}
                     <strong className="text-zinc-200">
                       Headphone / Tab Audio
                     </strong>{" "}
-                    inside the Crackpilot overlay):
+                    to capture interviewer speech on Meet, Zoom, Teams, or
+                    WhatsApp Web even while wearing headphones.
                   </p>
-                  <div className="flex items-center justify-between gap-2 rounded-lg border border-white/10 bg-[#070a0e] px-3 py-2 font-mono text-[11px] text-[#c6f527]">
-                    <span className="truncate">
-                      cd python-agent &amp;&amp; pip install -r requirements.txt
-                      &amp;&amp; python audio_listener.py
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() =>
-                        void copyText(
-                          "py",
-                          "cd python-agent && pip install -r requirements.txt && python audio_listener.py"
-                        )
-                      }
-                      className="rounded px-2 py-0.5 bg-white/[0.06] text-zinc-200 hover:bg-white/[0.12] shrink-0 cursor-pointer"
-                    >
-                      {copiedCmd === "py" ? (
-                        <Check className="h-3.5 w-3.5 text-[#c6f527]" />
-                      ) : (
-                        <Copy className="h-3.5 w-3.5" />
-                      )}
-                    </button>
-                  </div>
                 </div>
 
                 <div className="rounded-xl border border-white/[0.08] bg-[#10151c] p-4 space-y-2 text-xs">
                   <p className="font-semibold text-white flex items-center gap-2">
                     <Shield className="h-4 w-4 text-[#c6f527]" />
-                    <span>OS Screen-Share Privacy &amp; Always-On-Top</span>
+                    <span>Always-On-Top Floating Mode</span>
                   </p>
                   <p className="text-zinc-400 leading-relaxed">
-                    The Electron app automatically enables{" "}
-                    <code className="text-zinc-200">
-                      setContentProtection(true)
-                    </code>{" "}
-                    (Windows{" "}
-                    <code className="text-zinc-200">WDA_EXCLUDEFROMCAPTURE</code>
-                    , macOS{" "}
-                    <code className="text-zinc-200">NSWindowSharingNone</code>)
-                    and{" "}
-                    <code className="text-zinc-200">
-                      setAlwaysOnTop(true, &quot;screen-saver&quot;)
-                    </code>
-                    .
+                    Click the pop-out icon in the top-right bar of Crackpilot
+                    (or open Practice Mode / Testing Lab) to float Crackpilot
+                    Always On Top across all browser tabs.
                   </p>
                 </div>
 
@@ -451,7 +350,6 @@ export function InstallerModal({
               </div>
             )}
 
-            {/* STEP 3: Generate / Copy 48h Auth Token + Launch Crackpilot Icon */}
             {step === 3 && (
               <div className="space-y-4">
                 <div className="rounded-xl border border-white/[0.08] bg-[#10151c] p-4 space-y-3">
@@ -497,12 +395,11 @@ export function InstallerModal({
                   </div>
 
                   <p className="text-[11px] text-zinc-400">
-                    Copy this token, open Crackpilot below, paste it to
-                    Authenticate, and click Start Session.
+                    Copy this token, paste it into Crackpilot to Authenticate,
+                    and click Start Session.
                   </p>
                 </div>
 
-                {/* Final Launch Actions */}
                 <div className="flex flex-wrap items-center gap-3 pt-1">
                   <button
                     type="button"

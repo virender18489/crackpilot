@@ -26,7 +26,12 @@ import {
   Upload,
   UserCheck,
 } from "lucide-react";
-import type { DownloadPlatform } from "../data/crackpilotPackages";
+import {
+  WINDOWS_EXE_FILENAME,
+  WINDOWS_EXE_URL,
+  type DownloadPlatform,
+} from "../data/crackpilotPackages";
+import { apiUrl } from "../lib/api";
 import type {
   AnswerLanguage,
   AnswerStyle,
@@ -157,7 +162,7 @@ export function Dashboard({
     setGeneratingToken(true);
     setOverviewNotice(null);
     try {
-      const resp = await fetch("/api/token/generate", { method: "POST" });
+      const resp = await fetch(apiUrl("/api/token/generate"), { method: "POST" });
       const data = (await resp.json()) as {
         token?: SessionTokenState;
         error?: string;
@@ -204,7 +209,7 @@ export function Dashboard({
 
     setStartingSession(true);
     try {
-      const resp = await fetch("/api/session/start", { method: "POST" });
+      const resp = await fetch(apiUrl("/api/session/start"), { method: "POST" });
       const data = (await resp.json()) as {
         token?: SessionTokenState;
         error?: string;
@@ -234,7 +239,7 @@ export function Dashboard({
 
     try {
       const base64 = await fileToBase64(file);
-      const resp = await fetch("/api/profile/extract", {
+      const resp = await fetch(apiUrl("/api/profile/extract"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -273,7 +278,7 @@ export function Dashboard({
     setSavingProfile(true);
     setProfileNotice(null);
     try {
-      const resp = await fetch("/api/profile", {
+      const resp = await fetch(apiUrl("/api/profile"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(draftProfile),
@@ -774,38 +779,41 @@ export function Dashboard({
                     Download Apps &amp; Helpers
                   </p>
                   <div className="grid gap-2.5 sm:grid-cols-2 lg:grid-cols-4">
-                    <button
-                      type="button"
+                    <a
+                      href={WINDOWS_EXE_URL}
+                      download={WINDOWS_EXE_FILENAME}
                       onClick={() => onDownload("windows")}
                       className="inline-flex items-center justify-center gap-2 rounded-lg border border-white/10 bg-[#080b0f] py-2.5 text-xs font-medium text-zinc-200 hover:border-[#c6f527]/50 hover:text-white transition-colors cursor-pointer"
                     >
                       <Monitor className="h-3.5 w-3.5 text-[#c6f527]" />
-                      <span>Windows App</span>
-                    </button>
-                    <button
-                      type="button"
+                      <span>Download for Windows (.exe)</span>
+                    </a>
+                    <a
+                      href={WINDOWS_EXE_URL}
+                      download={WINDOWS_EXE_FILENAME}
                       onClick={() => onDownload("macos")}
                       className="inline-flex items-center justify-center gap-2 rounded-lg border border-white/10 bg-[#080b0f] py-2.5 text-xs font-medium text-zinc-200 hover:border-[#c6f527]/50 hover:text-white transition-colors cursor-pointer"
                     >
                       <Laptop className="h-3.5 w-3.5 text-[#c6f527]" />
                       <span>Mac OS</span>
-                    </button>
+                    </a>
                     <button
                       type="button"
-                      onClick={() => onDownload("extension")}
+                      onClick={onOpenSoftware}
                       className="inline-flex items-center justify-center gap-2 rounded-lg border border-white/10 bg-[#080b0f] py-2.5 text-xs font-medium text-zinc-200 hover:border-[#c6f527]/50 hover:text-white transition-colors cursor-pointer"
                     >
                       <Smartphone className="h-3.5 w-3.5 text-[#c6f527]" />
-                      <span>Extension (.zip)</span>
+                      <span>Web Overlay</span>
                     </button>
-                    <button
-                      type="button"
+                    <a
+                      href={WINDOWS_EXE_URL}
+                      download={WINDOWS_EXE_FILENAME}
                       onClick={() => onDownload("windows")}
                       className="inline-flex items-center justify-center gap-2 rounded-lg border border-white/10 bg-[#080b0f] py-2.5 text-xs font-medium text-zinc-200 hover:border-[#c6f527]/50 hover:text-white transition-colors cursor-pointer"
                     >
                       <Download className="h-3.5 w-3.5 text-[#c6f527]" />
-                      <span>Helper Kit (.zip)</span>
-                    </button>
+                      <span>Crackpilot-Setup.exe</span>
+                    </a>
                   </div>
                 </div>
 
@@ -1278,46 +1286,43 @@ export function Dashboard({
                   <div className="flex items-center gap-2.5">
                     <Monitor className="h-5 w-5 text-[#c6f527]" />
                     <h2 className="text-base font-bold text-white">
-                      Crackpilot Desktop Installer Kit (.zip)
+                      Crackpilot Windows Installer (.exe)
                     </h2>
                   </div>
                   <ol className="list-decimal pl-4 space-y-1.5 text-xs leading-relaxed text-zinc-400">
-                    <li>Extract the downloaded ZIP folder.</li>
+                    <li>
+                      Click download below to save{" "}
+                      <code className="text-[#c6f527]">
+                        Crackpilot-Setup.exe
+                      </code>{" "}
+                      directly (no ZIP extraction required).
+                    </li>
                     <li>
                       Double-click{" "}
                       <code className="text-zinc-200">
-                        INSTALL_AND_CREATE_SHORTCUT_WINDOWS.bat
+                        Crackpilot-Setup.exe
                       </code>{" "}
-                      to install Electron and create a{" "}
-                      <strong className="text-white">Crackpilot</strong> icon on
-                      your Desktop.
+                      and click <strong className="text-white">OK</strong>.
                     </li>
                     <li>
-                      Optional: Run{" "}
-                      <code className="text-zinc-200">npm run build:win</code>{" "}
-                      to compile a standalone{" "}
-                      <code className="text-zinc-200">
-                        Crackpilot Setup 1.0.0.exe
-                      </code>
-                      .
+                      A branded{" "}
+                      <strong className="text-white">Crackpilot</strong> icon is
+                      created automatically on your Desktop.
                     </li>
                     <li>
-                      Run{" "}
-                      <code className="text-zinc-200">
-                        python python-agent/audio_listener.py
-                      </code>{" "}
-                      for automatic headphone loopback capture on WhatsApp,
-                      Meet, Zoom, and Teams.
+                      Paste your 48h Auth Token from Overview to Authenticate
+                      and click Start Session.
                     </li>
                   </ol>
-                  <button
-                    type="button"
+                  <a
+                    href={WINDOWS_EXE_URL}
+                    download={WINDOWS_EXE_FILENAME}
                     onClick={() => onDownload("windows")}
                     className="w-full inline-flex items-center justify-center gap-2 rounded-full bg-[#c6f527] px-4 py-2.5 text-xs font-bold text-[#050709] hover:bg-[#b5e41c] transition-colors cursor-pointer"
                   >
                     <Download className="h-4 w-4" />
-                    <span>Download Desktop Installer Kit (.zip)</span>
-                  </button>
+                    <span>Download for Windows (.exe)</span>
+                  </a>
                 </div>
 
                 <div className="rounded-2xl border border-white/[0.08] bg-[#0c1015] p-6 space-y-4 flex flex-col justify-between">
@@ -1325,38 +1330,32 @@ export function Dashboard({
                     <div className="flex items-center gap-2.5">
                       <Chrome className="h-5 w-5 text-[#c6f527]" />
                       <h2 className="text-base font-bold text-white">
-                        Crackpilot Browser Extension (.zip)
+                        Instant Web Overlay (Always-On-Top)
                       </h2>
                     </div>
                     <ol className="list-decimal pl-4 space-y-1.5 text-xs leading-relaxed text-zinc-400">
-                      <li>Extract the downloaded Extension ZIP folder.</li>
                       <li>
-                        Open{" "}
-                        <code className="text-zinc-200">
-                          chrome://extensions
-                        </code>{" "}
-                        (or Edge Extensions) and enable{" "}
-                        <strong className="text-white">Developer mode</strong>.
+                        Launch the live Crackpilot overlay directly in Chrome or
+                        Edge with zero install.
                       </li>
                       <li>
-                        Click{" "}
-                        <strong className="text-white">Load unpacked</strong>{" "}
-                        and select the extracted folder.
+                        Paste your 48h Auth Token from{" "}
+                        <strong className="text-white">Overview</strong> and
+                        click <strong className="text-white">Authenticate</strong>.
                       </li>
                       <li>
-                        Press{" "}
-                        <code className="text-zinc-200">Alt+Shift+C</code> on
-                        any browser tab to launch Crackpilot instantly.
+                        Click the pop-out icon in the top-right bar to float
+                        Always On Top across all browser tabs.
                       </li>
                     </ol>
                   </div>
                   <button
                     type="button"
-                    onClick={() => onDownload("extension")}
+                    onClick={onOpenSoftware}
                     className="w-full inline-flex items-center justify-center gap-2 rounded-full border border-white/15 bg-white/[0.05] px-4 py-2.5 text-xs font-bold text-white hover:bg-white/[0.1] transition-colors cursor-pointer"
                   >
-                    <Download className="h-4 w-4 text-[#c6f527]" />
-                    <span>Download Browser Extension (.zip)</span>
+                    <ExternalLink className="h-4 w-4 text-[#c6f527]" />
+                    <span>Open Crackpilot Web Overlay</span>
                   </button>
                 </div>
               </div>

@@ -4,11 +4,8 @@ import { InstallerModal } from "./components/InstallerModal";
 import { LandingPage } from "./components/LandingPage";
 import { LoginView } from "./components/LoginView";
 import { SoftwareOverlay } from "./components/SoftwareOverlay";
-import {
-  downloadCrackpilotDesktopKit,
-  downloadCrackpilotExtension,
-  type DownloadPlatform,
-} from "./data/crackpilotPackages";
+import type { DownloadPlatform } from "./data/crackpilotPackages";
+import { apiUrl, isDesktopApp } from "./lib/api";
 import type {
   DashboardTab,
   RootView,
@@ -37,6 +34,7 @@ function getInitialView(): RootView {
   if (mode === "software") return "software";
   if (mode === "dashboard") return "dashboard";
   if (mode === "login") return "login";
+  if (isDesktopApp()) return "software";
   return "landing";
 }
 
@@ -53,7 +51,7 @@ export default function App() {
   // Hydrate auth, token, and target profile from backend
   useEffect(() => {
     let active = true;
-    fetch("/api/auth/me")
+    fetch(apiUrl("/api/auth/me"))
       .then((r) => r.json())
       .then(
         (data: {
@@ -72,7 +70,7 @@ export default function App() {
       });
 
     // Keep Dashboard & Software tabs synced via server SSE events
-    const sse = new EventSource("/api/events");
+    const sse = new EventSource(apiUrl("/api/events"));
     sse.onmessage = (ev) => {
       try {
         const msg = JSON.parse(ev.data) as {
@@ -92,18 +90,13 @@ export default function App() {
     };
   }, []);
 
-  const handleTriggerDownload = async (platform: DownloadPlatform) => {
+  const handleOpenInstallerModal = (platform: DownloadPlatform) => {
     setInstallerPlatform(platform);
     setInstallerOpen(true);
-    if (platform === "extension") {
-      await downloadCrackpilotExtension();
-    } else {
-      await downloadCrackpilotDesktopKit(tokenState?.token);
-    }
   };
 
   const handleLogout = async () => {
-    await fetch("/api/auth/logout", { method: "POST" }).catch(() => {});
+    await fetch(apiUrl("/api/auth/logout"), { method: "POST" }).catch(() => {});
     setUser(null);
     setView("landing");
   };
@@ -174,7 +167,7 @@ export default function App() {
           onTokenChange={setTokenState}
           onProfileChange={setProfile}
           onOpenSoftware={() => setView("software")}
-          onDownload={(platform) => void handleTriggerDownload(platform)}
+          onDownload={(platform) => handleOpenInstallerModal(platform)}
           onLogout={() => void handleLogout()}
           onGoHome={() => setView("landing")}
         />
@@ -197,7 +190,7 @@ export default function App() {
           setView("dashboard");
         }}
         onOpenSoftware={() => setView("software")}
-        onDownload={(platform) => void handleTriggerDownload(platform)}
+        onDownload={(platform) => handleOpenInstallerModal(platform)}
       />
       {installerModal}
     </>

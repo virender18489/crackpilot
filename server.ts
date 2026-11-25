@@ -1,5 +1,6 @@
 import "dotenv/config";
 import crypto from "crypto";
+import fs from "fs";
 import express from "express";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -209,6 +210,18 @@ async function transcribeWithGemini(
 async function startServer() {
   const app = express();
   app.use(express.json({ limit: "20mb" }));
+
+  // Allow the packaged Electron Desktop (.exe) app to call backend APIs & SSE
+  app.use("/api", (req, res, next) => {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization");
+    if (req.method === "OPTIONS") {
+      res.status(204).end();
+      return;
+    }
+    next();
+  });
 
   const sseClients = new Set<express.Response>();
 
@@ -881,6 +894,65 @@ async function startServer() {
       sendEvent({ error: message });
       res.end();
     }
+  });
+
+  // Native 64-bit Windows Crackpilot-Setup.exe Download (dynamically patched with live app origin)
+  app.get("/api/download/crackpilot.exe", (req, res) => {
+    const candidates = [
+      path.resolve(__dirname, "public/downloads/Crackpilot-Setup.exe"),
+      path.resolve(__dirname, "dist/downloads/Crackpilot-Setup.exe"),
+    ];
+    const exePath = candidates.find((p) => fs.existsSync(p));
+    if (!exePath) {
+      res.status(404).json({ error: "Crackpilot-Setup.exe not found on server." });
+      return;
+    }
+
+    const raw = Buffer.from(fs.readFileSync(exePath));
+    const marker = Buffer.from("CRACKPILOT_URL_SLOT_BEGIN_", "ascii");
+    const slotOffset = raw.indexOf(marker);
+
+    if (slotOffset !== -1) {
+      const forwardedProto = (req.headers["x-forwarded-proto"] as string | undefined)
+        ?.split(",")[0]
+        ?.trim();
+      const proto = forwardedProto || req.protocol || "https";
+      const host = req.get("host");
+      const baseOrigin = host
+        ? `${proto}://${host}`
+        : (process.env.APP_URL || "http://localhost:3000").replace(/\/$/, "");
+      const targetUrl = `${baseOrigin}/?mode=software`;
+
+      const valueStart = slotOffset + marker.length;
+      const maxLen = 255 - marker.length;
+      const clipped = targetUrl.slice(0, maxLen);
+      raw.fill("_".charCodeAt(0), valueStart, valueStart + maxLen);
+      raw.write(clipped, valueStart, "ascii");
+    }
+
+    res.setHeader("Content-Type", "application/vnd.microsoft.portable-executable");
+    res.setHeader(
+      "Content-Disposition",
+      'attachment; filename="Crackpilot-Setup.exe"'
+    );
+    res.setHeader("Cache-Control", "no-store");
+    res.send(raw);
+  });
+
+  // Developer export: serves the exact updated source files ZIP for pushing to GitHub
+  app.get("/api/export-github-update.zip", (_req, res) => {
+    const zipPath = path.resolve(__dirname, "public", "crackpilot-github-update.zip");
+    if (!fs.existsSync(zipPath)) {
+      res.status(404).json({ error: "Update archive not found." });
+      return;
+    }
+    res.setHeader("Content-Type", "application/zip");
+    res.setHeader(
+      "Content-Disposition",
+      'attachment; filename="crackpilot-github-update.zip"'
+    );
+    res.setHeader("Cache-Control", "no-store");
+    res.sendFile(zipPath);
   });
 
   if (!isProd) {

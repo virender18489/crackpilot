@@ -26,6 +26,9 @@ jobs:
 
       - name: Build Windows Installer (.exe)
         run: npm run dist -- --publish never
+        env:
+          VITE_API_BASE_URL: ${{ vars.VITE_API_BASE_URL }}
+          VITE_WINDOWS_EXE_URL: ${{ vars.VITE_WINDOWS_EXE_URL }}
 
       - name: Publish Release with EXE
         shell: pwsh
@@ -38,5 +41,5 @@ jobs:
           if ($LASTEXITCODE -eq 0) {
             gh release upload $tag "release/Crackpilot-Setup.exe" --clobber
           } else {
-            gh release create $tag "release/Crackpilot-Setup.exe" --title "Crackpilot $tag" --notes "Windows Installer"
+            gh release create $tag "release/Crackpilot-Setup.exe" --title "Crackpilot $tag" --notes "Crackpilot Windows Installer (.exe)"
           }

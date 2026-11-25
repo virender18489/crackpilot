@@ -1,14 +1,6 @@
 import { useState } from "react";
-import {
-  ArrowLeft,
-  ArrowRight,
-  CheckCircle2,
-  Download,
-  Lock,
-  Mail,
-  User,
-} from "lucide-react";
-import { downloadCrackpilotDesktopKit } from "../data/crackpilotPackages";
+import { ArrowLeft, CheckCircle2, Sparkles } from "lucide-react";
+import { apiUrl } from "../lib/api";
 import type { UserAccount } from "../types";
 
 interface LoginViewProps {
@@ -17,19 +9,22 @@ interface LoginViewProps {
   onLaunchSoftware: () => void;
 }
 
-export function LoginView({
-  onBackHome,
-  onLoginSuccess,
-  onLaunchSoftware,
-}: LoginViewProps) {
+type AuthMode = "signin" | "signup" | "forgot";
+
+export function LoginView({ onBackHome, onLoginSuccess }: LoginViewProps) {
+  const [mode, setMode] = useState<AuthMode>("signin");
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const [autoDownloadKit, setAutoDownloadKit] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [signedInUser, setSignedInUser] = useState<UserAccount | null>(null);
-  const [kitDownloaded, setKitDownloaded] = useState(false);
+  const [resetSent, setResetSent] = useState(false);
+
+  const switchMode = (next: AuthMode) => {
+    setMode(next);
+    setError(null);
+    setResetSent(false);
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -40,14 +35,23 @@ export function LoginView({
       return;
     }
 
+    if (mode === "forgot") {
+      setSubmitting(true);
+      window.setTimeout(() => {
+        setSubmitting(false);
+        setResetSent(true);
+      }, 350);
+      return;
+    }
+
     setSubmitting(true);
     try {
-      const resp = await fetch("/api/auth/login", {
+      const resp = await fetch(apiUrl("/api/auth/login"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           email: email.trim(),
-          name: name.trim() || undefined,
+          name: mode === "signup" && name.trim() ? name.trim() : undefined,
         }),
       });
       const data = (await resp.json()) as {
@@ -56,14 +60,10 @@ export function LoginView({
         error?: string;
       };
       if (!resp.ok || !data.user) {
-        throw new Error(data.error || "Login failed.");
+        throw new Error(data.error || "Sign in failed.");
       }
 
-      if (autoDownloadKit) {
-        await downloadCrackpilotDesktopKit();
-        setKitDownloaded(true);
-      }
-      setSignedInUser(data.user);
+      onLoginSuccess(data.user);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not sign in.");
     } finally {
@@ -73,163 +73,144 @@ export function LoginView({
 
   return (
     <div
-      className="min-h-screen bg-[#050709] text-white flex flex-col"
+      className="min-h-screen bg-[#050709] text-white flex flex-col justify-between px-5 py-8 selection:bg-[#c6f527] selection:text-[#050709]"
       style={{
         background:
-          "radial-gradient(ellipse 55% 75% at 85% 20%, rgba(132, 184, 24, 0.16), rgba(5, 7, 9, 1) 65%)",
+          "radial-gradient(ellipse 60% 60% at 50% 0%, rgba(198, 245, 39, 0.10), rgba(5, 7, 9, 1) 68%)",
       }}
     >
-      <header className="border-b border-white/[0.08] bg-[#050709]/90">
-        <div className="mx-auto flex h-16 max-w-6xl items-center justify-between px-5">
-          <button
-            type="button"
-            onClick={onBackHome}
-            className="inline-flex items-center gap-2 text-sm text-zinc-300 hover:text-white transition-colors cursor-pointer"
-          >
-            <ArrowLeft className="h-4 w-4" />
-            <span>Back to crackpilot</span>
-          </button>
-          <span className="font-mono text-[11px] text-zinc-400">
-            WORKSPACE LOGIN
+      {/* Top Bar: Crackpilot Brand + Back link */}
+      <div className="mx-auto flex w-full max-w-5xl items-center justify-between">
+        <button
+          type="button"
+          onClick={onBackHome}
+          className="inline-flex items-center gap-2 text-sm font-bold tracking-tight text-white cursor-pointer"
+        >
+          <span className="flex h-6 w-6 items-center justify-center rounded-[5px] bg-[#c6f527] text-xs font-extrabold text-[#050709]">
+            C
           </span>
-        </div>
-      </header>
+          <span>crackpilot</span>
+        </button>
 
-      <div className="flex-1 mx-auto grid w-full max-w-5xl gap-10 px-5 py-12 lg:grid-cols-12 lg:items-center">
-        {/* Left info column */}
-        <div className="lg:col-span-5 space-y-5">
-          <div className="flex items-center gap-2.5">
-            <span className="flex h-8 w-8 items-center justify-center rounded-md bg-[#c6f527] text-sm font-extrabold text-[#050709]">
-              C
-            </span>
-            <span className="text-lg font-bold tracking-tight text-white">
-              crackpilot
-            </span>
-            <span className="rounded bg-white/[0.07] px-2 py-0.5 font-mono text-[10px] text-zinc-400">
-              WORKSPACE
-            </span>
-          </div>
+        <button
+          type="button"
+          onClick={onBackHome}
+          className="inline-flex items-center gap-1.5 text-xs text-zinc-400 hover:text-white transition-colors cursor-pointer"
+        >
+          <ArrowLeft className="h-3.5 w-3.5" />
+          <span>Back to Home</span>
+        </button>
+      </div>
 
-          <h1 className="text-3xl font-extrabold tracking-tight text-white leading-[1.1]">
-            Sign in to download Crackpilot and generate your 48h token.
-          </h1>
-
-          <p className="text-sm leading-relaxed text-zinc-400">
-            After login, your Crackpilot Desktop Installer Kit downloads
-            automatically with the Windows Desktop shortcut creator and native{" "}
-            <code className="text-zinc-200">.exe</code> setup. Then open
-            Workspace → Overview to generate your token and start your session.
-          </p>
-
-          <div className="space-y-2.5 pt-2 text-xs text-zinc-300">
-            <p className="flex items-center gap-2">
-              <CheckCircle2 className="h-4 w-4 text-[#c6f527] shrink-0" />
-              <span>Creates a Crackpilot Desktop icon for instant launch</span>
-            </p>
-            <p className="flex items-center gap-2">
-              <CheckCircle2 className="h-4 w-4 text-[#c6f527] shrink-0" />
-              <span>
-                Upload Resume &amp; JD in Target Profile for personalized answers
-              </span>
-            </p>
-            <p className="flex items-center gap-2">
-              <CheckCircle2 className="h-4 w-4 text-[#c6f527] shrink-0" />
-              <span>
-                Token-verified software connection with live Start Session sync
-              </span>
+      {/* Centered Simple Auth Section in Crackpilot Dark + Electric Lime Theme */}
+      <main className="mx-auto w-full max-w-[430px] py-10">
+        <div className="rounded-2xl border border-white/[0.08] bg-[#0c1015]/95 p-7 sm:p-8 shadow-2xl space-y-6">
+          {/* Header */}
+          <div className="space-y-1.5">
+            <h1 className="text-[28px] font-extrabold tracking-tight text-white leading-tight">
+              {mode === "signin"
+                ? "Welcome back"
+                : mode === "signup"
+                  ? "Create your account"
+                  : "Forgot password"}
+            </h1>
+            <p className="text-sm text-zinc-400">
+              {mode === "signin"
+                ? "Sign in to your Crackpilot account"
+                : mode === "signup"
+                  ? "Get started with your Crackpilot workspace"
+                  : "Enter your email and we’ll send a reset link"}
             </p>
           </div>
-        </div>
 
-        {/* Right card: Form or Post-Login Desktop Icon Launcher */}
-        <div className="lg:col-span-7">
-          {!signedInUser ? (
-            <form
-              onSubmit={handleSubmit}
-              className="rounded-2xl border border-white/[0.09] bg-[#0c1015] p-6 sm:p-8 space-y-5 shadow-2xl"
-            >
-              <div>
-                <h2 className="text-xl font-bold text-white">
-                  Login to Workspace
-                </h2>
-                <p className="mt-1 text-xs text-zinc-400">
-                  Enter your details to open your Crackpilot Dashboard and
-                  download the desktop installer package.
-                </p>
+          {/* Forgot Password Success State */}
+          {mode === "forgot" && resetSent ? (
+            <div className="space-y-5">
+              <div className="rounded-xl border border-[#c6f527]/30 bg-[#141c0d] p-4 flex items-start gap-3">
+                <CheckCircle2 className="h-5 w-5 text-[#c6f527] shrink-0 mt-0.5" />
+                <div className="space-y-1 text-xs leading-relaxed">
+                  <p className="font-semibold text-white">Reset link sent</p>
+                  <p className="text-zinc-300">
+                    If an account exists for{" "}
+                    <span className="font-mono text-[#c6f527]">{email}</span>,
+                    check your inbox for password reset instructions.
+                  </p>
+                </div>
               </div>
 
-              <div className="space-y-4">
+              <button
+                type="button"
+                onClick={() => switchMode("signin")}
+                className="w-full rounded-xl bg-[#c6f527] hover:bg-[#b5e41c] py-3 text-sm font-bold text-[#050709] transition-colors cursor-pointer"
+              >
+                Back to Sign In
+              </button>
+            </div>
+          ) : (
+            <form onSubmit={handleSubmit} className="space-y-4">
+              {mode === "signup" && (
                 <label className="block space-y-1.5">
-                  <span className="text-xs font-medium text-zinc-300">
+                  <span className="block text-[11px] font-semibold uppercase tracking-[0.06em] text-zinc-300">
                     Full Name
                   </span>
-                  <div className="relative">
-                    <User className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-zinc-500" />
-                    <input
-                      type="text"
-                      value={name}
-                      onChange={(e) => setName(e.target.value)}
-                      placeholder="e.g., Aarav Mehta"
-                      className="w-full rounded-lg border border-white/10 bg-[#070a0e] py-2.5 pl-9 pr-3 text-sm text-white placeholder-zinc-500 focus:border-[#c6f527] focus:outline-none"
-                    />
-                  </div>
-                </label>
-
-                <label className="block space-y-1.5">
-                  <span className="text-xs font-medium text-zinc-300">
-                    Email Address
-                  </span>
-                  <div className="relative">
-                    <Mail className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-zinc-500" />
-                    <input
-                      type="email"
-                      required
-                      value={email}
-                      onChange={(e) => setEmail(e.target.value)}
-                      placeholder="aarav@example.com"
-                      className="w-full rounded-lg border border-white/10 bg-[#070a0e] py-2.5 pl-9 pr-3 text-sm text-white placeholder-zinc-500 focus:border-[#c6f527] focus:outline-none"
-                    />
-                  </div>
-                </label>
-
-                <label className="block space-y-1.5">
-                  <span className="text-xs font-medium text-zinc-300">
-                    Password
-                  </span>
-                  <div className="relative">
-                    <Lock className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-zinc-500" />
-                    <input
-                      type="password"
-                      required
-                      value={password}
-                      onChange={(e) => setPassword(e.target.value)}
-                      placeholder="Enter password"
-                      className="w-full rounded-lg border border-white/10 bg-[#070a0e] py-2.5 pl-9 pr-3 text-sm text-white placeholder-zinc-500 focus:border-[#c6f527] focus:outline-none"
-                    />
-                  </div>
-                </label>
-
-                <label className="flex items-start gap-2.5 pt-1 cursor-pointer">
                   <input
-                    type="checkbox"
-                    checked={autoDownloadKit}
-                    onChange={(e) => setAutoDownloadKit(e.target.checked)}
-                    className="mt-0.5 h-4 w-4 rounded border-zinc-600 bg-[#070a0e] accent-[#c6f527]"
+                    type="text"
+                    required
+                    value={name}
+                    onChange={(e) => setName(e.target.value)}
+                    placeholder="Aarav Mehta"
+                    className="w-full rounded-xl border border-white/10 bg-[#070a0e] px-4 py-3 text-sm text-white placeholder-zinc-500 focus:border-[#c6f527] focus:outline-none transition-colors"
                   />
-                  <span className="text-xs leading-relaxed text-zinc-300">
-                    Automatically download{" "}
-                    <strong className="text-white">
-                      Crackpilot-Desktop-Installer-Kit.zip
-                    </strong>{" "}
-                    (includes Desktop shortcut script &amp; Windows{" "}
-                    <code className="text-[#c6f527]">.exe</code> builder) right
-                    after login
-                  </span>
                 </label>
-              </div>
+              )}
+
+              <label className="block space-y-1.5">
+                <span className="block text-[11px] font-semibold uppercase tracking-[0.06em] text-zinc-300">
+                  Email Address
+                </span>
+                <input
+                  type="email"
+                  required
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  placeholder="name@company.com"
+                  className="w-full rounded-xl border border-white/10 bg-[#070a0e] px-4 py-3 text-sm text-white placeholder-zinc-500 focus:border-[#c6f527] focus:outline-none transition-colors"
+                />
+              </label>
+
+              {mode !== "forgot" && (
+                <div className="space-y-1.5">
+                  <div className="flex items-center justify-between">
+                    <label
+                      htmlFor="login-password"
+                      className="text-[11px] font-semibold uppercase tracking-[0.06em] text-zinc-300"
+                    >
+                      Password
+                    </label>
+                    {mode === "signin" && (
+                      <button
+                        type="button"
+                        onClick={() => switchMode("forgot")}
+                        className="text-xs font-medium text-[#c6f527] hover:text-[#d8fa61] transition-colors cursor-pointer"
+                      >
+                        Forgot password?
+                      </button>
+                    )}
+                  </div>
+                  <input
+                    id="login-password"
+                    type="password"
+                    required
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    placeholder="••••••••"
+                    className="w-full rounded-xl border border-white/10 bg-[#070a0e] px-4 py-3 text-sm text-white placeholder-zinc-500 focus:border-[#c6f527] focus:outline-none transition-colors"
+                  />
+                </div>
+              )}
 
               {error && (
-                <p className="rounded-lg border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-xs text-rose-300">
+                <p className="rounded-lg border border-rose-500/40 bg-rose-500/10 px-3.5 py-2 text-xs text-rose-300">
                   {error}
                 </p>
               )}
@@ -237,105 +218,74 @@ export function LoginView({
               <button
                 type="submit"
                 disabled={submitting}
-                className="w-full inline-flex items-center justify-center gap-2 rounded-full bg-[#c6f527] px-4 py-3 text-sm font-bold text-[#050709] hover:bg-[#b5e41c] transition-colors cursor-pointer disabled:opacity-60"
+                className="w-full rounded-xl bg-[#c6f527] hover:bg-[#b5e41c] py-3.5 text-sm font-bold text-[#050709] transition-colors cursor-pointer disabled:opacity-60"
               >
-                <span>
-                  {submitting
-                    ? "Signing in & Downloading Setup..."
-                    : "Login & Download Crackpilot"}
-                </span>
-                <ArrowRight className="h-4 w-4" />
+                {submitting
+                  ? mode === "forgot"
+                    ? "Sending Reset Link..."
+                    : mode === "signup"
+                      ? "Creating Account..."
+                      : "Signing In..."
+                  : mode === "forgot"
+                    ? "Send Reset Link"
+                    : mode === "signup"
+                      ? "Get Started"
+                      : "Sign In"}
               </button>
             </form>
-          ) : (
-            <div className="rounded-2xl border border-white/[0.09] bg-[#0c1015] p-6 sm:p-8 space-y-6 shadow-2xl">
-              <div className="flex items-start gap-3">
-                <CheckCircle2 className="h-6 w-6 text-[#c6f527] shrink-0 mt-0.5" />
-                <div>
-                  <h2 className="text-xl font-bold text-white">
-                    Welcome, {signedInUser.name}
-                  </h2>
-                  <p className="mt-1 text-xs leading-relaxed text-zinc-300">
-                    {kitDownloaded
-                      ? "Your Crackpilot Desktop Installer Kit has started downloading. Extract it and double-click INSTALL_AND_CREATE_SHORTCUT_WINDOWS.bat to place the Crackpilot icon on your Desktop."
-                      : "You are signed in. You can download the Desktop Installer Kit anytime from Workspace → Downloads."}
-                  </p>
-                </div>
-              </div>
-
-              {/* Desktop Icon Launcher */}
-              <div className="rounded-xl border border-white/10 bg-[#070a0e] p-5 flex flex-col sm:flex-row items-center justify-between gap-4">
-                <button
-                  type="button"
-                  onClick={() => {
-                    onLoginSuccess(signedInUser);
-                    onLaunchSoftware();
-                  }}
-                  className="group flex flex-col items-center gap-2 rounded-xl border border-white/10 bg-[#11161d] px-6 py-4 hover:border-[#c6f527]/60 transition-colors cursor-pointer"
-                >
-                  <span className="flex h-12 w-12 items-center justify-center rounded-xl bg-[#c6f527] text-xl font-extrabold text-[#050709] shadow-lg group-hover:scale-105 transition-transform">
-                    C
-                  </span>
-                  <span className="text-xs font-bold text-white">
-                    crackpilot
-                  </span>
-                  <span className="text-[10px] text-zinc-400">
-                    Click to Launch App
-                  </span>
-                </button>
-
-                <div className="flex-1 space-y-2 text-xs text-zinc-300">
-                  <p className="font-semibold text-white">
-                    Next Steps to Connect:
-                  </p>
-                  <ol className="list-decimal pl-4 space-y-1 text-zinc-400">
-                    <li>
-                      Open <strong className="text-zinc-200">Workspace</strong>{" "}
-                      → <strong className="text-zinc-200">Overview</strong> and
-                      click{" "}
-                      <strong className="text-[#c6f527]">
-                        Generate 48h Token
-                      </strong>
-                      .
-                    </li>
-                    <li>
-                      Open <strong className="text-zinc-200">Crackpilot</strong>
-                      , paste the token, and click{" "}
-                      <strong className="text-[#c6f527]">Authenticate</strong>.
-                    </li>
-                    <li>
-                      Click{" "}
-                      <strong className="text-emerald-400">
-                        Start Session
-                      </strong>{" "}
-                      to launch live answers.
-                    </li>
-                  </ol>
-                </div>
-              </div>
-
-              <div className="flex flex-wrap items-center gap-3">
-                <button
-                  type="button"
-                  onClick={() => onLoginSuccess(signedInUser)}
-                  className="flex-1 inline-flex items-center justify-center gap-2 rounded-full bg-[#c6f527] px-4 py-2.5 text-sm font-bold text-[#050709] hover:bg-[#b5e41c] transition-colors cursor-pointer"
-                >
-                  <span>Go to Workspace Overview</span>
-                  <ArrowRight className="h-4 w-4" />
-                </button>
-                <button
-                  type="button"
-                  onClick={() => void downloadCrackpilotDesktopKit()}
-                  className="inline-flex items-center gap-2 rounded-full border border-white/15 bg-white/[0.04] px-4 py-2.5 text-xs font-medium text-zinc-200 hover:bg-white/[0.08] transition-colors cursor-pointer"
-                >
-                  <Download className="h-3.5 w-3.5" />
-                  <span>Download Again</span>
-                </button>
-              </div>
-            </div>
           )}
+
+          {/* OR Divider */}
+          <div className="flex items-center gap-4">
+            <span className="h-px flex-1 bg-white/[0.08]" />
+            <span className="font-mono text-[11px] font-medium text-zinc-500">
+              OR
+            </span>
+            <span className="h-px flex-1 bg-white/[0.08]" />
+          </div>
+
+          {/* Mode Switch Links */}
+          <p className="text-center text-sm text-zinc-300">
+            {mode === "signin" ? (
+              <>
+                Don&apos;t have an account?{" "}
+                <button
+                  type="button"
+                  onClick={() => switchMode("signup")}
+                  className="font-semibold text-[#c6f527] underline underline-offset-4 hover:text-[#d8fa61] cursor-pointer"
+                >
+                  Get Started
+                </button>
+              </>
+            ) : (
+              <>
+                Remembered your password?{" "}
+                <button
+                  type="button"
+                  onClick={() => switchMode("signin")}
+                  className="font-semibold text-[#c6f527] underline underline-offset-4 hover:text-[#d8fa61] cursor-pointer"
+                >
+                  Sign In
+                </button>
+              </>
+            )}
+          </p>
+
+          {/* Bottom Agent Partner Pill matching Crackpilot lime theme */}
+          <div className="border-t border-white/[0.08] pt-5 flex justify-center">
+            <button
+              type="button"
+              onClick={onBackHome}
+              className="inline-flex items-center gap-2 rounded-full border border-[#c6f527]/30 bg-[#141c0d] px-5 py-2.5 text-xs font-medium text-[#c6f527] hover:border-[#c6f527]/60 hover:bg-[#1a2510] transition-colors cursor-pointer"
+            >
+              <Sparkles className="h-3.5 w-3.5" />
+              <span>Want to become an Agent Partner? Apply Here</span>
+            </button>
+          </div>
         </div>
-      </div>
+      </main>
+
+      <div className="h-4" />
     </div>
   );
 }

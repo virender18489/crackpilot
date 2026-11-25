@@ -30,6 +30,7 @@ import {
 } from "lucide-react";
 import { AnswerView } from "./AnswerView";
 import { SAMPLE_INTERVIEW_QUESTIONS } from "../data/crackpilotPackages";
+import { apiUrl, getApiBaseUrl, isDesktopApp } from "../lib/api";
 import type {
   AnswerLanguage,
   AnswerStyle,
@@ -69,9 +70,9 @@ interface SpeechRecognitionLike {
 }
 
 const LAYER_OPACITIES = [
-  { label: "92%", bg: "bg-[#1a2c44]/88" },
-  { label: "76%", bg: "bg-[#1a2c44]/68" },
-  { label: "58%", bg: "bg-[#1a2c44]/48" },
+  { label: "92%", bg: "bg-[#1a2c44]/88", nativeOpacity: 0.96 },
+  { label: "76%", bg: "bg-[#1a2c44]/68", nativeOpacity: 0.84 },
+  { label: "58%", bg: "bg-[#1a2c44]/48", nativeOpacity: 0.68 },
 ];
 
 function formatNow(): string {
@@ -206,10 +207,12 @@ export function SoftwareOverlay({
   glitchDurationRef.current = glitchDurationSec;
   sessionActiveRef.current = Boolean(tokenState?.sessionActive);
 
+  const desktopMode = isDesktopApp();
   const serverDisplayUrl =
-    typeof window !== "undefined"
+    getApiBaseUrl() ||
+    (typeof window !== "undefined" && window.location.origin !== "null"
       ? window.location.origin
-      : "http://localhost:3000";
+      : "http://localhost:3000");
 
   const isAuthenticated = Boolean(tokenState?.authenticated);
   const isSessionLive = Boolean(tokenState?.authenticated && tokenState?.sessionActive);
@@ -225,7 +228,7 @@ export function SoftwareOverlay({
 
     setVerifyingToken(true);
     try {
-      const resp = await fetch("/api/token/verify", {
+      const resp = await fetch(apiUrl("/api/token/verify"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ token: tokenInput.trim() }),
@@ -253,7 +256,7 @@ export function SoftwareOverlay({
     setAuthError(null);
     setStartingSession(true);
     try {
-      const resp = await fetch("/api/session/start", { method: "POST" });
+      const resp = await fetch(apiUrl("/api/session/start"), { method: "POST" });
       const data = (await resp.json()) as {
         token?: SessionTokenState;
         profile?: TargetProfile;
@@ -408,7 +411,7 @@ export function SoftwareOverlay({
       abortRef.current = controller;
 
       try {
-        const resp = await fetch(endpoint, {
+        const resp = await fetch(apiUrl(endpoint), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           signal: controller.signal,
@@ -558,7 +561,7 @@ export function SoftwareOverlay({
       sseRef.current.close();
       sseRef.current = null;
     }
-    const source = new EventSource("/api/events");
+    const source = new EventSource(apiUrl("/api/events"));
     source.onopen = () => {
       setIsConnected(true);
       setIsReconnecting(false);
@@ -746,7 +749,7 @@ export function SoftwareOverlay({
       setIsTranscribing(true);
       try {
         const audioBase64 = await blobToBase64(blob);
-        const resp = await fetch("/api/transcribe", {
+        const resp = await fetch(apiUrl("/api/transcribe"), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -1219,7 +1222,7 @@ export function SoftwareOverlay({
     setStatusNotice("Reconnecting...");
 
     try {
-      const resp = await fetch("/api/health", { cache: "no-store" });
+      const resp = await fetch(apiUrl("/api/health"), { cache: "no-store" });
       if (!resp.ok) throw new Error("Server unreachable");
       setIsConnected(true);
       connectEventStream();
@@ -1286,7 +1289,7 @@ export function SoftwareOverlay({
     }
     if (abortRef.current) abortRef.current.abort();
     setIsConnected(false);
-    void fetch("/api/session/stop", { method: "POST" });
+    void fetch(apiUrl("/api/session/stop"), { method: "POST" });
     setStatusNotice("Session Disconnected. Press Reconnect (Alt+R) to resume.");
   }, [stopAudioListening, stopScreenStream]);
 
@@ -1338,7 +1341,11 @@ export function SoftwareOverlay({
         void handleReconnect();
       } else if (key === "h") {
         e.preventDefault();
-        setIsHidden((h) => !h);
+        if (window.crackpilotDesktop?.isElectron) {
+          void window.crackpilotDesktop.hideWindow();
+        } else {
+          setIsHidden((h) => !h);
+        }
       } else if (key === "f") {
         e.preventDefault();
         handleFontIncreaseCycle();
@@ -1419,7 +1426,7 @@ export function SoftwareOverlay({
   const updateInlineProfile = (patch: Partial<TargetProfile>) => {
     const next = { ...profile, ...patch };
     onProfileChange(next);
-    void fetch("/api/profile", {
+    void fetch(apiUrl("/api/profile"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(next),
@@ -1447,7 +1454,11 @@ export function SoftwareOverlay({
 
   return (
     <div
-      className={`min-h-screen bg-gradient-to-br from-[#0a1322] via-[#13263f] to-[#0b1526] flex items-center justify-center p-2 sm:p-4 ${
+      className={`${
+        desktopMode
+          ? "h-screen w-screen bg-transparent p-0"
+          : "min-h-screen bg-gradient-to-br from-[#0a1322] via-[#13263f] to-[#0b1526] p-2 sm:p-4"
+      } flex items-center justify-center ${
         isResizing ? "select-none cursor-ew-resize" : ""
       }`}
     >
@@ -1456,40 +1467,46 @@ export function SoftwareOverlay({
       {/* Resizable Floating Translucent Overlay Window */}
       <div
         style={
-          isMaximized
+          desktopMode || isMaximized
             ? undefined
             : { width: `min(100%, ${hudWidthPx}px)` }
         }
         className={`relative flex flex-col overflow-hidden rounded-xl border border-slate-500/35 shadow-2xl backdrop-blur-md transition-colors ${
           currentLayer.bg
         } ${
-          isMaximized
-            ? "h-[calc(100vh-1rem)] w-full"
-            : isCompact
-              ? "h-[460px]"
-              : "h-[calc(100vh-2rem)] max-h-[840px]"
+          desktopMode
+            ? "h-full w-full"
+            : isMaximized
+              ? "h-[calc(100vh-1rem)] w-full"
+              : isCompact
+                ? "h-[460px]"
+                : "h-[calc(100vh-2rem)] max-h-[840px]"
         }`}
       >
         {/* Left & Right Drag-to-Resize Width Handles */}
-        <div
-          role="separator"
-          aria-orientation="vertical"
-          aria-label="Resize window width from left edge"
-          onMouseDown={(e) => startWidthResize("left", e.clientX)}
-          title="Drag to adjust width"
-          className="absolute inset-y-0 left-0 z-20 w-2 cursor-ew-resize hover:bg-sky-400/25 transition-colors"
-        />
-        <div
-          role="separator"
-          aria-orientation="vertical"
-          aria-label="Resize window width from right edge"
-          onMouseDown={(e) => startWidthResize("right", e.clientX)}
-          title="Drag to adjust width"
-          className="absolute inset-y-0 right-0 z-20 w-2 cursor-ew-resize hover:bg-sky-400/25 transition-colors"
-        />
+        {!desktopMode && (
+          <>
+            <div
+              role="separator"
+              aria-orientation="vertical"
+              aria-label="Resize window width from left edge"
+              onMouseDown={(e) => startWidthResize("left", e.clientX)}
+              title="Drag to adjust width"
+              className="absolute inset-y-0 left-0 z-20 w-2 cursor-ew-resize hover:bg-sky-400/25 transition-colors"
+            />
+            <div
+              role="separator"
+              aria-orientation="vertical"
+              aria-label="Resize window width from right edge"
+              onMouseDown={(e) => startWidthResize("right", e.clientX)}
+              title="Drag to adjust width"
+              className="absolute inset-y-0 right-0 z-20 w-2 cursor-ew-resize hover:bg-sky-400/25 transition-colors"
+            />
+          </>
+        )}
 
         {/* Clean Top Window Bar — ONLY Crackpilot (No "Node + Python", No "Live HUD") */}
-        <header className="flex h-10 shrink-0 items-center justify-between gap-4 border-b border-slate-700/60 bg-[#0d1220]/95 px-4">
+        <header className="app-drag flex h-10 shrink-0 items-center justify-between gap-4 border-b border-slate-700/60 bg-[#0d1220]/95 px-4">
           {/* Left: Clean Brand Name Only */}
           <div className="flex items-center gap-2.5 min-w-0">
             <span className="flex h-5 w-5 items-center justify-center rounded bg-[#405fe8] text-[11px] font-bold text-white shrink-0">
@@ -1505,7 +1522,7 @@ export function SoftwareOverlay({
             type="button"
             onClick={() => setShowContextPanel((v) => !v)}
             title="Width, Target Profile & Quick Test Settings"
-            className={`rounded-md px-2.5 py-1 transition-colors cursor-pointer ${
+            className={`app-no-drag rounded-md px-2.5 py-1 transition-colors cursor-pointer ${
               showContextPanel
                 ? "bg-slate-700/80 text-sky-300"
                 : "text-slate-400 hover:bg-slate-800 hover:text-slate-100"
@@ -1515,18 +1532,28 @@ export function SoftwareOverlay({
           </button>
 
           {/* Right: Float on Top (PiP) + Window Controls (— □ ×) */}
-          <div className="flex items-center gap-1 shrink-0 text-slate-400">
+          <div className="app-no-drag flex items-center gap-1 shrink-0 text-slate-400">
+            {!desktopMode && (
+              <button
+                type="button"
+                onClick={() => void handlePopOutFloatingWindow()}
+                title="Float Always On Top Across Tabs"
+                className="rounded p-1.5 hover:bg-slate-800 hover:text-sky-300 transition-colors cursor-pointer"
+              >
+                <ExternalLink className="h-3.5 w-3.5" />
+              </button>
+            )}
             <button
               type="button"
-              onClick={() => void handlePopOutFloatingWindow()}
-              title="Float Always On Top Across Tabs"
-              className="rounded p-1.5 hover:bg-slate-800 hover:text-sky-300 transition-colors cursor-pointer"
-            >
-              <ExternalLink className="h-3.5 w-3.5" />
-            </button>
-            <button
-              type="button"
-              onClick={() => setIsCompact((c) => !c)}
+              onClick={() => {
+                setIsCompact((c) => {
+                  const next = !c;
+                  if (window.crackpilotDesktop?.isElectron) {
+                    void window.crackpilotDesktop.setCompact(next);
+                  }
+                  return next;
+                });
+              }}
               title="Compact / Normal height"
               className="rounded p-1.5 hover:bg-slate-800 hover:text-white transition-colors cursor-pointer"
             >
@@ -1536,7 +1563,13 @@ export function SoftwareOverlay({
               type="button"
               onClick={() => {
                 setIsCompact(false);
-                setIsMaximized((m) => !m);
+                if (window.crackpilotDesktop?.isElectron) {
+                  void window.crackpilotDesktop
+                    .toggleMaximize()
+                    .then((max) => setIsMaximized(max));
+                } else {
+                  setIsMaximized((m) => !m);
+                }
               }}
               title="Maximize / Restore"
               className="rounded p-1.5 hover:bg-slate-800 hover:text-white transition-colors cursor-pointer"
@@ -1545,7 +1578,13 @@ export function SoftwareOverlay({
             </button>
             <button
               type="button"
-              onClick={() => setIsHidden(true)}
+              onClick={() => {
+                if (window.crackpilotDesktop?.isElectron) {
+                  void window.crackpilotDesktop.hideWindow();
+                } else {
+                  setIsHidden(true);
+                }
+              }}
               title="Hide Overlay (Alt+H)"
               className="rounded p-1.5 hover:bg-rose-500/80 hover:text-white transition-colors cursor-pointer"
             >
@@ -2284,7 +2323,13 @@ export function SoftwareOverlay({
                 {/* Hide (Alt+H) */}
                 <button
                   type="button"
-                  onClick={() => setIsHidden(true)}
+                  onClick={() => {
+                    if (window.crackpilotDesktop?.isElectron) {
+                      void window.crackpilotDesktop.hideWindow();
+                    } else {
+                      setIsHidden(true);
+                    }
+                  }}
                   title="Hide Software (Alt+H)"
                   className="inline-flex items-center gap-1.5 rounded-lg border border-slate-600/50 bg-[#1f293f]/95 px-3 py-1.5 text-xs font-medium text-slate-200 hover:bg-slate-700/70 transition-colors cursor-pointer"
                 >
@@ -2295,9 +2340,17 @@ export function SoftwareOverlay({
                 {/* Layer */}
                 <button
                   type="button"
-                  onClick={() =>
-                    setLayerIdx((i) => (i + 1) % LAYER_OPACITIES.length)
-                  }
+                  onClick={() => {
+                    setLayerIdx((i) => {
+                      const next = (i + 1) % LAYER_OPACITIES.length;
+                      if (window.crackpilotDesktop?.isElectron) {
+                        void window.crackpilotDesktop.setOpacity(
+                          LAYER_OPACITIES[next].nativeOpacity
+                        );
+                      }
+                      return next;
+                    });
+                  }}
                   title={`Opacity: ${currentLayer.label}`}
                   className="inline-flex items-center gap-1.5 rounded-lg border border-slate-600/50 bg-[#1f293f]/95 px-3 py-1.5 text-xs font-medium text-slate-200 hover:bg-slate-700/70 transition-colors cursor-pointer"
                 >

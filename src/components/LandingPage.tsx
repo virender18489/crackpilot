@@ -28,7 +28,11 @@ import {
   Zap,
   BarChart3,
 } from "lucide-react";
-import type { DownloadPlatform } from "../data/crackpilotPackages";
+import {
+  WINDOWS_EXE_FILENAME,
+  WINDOWS_EXE_URL,
+  type DownloadPlatform,
+} from "../data/crackpilotPackages";
 
 interface LandingPageProps {
   isLoggedIn: boolean;
@@ -390,28 +394,18 @@ export function LandingPage({
               </button>
               {downloadMenuOpen && (
                 <div className="absolute left-0 top-9 w-56 rounded-xl border border-white/10 bg-[#0d1117] p-1.5 shadow-2xl">
-                  <button
-                    type="button"
+                  <a
+                    href={WINDOWS_EXE_URL}
+                    download={WINDOWS_EXE_FILENAME}
                     onClick={() => {
                       setDownloadMenuOpen(false);
                       onDownload("windows");
                     }}
                     className="w-full flex items-center justify-between rounded-lg px-3 py-2 text-left text-xs text-zinc-200 hover:bg-white/[0.06] cursor-pointer"
                   >
-                    <span>Windows / macOS Desktop Kit</span>
+                    <span>Download for Windows (.exe)</span>
                     <Download className="h-3.5 w-3.5 text-[#c6f527]" />
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setDownloadMenuOpen(false);
-                      onDownload("extension");
-                    }}
-                    className="w-full flex items-center justify-between rounded-lg px-3 py-2 text-left text-xs text-zinc-200 hover:bg-white/[0.06] cursor-pointer"
-                  >
-                    <span>Browser Extension (.zip)</span>
-                    <Download className="h-3.5 w-3.5 text-[#c6f527]" />
-                  </button>
+                  </a>
                   <button
                     type="button"
                     onClick={() => {
@@ -482,14 +476,15 @@ export function LandingPage({
                 <span>Book a Demo</span>
                 <ArrowRight className="h-4 w-4" />
               </a>
-              <button
-                type="button"
+              <a
+                href={WINDOWS_EXE_URL}
+                download={WINDOWS_EXE_FILENAME}
                 onClick={() => onDownload("windows")}
                 className="inline-flex items-center gap-2 rounded-full border border-white/15 bg-[#0c1015] px-5 py-3 text-sm font-medium text-zinc-100 hover:bg-white/[0.06] transition-colors cursor-pointer"
               >
                 <Download className="h-4 w-4 text-zinc-300" />
-                <span>Download</span>
-              </button>
+                <span>Download for Windows (.exe)</span>
+              </a>
             </div>
 
             <div className="flex flex-wrap items-center gap-x-4 gap-y-2 pt-2 text-xs text-zinc-400">
@@ -1452,9 +1447,9 @@ export function LandingPage({
                   "WASAPI native system audio capture",
                   "4 GB RAM, 150 MB disk space",
                 ],
-                cta: "Download Windows App",
+                cta: "Download for Windows (.exe)",
                 foot: "Running Windows 7/8 or older hardware? Grab the Lightweight Helper (.exe) in your dashboard.",
-                action: () => onDownload("windows"),
+                platform: "windows" as DownloadPlatform,
               },
               {
                 icon: Laptop,
@@ -1468,7 +1463,7 @@ export function LandingPage({
                 ],
                 cta: "Download macOS App",
                 foot: "Signed and notarized DMG with guided audio permission setup in under 60 seconds.",
-                action: () => onDownload("macos"),
+                platform: "macos" as DownloadPlatform,
               },
               {
                 icon: Smartphone,
@@ -1482,7 +1477,7 @@ export function LandingPage({
                 ],
                 cta: "Download Android App",
                 foot: "Prefer zero install on iOS or Android? Open the local QR URL directly in your mobile browser.",
-                action: () => onDownload("extension"),
+                platform: "windows" as DownloadPlatform,
               },
             ].map((dl) => {
               const Icon = dl.icon;
@@ -1519,14 +1514,15 @@ export function LandingPage({
                   </div>
 
                   <div className="space-y-2.5">
-                    <button
-                      type="button"
-                      onClick={dl.action}
+                    <a
+                      href={WINDOWS_EXE_URL}
+                      download={WINDOWS_EXE_FILENAME}
+                      onClick={() => onDownload(dl.platform)}
                       className="w-full inline-flex items-center justify-center gap-2 rounded-full bg-[#c6f527] px-4 py-2.5 text-xs font-bold text-[#050709] hover:bg-[#b5e41c] transition-colors cursor-pointer"
                     >
                       <Download className="h-3.5 w-3.5" />
                       <span>{dl.cta}</span>
-                    </button>
+                    </a>
                     <p className="text-[11px] leading-relaxed text-[#6d7367]">
                       {dl.foot}
                     </p>
