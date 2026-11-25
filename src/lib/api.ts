@@ -18,7 +18,8 @@ declare global {
 
 const SERVER_STORAGE_KEY = "crackpilot_api_base_url";
 const DEFAULT_DESKTOP_API_BASE =
-  (import.meta.env.VITE_API_BASE_URL as string | undefined)?.trim() ||
+  ((import.meta as unknown as { env?: Record<string, string | undefined> }).env
+    ?.VITE_API_BASE_URL?.trim()) ||
   "https://ais-pre-xd2kveu6r7j7jhuqh3qugu-628952540927.asia-southeast1.run.app";
 
 export function isDesktopApp(): boolean {
@@ -32,7 +33,9 @@ export function isDesktopApp(): boolean {
 
 export function getApiBaseUrl(): string {
   if (typeof window === "undefined") return "";
-  const envBase = (import.meta.env.VITE_API_BASE_URL as string | undefined)
+  const envBase = (
+    import.meta as unknown as { env?: Record<string, string | undefined> }
+  ).env?.VITE_API_BASE_URL
     ?.trim()
     ?.replace(/\/+$/, "");
 

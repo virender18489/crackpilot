@@ -1,5 +1,5 @@
 import type { SessionTokenState, TargetProfile, UserAccount } from "../types";
-import { apiUrl } from "./api";
+import { apiUrl, isDesktopApp } from "./api";
 
 const STORAGE_KEYS = {
   user: "crackpilot_user_v1",
@@ -98,9 +98,9 @@ function randomHex(len: number): string {
 }
 
 /**
- * Safely fetches JSON from the backend API. Returns `{ ok: true, data }` only
- * when the response is genuinely JSON (preventing crashes on static hosts like
- * Vercel where missing /api/* routes return plain-text/HTML 404 pages).
+ * Safely fetches JSON from the backend API with a 3.5s timeout. Returns
+ * `{ reachable: true, ... }` ONLY when the response is valid JSON, so HTML/404
+ * pages from Vercel or auth proxies can never trigger "Unexpected token '<'".
  */
 export async function tryApiJson<T>(
   path: string,
@@ -109,17 +109,27 @@ export async function tryApiJson<T>(
   | { reachable: true; ok: boolean; status: number; data: T }
   | { reachable: false }
 > {
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), 3500);
   try {
-    const resp = await fetch(apiUrl(path), init);
+    const resp = await fetch(apiUrl(path), {
+      ...init,
+      signal: init?.signal ?? controller.signal,
+    });
     const contentType = resp.headers.get("content-type") || "";
     if (!contentType.includes("application/json")) {
       return { reachable: false };
     }
     const text = await resp.text();
+    if (!text.trim() || text.trim().startsWith("<")) {
+      return { reachable: false };
+    }
     const data = JSON.parse(text) as T;
     return { reachable: true, ok: resp.ok, status: resp.status, data };
   } catch {
     return { reachable: false };
+  } finally {
+    window.clearTimeout(timer);
   }
 }
 
@@ -128,6 +138,7 @@ export async function hydrateWorkspaceState(defaultProfile: TargetProfile): Prom
   token: SessionTokenState | null;
   profile: TargetProfile;
 }> {
+  const desktop = isDesktopApp();
   const res = await tryApiJson<{
     user?: UserAccount | null;
     token?: SessionTokenState | null;
@@ -136,8 +147,9 @@ export async function hydrateWorkspaceState(defaultProfile: TargetProfile): Prom
 
   if (res.reachable && res.ok) {
     const user = res.data.user ?? readStorage<UserAccount>(STORAGE_KEYS.user);
-    const token =
-      res.data.token ?? readStorage<SessionTokenState>(STORAGE_KEYS.token);
+    const token = desktop
+      ? null
+      : res.data.token ?? readStorage<SessionTokenState>(STORAGE_KEYS.token);
     const profile =
       res.data.profile ??
       readStorage<TargetProfile>(STORAGE_KEYS.profile) ??
@@ -147,7 +159,7 @@ export async function hydrateWorkspaceState(defaultProfile: TargetProfile): Prom
 
   return {
     user: readStorage<UserAccount>(STORAGE_KEYS.user),
-    token: readStorage<SessionTokenState>(STORAGE_KEYS.token),
+    token: desktop ? null : readStorage<SessionTokenState>(STORAGE_KEYS.token),
     profile: readStorage<TargetProfile>(STORAGE_KEYS.profile) ?? defaultProfile,
   };
 }
@@ -253,18 +265,33 @@ export async function verifySessionToken(submittedToken: string): Promise<{
   }
 
   const stored = readStorage<SessionTokenState>(STORAGE_KEYS.token);
-  if (stored && submitted !== stored.token) {
-    throw new Error("Invalid token. Copy the exact token from Dashboard → Overview.");
-  }
-  if (!stored && !/^CP-[A-Z0-9-]+$/i.test(submitted)) {
-    throw new Error("Invalid token format. Generate a token in Dashboard → Overview first.");
+  const validFormat = /^CP-[A-Z0-9-]{6,}$/i.test(submitted);
+
+  // In Desktop .exe standalone mode, accept any freshly generated CP-... token from Dashboard
+  if (isDesktopApp()) {
+    if (!validFormat) {
+      throw new Error(
+        "Invalid token format. Copy your CP-XXXX-XXXX-XXXX token from Dashboard → Overview."
+      );
+    }
+  } else {
+    if (stored && submitted !== stored.token) {
+      throw new Error(
+        "Invalid token. Copy the exact token from Dashboard → Overview."
+      );
+    }
+    if (!stored && !validFormat) {
+      throw new Error(
+        "Invalid token format. Generate a token in Dashboard → Overview first."
+      );
+    }
   }
 
   const verified: SessionTokenState = {
-    token: stored ? stored.token : submitted,
-    createdAt: stored ? stored.createdAt : new Date().toISOString(),
+    token: submitted,
+    createdAt: new Date().toISOString(),
     authenticated: true,
-    sessionActive: stored ? stored.sessionActive : false,
+    sessionActive: false,
   };
   const savedProfile = readStorage<TargetProfile>(STORAGE_KEYS.profile) ?? undefined;
   writeStorage(STORAGE_KEYS.token, verified);

@@ -1705,9 +1705,14 @@ export function SoftwareOverlay({
                   <KeyRound className="h-5 w-5" />
                 </span>
                 <div>
-                  <h2 className="text-base font-semibold text-white">
-                    Authenticate Crackpilot
-                  </h2>
+                  <div className="flex items-center gap-2">
+                    <h2 className="text-base font-semibold text-white">
+                      Authenticate Crackpilot
+                    </h2>
+                    <span className="rounded bg-slate-800 px-1.5 py-0.5 font-mono text-[10px] text-sky-300">
+                      v1.0.2
+                    </span>
+                  </div>
                   <p className="text-xs text-slate-400">
                     Copy the Generated Token from Dashboard → Overview and paste
                     it below.

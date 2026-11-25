@@ -11,8 +11,38 @@ const path = require("path");
 
 let mainWindow = null;
 
+// Ensure clicking the Desktop icon again brings back the hidden/minimized Crackpilot window
+const gotSingleInstanceLock = app.requestSingleInstanceLock();
+if (!gotSingleInstanceLock) {
+  app.quit();
+} else {
+  app.on("second-instance", () => {
+    showOverlayWindow();
+  });
+}
+
 function resolveIconPath() {
   return path.join(__dirname, "../public/favicon.ico");
+}
+
+function showOverlayWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    createWindow();
+    return;
+  }
+  if (mainWindow.isMinimized()) {
+    mainWindow.restore();
+  }
+  mainWindow.setSkipTaskbar(true);
+  mainWindow.show();
+  mainWindow.focus();
+  mainWindow.setAlwaysOnTop(true, "screen-saver");
+}
+
+function hideOverlayWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  mainWindow.setSkipTaskbar(true);
+  mainWindow.hide();
 }
 
 function createWindow() {
@@ -27,6 +57,7 @@ function createWindow() {
     transparent: true,
     backgroundColor: "#00000000",
     alwaysOnTop: true,
+    skipTaskbar: true,
     resizable: true,
     minimizable: true,
     maximizable: true,
@@ -42,9 +73,18 @@ function createWindow() {
 
   mainWindow = win;
   win.setMenuBarVisibility(false);
+  win.setSkipTaskbar(true);
   win.setAlwaysOnTop(true, "screen-saver");
   win.setContentProtection(true);
 
+  win.on("show", () => {
+    if (!win.isDestroyed()) {
+      win.setSkipTaskbar(true);
+      win.setAlwaysOnTop(true, "screen-saver");
+    }
+  });
+
+  // Always open Crackpilot Software Authentication & Live Overlay directly from Desktop icon
   const remoteAppUrl = process.env.CRACKPILOT_APP_URL;
   if (remoteAppUrl) {
     const targetUrl = remoteAppUrl.includes("?")
@@ -56,7 +96,6 @@ function createWindow() {
       });
     });
   } else {
-    // Open Crackpilot Live Software Overlay directly when user clicks the Desktop icon
     win.loadFile(path.join(__dirname, "../dist/index.html"), {
       query: { mode: "software" },
     });
@@ -68,26 +107,19 @@ function createWindow() {
 }
 
 function registerIpcHandlers() {
+  // With skipTaskbar: true + frameless transparent window on Windows 11,
+  // hide() cleanly minimizes/hides the window immediately without leaving a taskbar icon.
+  // Press Alt+H or double-click the Desktop icon to restore it anytime.
   ipcMain.handle("crackpilot:minimize", () => {
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.minimize();
-    }
+    hideOverlayWindow();
   });
 
   ipcMain.handle("crackpilot:hide", () => {
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.hide();
-    }
+    hideOverlayWindow();
   });
 
   ipcMain.handle("crackpilot:show", () => {
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      if (mainWindow.isMinimized()) {
-        mainWindow.restore();
-      }
-      mainWindow.show();
-      mainWindow.focus();
-    }
+    showOverlayWindow();
   });
 
   ipcMain.handle("crackpilot:toggle-maximize", () => {
@@ -129,7 +161,6 @@ function registerIpcHandlers() {
 }
 
 app.whenReady().then(() => {
-  // Allow mic, screen capture, and system audio permissions seamlessly
   session.defaultSession.setPermissionRequestHandler(
     (_webContents, permission, callback) => {
       const allowed = [
@@ -143,7 +174,6 @@ app.whenReady().then(() => {
     }
   );
 
-  // Enable native getDisplayMedia screen + Windows loopback system audio capture
   if (typeof session.defaultSession.setDisplayMediaRequestHandler === "function") {
     session.defaultSession.setDisplayMediaRequestHandler(
       async (_request, callback) => {
@@ -156,7 +186,7 @@ app.whenReady().then(() => {
             return;
           }
         } catch {
-          // Fall back to empty grant on error
+          // Fall back to empty grant
         }
         callback({});
       }
@@ -166,26 +196,21 @@ app.whenReady().then(() => {
   registerIpcHandlers();
   createWindow();
 
-  // Global OS shortcut Alt+H to instantly hide or restore the Crackpilot HUD
+  // Global OS shortcut Alt+H to instantly hide or restore Crackpilot from any app
   globalShortcut.register("Alt+H", () => {
-    if (!mainWindow || mainWindow.isDestroyed()) return;
+    if (!mainWindow || mainWindow.isDestroyed()) {
+      createWindow();
+      return;
+    }
     if (mainWindow.isVisible() && !mainWindow.isMinimized()) {
-      mainWindow.hide();
+      hideOverlayWindow();
     } else {
-      if (mainWindow.isMinimized()) {
-        mainWindow.restore();
-      }
-      mainWindow.show();
-      mainWindow.focus();
+      showOverlayWindow();
     }
   });
 
   app.on("activate", () => {
-    if (BrowserWindow.getAllWindows().length === 0) {
-      createWindow();
-    } else if (mainWindow) {
-      mainWindow.show();
-    }
+    showOverlayWindow();
   });
 });
 
