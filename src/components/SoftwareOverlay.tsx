@@ -31,6 +31,13 @@ import {
 import { AnswerView } from "./AnswerView";
 import { SAMPLE_INTERVIEW_QUESTIONS } from "../data/crackpilotPackages";
 import { apiUrl, getApiBaseUrl, isDesktopApp } from "../lib/api";
+import {
+  saveTargetProfile,
+  startLiveSession,
+  stopLiveSession,
+  subscribeLocalSync,
+  verifySessionToken,
+} from "../lib/clientStore";
 import type {
   AnswerLanguage,
   AnswerStyle,
@@ -228,19 +235,7 @@ export function SoftwareOverlay({
 
     setVerifyingToken(true);
     try {
-      const resp = await fetch(apiUrl("/api/token/verify"), {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ token: tokenInput.trim() }),
-      });
-      const data = (await resp.json()) as {
-        token?: SessionTokenState;
-        profile?: TargetProfile;
-        error?: string;
-      };
-      if (!resp.ok || !data.token) {
-        throw new Error(data.error || "Token verification failed.");
-      }
+      const data = await verifySessionToken(tokenInput.trim());
       onTokenChange(data.token);
       if (data.profile) onProfileChange(data.profile);
     } catch (err) {
@@ -256,15 +251,7 @@ export function SoftwareOverlay({
     setAuthError(null);
     setStartingSession(true);
     try {
-      const resp = await fetch(apiUrl("/api/session/start"), { method: "POST" });
-      const data = (await resp.json()) as {
-        token?: SessionTokenState;
-        profile?: TargetProfile;
-        error?: string;
-      };
-      if (!resp.ok || !data.token) {
-        throw new Error(data.error || "Could not start session.");
-      }
+      const data = await startLiveSession();
       onTokenChange(data.token);
       if (data.profile) onProfileChange(data.profile);
       setIsConnected(true);
@@ -418,8 +405,14 @@ export function SoftwareOverlay({
           body: JSON.stringify(body),
         });
 
-        if (!resp.ok || !resp.body) {
+        const contentType = resp.headers.get("content-type") || "";
+        if (!resp.ok || !resp.body || contentType.includes("text/html")) {
           const errText = await resp.text();
+          if (contentType.includes("text/html") || errText.trim().startsWith("<")) {
+            throw new Error(
+              "Live AI backend server is not reachable from this build. Run Crackpilot with your Node.js server or set VITE_API_BASE_URL."
+            );
+          }
           throw new Error(errText || `Server returned ${resp.status}`);
         }
 
@@ -601,10 +594,15 @@ export function SoftwareOverlay({
 
   useEffect(() => {
     connectEventStream();
+    const unsubLocal = subscribeLocalSync((msg) => {
+      if (msg.token !== undefined) onTokenChange(msg.token);
+      if (msg.profile) onProfileChange(msg.profile);
+    });
     return () => {
+      unsubLocal();
       sseRef.current?.close();
     };
-  }, [connectEventStream]);
+  }, [connectEventStream, onProfileChange, onTokenChange]);
 
   useEffect(() => {
     const onOffline = () => {
@@ -759,6 +757,12 @@ export function SoftwareOverlay({
               profileRef.current.answerLanguage === "Hindi" ? "hi" : "auto",
           }),
         });
+        const contentType = resp.headers.get("content-type") || "";
+        if (!contentType.includes("application/json")) {
+          throw new Error(
+            "Transcription server returned a non-JSON response. Please check your Crackpilot server connection."
+          );
+        }
         const data = (await resp.json()) as { text?: string; error?: string };
         if (!resp.ok) {
           throw new Error(data.error || "Transcription failed.");
@@ -1223,7 +1227,10 @@ export function SoftwareOverlay({
 
     try {
       const resp = await fetch(apiUrl("/api/health"), { cache: "no-store" });
-      if (!resp.ok) throw new Error("Server unreachable");
+      const contentType = resp.headers.get("content-type") || "";
+      if (!resp.ok || !contentType.includes("application/json")) {
+        throw new Error("Server unreachable");
+      }
       setIsConnected(true);
       connectEventStream();
       setStatusNotice("Reconnected — Live Stream Active.");
@@ -1289,7 +1296,7 @@ export function SoftwareOverlay({
     }
     if (abortRef.current) abortRef.current.abort();
     setIsConnected(false);
-    void fetch(apiUrl("/api/session/stop"), { method: "POST" });
+    void stopLiveSession();
     setStatusNotice("Session Disconnected. Press Reconnect (Alt+R) to resume.");
   }, [stopAudioListening, stopScreenStream]);
 
@@ -1426,11 +1433,7 @@ export function SoftwareOverlay({
   const updateInlineProfile = (patch: Partial<TargetProfile>) => {
     const next = { ...profile, ...patch };
     onProfileChange(next);
-    void fetch(apiUrl("/api/profile"), {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(next),
-    });
+    void saveTargetProfile(next);
   };
 
   const currentLayer = LAYER_OPACITIES[layerIdx];
@@ -1538,7 +1541,7 @@ export function SoftwareOverlay({
                 type="button"
                 onClick={() => void handlePopOutFloatingWindow()}
                 title="Float Always On Top Across Tabs"
-                className="rounded p-1.5 hover:bg-slate-800 hover:text-sky-300 transition-colors cursor-pointer"
+                className="app-no-drag rounded p-1.5 hover:bg-slate-800 hover:text-sky-300 transition-colors cursor-pointer"
               >
                 <ExternalLink className="h-3.5 w-3.5" />
               </button>
@@ -1546,16 +1549,14 @@ export function SoftwareOverlay({
             <button
               type="button"
               onClick={() => {
-                setIsCompact((c) => {
-                  const next = !c;
-                  if (window.crackpilotDesktop?.isElectron) {
-                    void window.crackpilotDesktop.setCompact(next);
-                  }
-                  return next;
-                });
+                if (window.crackpilotDesktop?.isElectron) {
+                  void window.crackpilotDesktop.minimizeWindow();
+                } else {
+                  setIsCompact((c) => !c);
+                }
               }}
-              title="Compact / Normal height"
-              className="rounded p-1.5 hover:bg-slate-800 hover:text-white transition-colors cursor-pointer"
+              title={desktopMode ? "Minimize to Taskbar" : "Compact / Normal height"}
+              className="app-no-drag rounded p-1.5 hover:bg-slate-800 hover:text-white transition-colors cursor-pointer"
             >
               <Minus className="h-3.5 w-3.5" />
             </button>
@@ -1572,7 +1573,7 @@ export function SoftwareOverlay({
                 }
               }}
               title="Maximize / Restore"
-              className="rounded p-1.5 hover:bg-slate-800 hover:text-white transition-colors cursor-pointer"
+              className="app-no-drag rounded p-1.5 hover:bg-slate-800 hover:text-white transition-colors cursor-pointer"
             >
               <Square className="h-3 w-3" />
             </button>
@@ -1586,7 +1587,7 @@ export function SoftwareOverlay({
                 }
               }}
               title="Hide Overlay (Alt+H)"
-              className="rounded p-1.5 hover:bg-rose-500/80 hover:text-white transition-colors cursor-pointer"
+              className="app-no-drag rounded p-1.5 hover:bg-rose-500/80 hover:text-white transition-colors cursor-pointer"
             >
               <X className="h-3.5 w-3.5" />
             </button>

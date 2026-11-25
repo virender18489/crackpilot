@@ -28,6 +28,9 @@ function createWindow() {
     backgroundColor: "#00000000",
     alwaysOnTop: true,
     resizable: true,
+    minimizable: true,
+    maximizable: true,
+    closable: true,
     hasShadow: true,
     webPreferences: {
       preload: path.join(__dirname, "preload.cjs"),
@@ -65,6 +68,12 @@ function createWindow() {
 }
 
 function registerIpcHandlers() {
+  ipcMain.handle("crackpilot:minimize", () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.minimize();
+    }
+  });
+
   ipcMain.handle("crackpilot:hide", () => {
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.hide();
@@ -73,6 +82,9 @@ function registerIpcHandlers() {
 
   ipcMain.handle("crackpilot:show", () => {
     if (mainWindow && !mainWindow.isDestroyed()) {
+      if (mainWindow.isMinimized()) {
+        mainWindow.restore();
+      }
       mainWindow.show();
       mainWindow.focus();
     }
@@ -157,9 +169,12 @@ app.whenReady().then(() => {
   // Global OS shortcut Alt+H to instantly hide or restore the Crackpilot HUD
   globalShortcut.register("Alt+H", () => {
     if (!mainWindow || mainWindow.isDestroyed()) return;
-    if (mainWindow.isVisible()) {
+    if (mainWindow.isVisible() && !mainWindow.isMinimized()) {
       mainWindow.hide();
     } else {
+      if (mainWindow.isMinimized()) {
+        mainWindow.restore();
+      }
       mainWindow.show();
       mainWindow.focus();
     }

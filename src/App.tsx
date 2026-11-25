@@ -1,11 +1,14 @@
 import { useEffect, useState } from "react";
 import { Dashboard } from "./components/Dashboard";
-import { InstallerModal } from "./components/InstallerModal";
 import { LandingPage } from "./components/LandingPage";
 import { LoginView } from "./components/LoginView";
 import { SoftwareOverlay } from "./components/SoftwareOverlay";
-import type { DownloadPlatform } from "./data/crackpilotPackages";
 import { apiUrl, isDesktopApp } from "./lib/api";
+import {
+  hydrateWorkspaceState,
+  logoutAccount,
+  subscribeLocalSync,
+} from "./lib/clientStore";
 import type {
   DashboardTab,
   RootView,
@@ -44,72 +47,110 @@ export default function App() {
   const [user, setUser] = useState<UserAccount | null>(null);
   const [tokenState, setTokenState] = useState<SessionTokenState | null>(null);
   const [profile, setProfile] = useState<TargetProfile>(DEFAULT_PROFILE);
-  const [installerOpen, setInstallerOpen] = useState(false);
-  const [installerPlatform, setInstallerPlatform] =
-    useState<DownloadPlatform>("windows");
 
-  // Hydrate auth, token, and target profile from backend
+  // Hydrate auth, token, and target profile safely from backend or local storage
   useEffect(() => {
     let active = true;
-    fetch(apiUrl("/api/auth/me"))
-      .then((r) => r.json())
-      .then(
-        (data: {
-          user?: UserAccount | null;
-          token?: SessionTokenState | null;
-          profile?: TargetProfile;
-        }) => {
-          if (!active) return;
-          if (data.user) setUser(data.user);
-          if (data.token) setTokenState(data.token);
-          if (data.profile) setProfile(data.profile);
-        }
-      )
-      .catch(() => {
-        // Ignore initial network hiccup
-      });
+    void hydrateWorkspaceState(DEFAULT_PROFILE).then((state) => {
+      if (!active) return;
+      if (state.user) setUser(state.user);
+      if (state.token) setTokenState(state.token);
+      if (state.profile) setProfile(state.profile);
+    });
 
-    // Keep Dashboard & Software tabs synced via server SSE events
-    const sse = new EventSource(apiUrl("/api/events"));
-    sse.onmessage = (ev) => {
-      try {
-        const msg = JSON.parse(ev.data) as {
-          token?: SessionTokenState | null;
-          profile?: TargetProfile;
-        };
-        if (msg.token !== undefined) setTokenState(msg.token);
-        if (msg.profile) setProfile(msg.profile);
-      } catch {
-        // Ignore malformed payloads
-      }
-    };
+    const unsubLocal = subscribeLocalSync((msg) => {
+      if (msg.token !== undefined) setTokenState(msg.token);
+      if (msg.profile) setProfile(msg.profile);
+    });
+
+    // Keep Dashboard & Software tabs synced via server SSE events when backend is present
+    let sse: EventSource | null = null;
+    try {
+      sse = new EventSource(apiUrl("/api/events"));
+      sse.onmessage = (ev) => {
+        try {
+          const msg = JSON.parse(ev.data) as {
+            token?: SessionTokenState | null;
+            profile?: TargetProfile;
+          };
+          if (msg.token !== undefined) setTokenState(msg.token);
+          if (msg.profile) setProfile(msg.profile);
+        } catch {
+          // Ignore malformed payloads
+        }
+      };
+      sse.onerror = () => {
+        // Close silently if hosted on static frontend without SSE server
+        sse?.close();
+      };
+    } catch {
+      sse = null;
+    }
 
     return () => {
       active = false;
-      sse.close();
+      unsubLocal();
+      sse?.close();
     };
   }, []);
 
-  const handleOpenInstallerModal = (platform: DownloadPlatform) => {
-    setInstallerPlatform(platform);
-    setInstallerOpen(true);
-  };
-
   const handleLogout = async () => {
-    await fetch(apiUrl("/api/auth/logout"), { method: "POST" }).catch(() => {});
+    await logoutAccount();
     setUser(null);
     setView("landing");
   };
 
-  const installerModal = (
-    <InstallerModal
-      open={installerOpen}
-      platform={installerPlatform}
-      tokenState={tokenState}
-      onTokenChange={setTokenState}
-      onClose={() => setInstallerOpen(false)}
-      onLaunchSoftware={() => setView("software")}
-      onOpenDashboard={() => {
+  if (view === "software") {
+    return (
+      <SoftwareOverlay
+        tokenState={tokenState}
+        profile={profile}
+        onTokenChange={setTokenState}
+        onProfileChange={setProfile}
+        onGoDashboard={() => {
+          setDashboardTab("overview");
+          setView("dashboard");
+        }}
+      />
+    );
+  }
+
+  if (view === "login") {
+    return (
+      <LoginView
+        onBackHome={() => setView("landing")}
+        onLoginSuccess={(loggedInUser) => {
+          setUser(loggedInUser);
+          setDashboardTab("overview");
+          setView("dashboard");
+        }}
+        onLaunchSoftware={() => setView("software")}
+      />
+    );
+  }
+
+  if (view === "dashboard") {
+    return (
+      <Dashboard
+        user={user}
+        activeTab={dashboardTab}
+        onTabChange={setDashboardTab}
+        tokenState={tokenState}
+        profile={profile}
+        onTokenChange={setTokenState}
+        onProfileChange={setProfile}
+        onOpenSoftware={() => setView("software")}
+        onLogout={() => void handleLogout()}
+        onGoHome={() => setView("landing")}
+      />
+    );
+  }
+
+  return (
+    <LandingPage
+      isLoggedIn={Boolean(user)}
+      onGoLogin={() => setView("login")}
+      onGoDashboard={() => {
         setDashboardTab("overview");
         setView("dashboard");
       }}
@@ -117,82 +158,7 @@ export default function App() {
         setDashboardTab("testing");
         setView("dashboard");
       }}
+      onOpenSoftware={() => setView("software")}
     />
-  );
-
-  if (view === "software") {
-    return (
-      <>
-        <SoftwareOverlay
-          tokenState={tokenState}
-          profile={profile}
-          onTokenChange={setTokenState}
-          onProfileChange={setProfile}
-          onGoDashboard={() => {
-            setDashboardTab("overview");
-            setView("dashboard");
-          }}
-        />
-        {installerModal}
-      </>
-    );
-  }
-
-  if (view === "login") {
-    return (
-      <>
-        <LoginView
-          onBackHome={() => setView("landing")}
-          onLoginSuccess={(loggedInUser) => {
-            setUser(loggedInUser);
-            setDashboardTab("overview");
-            setView("dashboard");
-          }}
-          onLaunchSoftware={() => setView("software")}
-        />
-        {installerModal}
-      </>
-    );
-  }
-
-  if (view === "dashboard") {
-    return (
-      <>
-        <Dashboard
-          user={user}
-          activeTab={dashboardTab}
-          onTabChange={setDashboardTab}
-          tokenState={tokenState}
-          profile={profile}
-          onTokenChange={setTokenState}
-          onProfileChange={setProfile}
-          onOpenSoftware={() => setView("software")}
-          onDownload={(platform) => handleOpenInstallerModal(platform)}
-          onLogout={() => void handleLogout()}
-          onGoHome={() => setView("landing")}
-        />
-        {installerModal}
-      </>
-    );
-  }
-
-  return (
-    <>
-      <LandingPage
-        isLoggedIn={Boolean(user)}
-        onGoLogin={() => setView("login")}
-        onGoDashboard={() => {
-          setDashboardTab("overview");
-          setView("dashboard");
-        }}
-        onOpenTestingLab={() => {
-          setDashboardTab("testing");
-          setView("dashboard");
-        }}
-        onOpenSoftware={() => setView("software")}
-        onDownload={(platform) => handleOpenInstallerModal(platform)}
-      />
-      {installerModal}
-    </>
   );
 }

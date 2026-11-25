@@ -40,7 +40,6 @@ interface LandingPageProps {
   onGoDashboard: () => void;
   onOpenTestingLab: () => void;
   onOpenSoftware: () => void;
-  onDownload: (platform: DownloadPlatform) => void;
 }
 
 const HERO_TABS = [
@@ -324,7 +323,6 @@ export function LandingPage({
   onGoDashboard,
   onOpenTestingLab,
   onOpenSoftware,
-  onDownload,
 }: LandingPageProps) {
   const [heroTab, setHeroTab] = useState(0);
   const [roleTab, setRoleTab] = useState(0);
@@ -397,10 +395,8 @@ export function LandingPage({
                   <a
                     href={WINDOWS_EXE_URL}
                     download={WINDOWS_EXE_FILENAME}
-                    onClick={() => {
-                      setDownloadMenuOpen(false);
-                      onDownload("windows");
-                    }}
+                    rel="noopener noreferrer"
+                    onClick={() => setDownloadMenuOpen(false)}
                     className="w-full flex items-center justify-between rounded-lg px-3 py-2 text-left text-xs text-zinc-200 hover:bg-white/[0.06] cursor-pointer"
                   >
                     <span>Download for Windows (.exe)</span>
@@ -479,7 +475,7 @@ export function LandingPage({
               <a
                 href={WINDOWS_EXE_URL}
                 download={WINDOWS_EXE_FILENAME}
-                onClick={() => onDownload("windows")}
+                rel="noopener noreferrer"
                 className="inline-flex items-center gap-2 rounded-full border border-white/15 bg-[#0c1015] px-5 py-3 text-sm font-medium text-zinc-100 hover:bg-white/[0.06] transition-colors cursor-pointer"
               >
                 <Download className="h-4 w-4 text-zinc-300" />
@@ -1517,7 +1513,7 @@ export function LandingPage({
                     <a
                       href={WINDOWS_EXE_URL}
                       download={WINDOWS_EXE_FILENAME}
-                      onClick={() => onDownload(dl.platform)}
+                      rel="noopener noreferrer"
                       className="w-full inline-flex items-center justify-center gap-2 rounded-full bg-[#c6f527] px-4 py-2.5 text-xs font-bold text-[#050709] hover:bg-[#b5e41c] transition-colors cursor-pointer"
                     >
                       <Download className="h-3.5 w-3.5" />

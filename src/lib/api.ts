@@ -1,5 +1,6 @@
 export interface CrackpilotDesktopBridge {
   isElectron: boolean;
+  minimizeWindow: () => Promise<void>;
   hideWindow: () => Promise<void>;
   showWindow: () => Promise<void>;
   toggleMaximize: () => Promise<boolean>;
@@ -31,14 +32,21 @@ export function isDesktopApp(): boolean {
 
 export function getApiBaseUrl(): string {
   if (typeof window === "undefined") return "";
-  if (!isDesktopApp()) return "";
+  const envBase = (import.meta.env.VITE_API_BASE_URL as string | undefined)
+    ?.trim()
+    ?.replace(/\/+$/, "");
+
+  if (!isDesktopApp()) {
+    return envBase || "";
+  }
+
   try {
     const saved = window.localStorage.getItem(SERVER_STORAGE_KEY)?.trim();
     if (saved) return saved.replace(/\/+$/, "");
   } catch {
     // Ignore storage restriction
   }
-  return DEFAULT_DESKTOP_API_BASE.replace(/\/+$/, "");
+  return (envBase || DEFAULT_DESKTOP_API_BASE).replace(/\/+$/, "");
 }
 
 export function setApiBaseUrl(url: string): string {

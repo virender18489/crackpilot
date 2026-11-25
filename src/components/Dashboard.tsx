@@ -29,9 +29,13 @@ import {
 import {
   WINDOWS_EXE_FILENAME,
   WINDOWS_EXE_URL,
-  type DownloadPlatform,
 } from "../data/crackpilotPackages";
-import { apiUrl } from "../lib/api";
+import {
+  extractDocumentText,
+  generateSessionToken,
+  saveTargetProfile,
+  startLiveSession,
+} from "../lib/clientStore";
 import type {
   AnswerLanguage,
   AnswerStyle,
@@ -50,7 +54,6 @@ interface DashboardProps {
   onTokenChange: (token: SessionTokenState | null) => void;
   onProfileChange: (profile: TargetProfile) => void;
   onOpenSoftware: () => void;
-  onDownload: (platform: DownloadPlatform) => void;
   onLogout: () => void;
   onGoHome: () => void;
 }
@@ -88,7 +91,6 @@ export function Dashboard({
   onTokenChange,
   onProfileChange,
   onOpenSoftware,
-  onDownload,
   onLogout,
   onGoHome,
 }: DashboardProps) {
@@ -162,15 +164,8 @@ export function Dashboard({
     setGeneratingToken(true);
     setOverviewNotice(null);
     try {
-      const resp = await fetch(apiUrl("/api/token/generate"), { method: "POST" });
-      const data = (await resp.json()) as {
-        token?: SessionTokenState;
-        error?: string;
-      };
-      if (!resp.ok || !data.token) {
-        throw new Error(data.error || "Failed to generate token.");
-      }
-      onTokenChange(data.token);
+      const token = await generateSessionToken();
+      onTokenChange(token);
       setOverviewNotice(
         "48h Auth Token generated! Copy it, open Crackpilot Software, paste the token, and click Authenticate."
       );
@@ -209,15 +204,8 @@ export function Dashboard({
 
     setStartingSession(true);
     try {
-      const resp = await fetch(apiUrl("/api/session/start"), { method: "POST" });
-      const data = (await resp.json()) as {
-        token?: SessionTokenState;
-        error?: string;
-      };
-      if (!resp.ok || !data.token) {
-        throw new Error(data.error || "Could not start session.");
-      }
-      onTokenChange(data.token);
+      const result = await startLiveSession();
+      onTokenChange(result.token);
       onOpenSoftware();
     } catch (err) {
       setOverviewNotice(
@@ -239,22 +227,7 @@ export function Dashboard({
 
     try {
       const base64 = await fileToBase64(file);
-      const resp = await fetch(apiUrl("/api/profile/extract"), {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          fileBase64: base64,
-          mimeType: file.type || "application/pdf",
-          fileName: file.name,
-          kind,
-        }),
-      });
-      const data = (await resp.json()) as { text?: string; error?: string };
-      if (!resp.ok) {
-        throw new Error(data.error || "Failed to read uploaded file.");
-      }
-
-      const extracted = (data.text || "").trim();
+      const extracted = await extractDocumentText({ file, base64, kind });
       setDraftProfile((prev) =>
         kind === "resume"
           ? { ...prev, resumeFileName: file.name, resumeText: extracted }
@@ -278,19 +251,8 @@ export function Dashboard({
     setSavingProfile(true);
     setProfileNotice(null);
     try {
-      const resp = await fetch(apiUrl("/api/profile"), {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(draftProfile),
-      });
-      const data = (await resp.json()) as {
-        profile?: TargetProfile;
-        error?: string;
-      };
-      if (!resp.ok || !data.profile) {
-        throw new Error(data.error || "Could not save Target Profile.");
-      }
-      onProfileChange(data.profile);
+      const saved = await saveTargetProfile(draftProfile);
+      onProfileChange(saved);
       setProfileNotice(
         "Target Profile saved & synced! Crackpilot software will now tailor every answer to this Role, Resume, and JD."
       );
@@ -782,7 +744,7 @@ export function Dashboard({
                     <a
                       href={WINDOWS_EXE_URL}
                       download={WINDOWS_EXE_FILENAME}
-                      onClick={() => onDownload("windows")}
+                      rel="noopener noreferrer"
                       className="inline-flex items-center justify-center gap-2 rounded-lg border border-white/10 bg-[#080b0f] py-2.5 text-xs font-medium text-zinc-200 hover:border-[#c6f527]/50 hover:text-white transition-colors cursor-pointer"
                     >
                       <Monitor className="h-3.5 w-3.5 text-[#c6f527]" />
@@ -791,7 +753,7 @@ export function Dashboard({
                     <a
                       href={WINDOWS_EXE_URL}
                       download={WINDOWS_EXE_FILENAME}
-                      onClick={() => onDownload("macos")}
+                      rel="noopener noreferrer"
                       className="inline-flex items-center justify-center gap-2 rounded-lg border border-white/10 bg-[#080b0f] py-2.5 text-xs font-medium text-zinc-200 hover:border-[#c6f527]/50 hover:text-white transition-colors cursor-pointer"
                     >
                       <Laptop className="h-3.5 w-3.5 text-[#c6f527]" />
@@ -808,7 +770,7 @@ export function Dashboard({
                     <a
                       href={WINDOWS_EXE_URL}
                       download={WINDOWS_EXE_FILENAME}
-                      onClick={() => onDownload("windows")}
+                      rel="noopener noreferrer"
                       className="inline-flex items-center justify-center gap-2 rounded-lg border border-white/10 bg-[#080b0f] py-2.5 text-xs font-medium text-zinc-200 hover:border-[#c6f527]/50 hover:text-white transition-colors cursor-pointer"
                     >
                       <Download className="h-3.5 w-3.5 text-[#c6f527]" />
@@ -1317,7 +1279,7 @@ export function Dashboard({
                   <a
                     href={WINDOWS_EXE_URL}
                     download={WINDOWS_EXE_FILENAME}
-                    onClick={() => onDownload("windows")}
+                    rel="noopener noreferrer"
                     className="w-full inline-flex items-center justify-center gap-2 rounded-full bg-[#c6f527] px-4 py-2.5 text-xs font-bold text-[#050709] hover:bg-[#b5e41c] transition-colors cursor-pointer"
                   >
                     <Download className="h-4 w-4" />

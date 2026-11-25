@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { ArrowLeft, CheckCircle2, Sparkles } from "lucide-react";
-import { apiUrl } from "../lib/api";
+import { loginAccount } from "../lib/clientStore";
 import type { UserAccount } from "../types";
 
 interface LoginViewProps {
@@ -46,24 +46,11 @@ export function LoginView({ onBackHome, onLoginSuccess }: LoginViewProps) {
 
     setSubmitting(true);
     try {
-      const resp = await fetch(apiUrl("/api/auth/login"), {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          email: email.trim(),
-          name: mode === "signup" && name.trim() ? name.trim() : undefined,
-        }),
+      const user = await loginAccount({
+        email: email.trim(),
+        name: mode === "signup" && name.trim() ? name.trim() : undefined,
       });
-      const data = (await resp.json()) as {
-        ok?: boolean;
-        user?: UserAccount;
-        error?: string;
-      };
-      if (!resp.ok || !data.user) {
-        throw new Error(data.error || "Sign in failed.");
-      }
-
-      onLoginSuccess(data.user);
+      onLoginSuccess(user);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not sign in.");
     } finally {

@@ -2,6 +2,7 @@ const { contextBridge, ipcRenderer } = require("electron");
 
 contextBridge.exposeInMainWorld("crackpilotDesktop", {
   isElectron: true,
+  minimizeWindow: () => ipcRenderer.invoke("crackpilot:minimize"),
   hideWindow: () => ipcRenderer.invoke("crackpilot:hide"),
   showWindow: () => ipcRenderer.invoke("crackpilot:show"),
   toggleMaximize: () => ipcRenderer.invoke("crackpilot:toggle-maximize"),
