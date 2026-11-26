@@ -328,21 +328,22 @@ app.whenReady().then(() => {
   registerIpcHandlers();
   createWindow();
 
-  // Global OS shortcut Alt+H to instantly hide or restore Crackpilot from any app
-  const registered = globalShortcut.register("Alt+H", () => {
-    if (!mainWindow || mainWindow.isDestroyed()) {
-      createWindow();
-      return;
-    }
-    if (mainWindow.isVisible() && !mainWindow.isMinimized()) {
-      hideOverlayWindow();
-    } else {
-      showOverlayWindow();
-    }
-  });
-  if (!registered) {
-    logError("Could not register global shortcut Alt+H (may be in use by another app).");
-  }
+  // === TEMPORARILY COMMENTED OUT: Alt+H global shortcut (uncomment when requested) ===
+  // const registered = globalShortcut.register("Alt+H", () => {
+  //   if (!mainWindow || mainWindow.isDestroyed()) {
+  //     createWindow();
+  //     return;
+  //   }
+  //   if (mainWindow.isVisible() && !mainWindow.isMinimized()) {
+  //     hideOverlayWindow();
+  //   } else {
+  //     showOverlayWindow();
+  //   }
+  // });
+  // if (!registered) {
+  //   logError("Could not register global shortcut Alt+H (may be in use by another app).");
+  // }
+  // ===================================================================================
 
   app.on("activate", () => {
     showOverlayWindow();

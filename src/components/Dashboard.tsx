@@ -65,7 +65,7 @@ const TEST_SHORTCUTS = [
   { combo: "alt+s", label: "Alt+S", action: "Capture Screen / Chat Box" },
   { combo: "alt+v", label: "Alt+V", action: "4s–10s Video Page Scan" },
   { combo: "alt+r", label: "Alt+R", action: "Instant Reconnect" },
-  { combo: "alt+h", label: "Alt+H", action: "Hide / Show Overlay" },
+  // { combo: "alt+h", label: "Alt+H", action: "Hide / Show Overlay" }, // Temporarily commented out (uncomment when requested)
   { combo: "alt+f", label: "Alt+F", action: "Increase Q&A Font Size" },
   { combo: "alt+d", label: "Alt+D", action: "Disconnect Session" },
 ];

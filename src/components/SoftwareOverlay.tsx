@@ -1548,15 +1548,17 @@ export function SoftwareOverlay({
 
       if (!e.altKey) return;
 
-      if (key === "h") {
-        e.preventDefault();
-        if (window.crackpilotDesktop?.isElectron) {
-          void window.crackpilotDesktop.hideWindow();
-        } else {
-          setIsHidden((h) => !h);
-        }
-        return;
-      }
+      // === TEMPORARILY COMMENTED OUT: Alt+H shortcut (uncomment when requested) ===
+      // if (key === "h") {
+      //   e.preventDefault();
+      //   if (window.crackpilotDesktop?.isElectron) {
+      //     void window.crackpilotDesktop.hideWindow();
+      //   } else {
+      //     setIsHidden((h) => !h);
+      //   }
+      //   return;
+      // }
+      // ============================================================================
 
       if (key === "f") {
         e.preventDefault();
