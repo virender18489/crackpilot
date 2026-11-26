@@ -29,9 +29,18 @@ import {
   Zap,
 } from "lucide-react";
 import { AnswerView } from "./AnswerView";
+import { LiveAudioQAEngine } from "./LiveAudioQAEngine";
 import { SAMPLE_INTERVIEW_QUESTIONS } from "../data/crackpilotPackages";
-import { apiUrl, getApiBaseUrl, isDesktopApp } from "../lib/api";
 import {
+  apiUrl,
+  getApiBaseUrl,
+  hasConfiguredBackend,
+  isDesktopApp,
+  setApiBaseUrl,
+} from "../lib/api";
+import {
+  probeBackendHealth,
+  resetBackendHealthCache,
   saveTargetProfile,
   startLiveSession,
   stopLiveSession,
@@ -125,7 +134,10 @@ export function SoftwareOverlay({
 
   // Settings & font drawers
   const [showContextPanel, setShowContextPanel] = useState(false);
+  const [showLiveQaBench, setShowLiveQaBench] = useState(false);
   const [showFontPopover, setShowFontPopover] = useState(false);
+  const [backendUrlInput, setBackendUrlInput] = useState(() => getApiBaseUrl());
+  const [backendSaveNotice, setBackendSaveNotice] = useState<string | null>(null);
 
   // Resizable HUD window width (drag left/right edges or adjust slider)
   const [hudWidthPx, setHudWidthPx] = useState<number>(1060);
@@ -140,6 +152,9 @@ export function SoftwareOverlay({
   const [isMaximized, setIsMaximized] = useState(false);
   const [layerIdx, setLayerIdx] = useState(0);
   const [fontSizePx, setFontSizePx] = useState<number>(15);
+
+  // Master Start / Stop toggle for all software functionality (default stopped -> shows "Start")
+  const [isEngineRunning, setIsEngineRunning] = useState(false);
 
   // Live session connection, glitch, video scan & audio states
   const [isConnected, setIsConnected] = useState(true);
@@ -197,6 +212,7 @@ export function SoftwareOverlay({
   const videoFrameIntervalRef = useRef<number | null>(null);
   const capturedVideoFramesRef = useRef<string[]>([]);
 
+  const isEngineRunningRef = useRef(false);
   const isListeningRef = useRef(false);
   const isConnectedRef = useRef(true);
   const glitchActiveRef = useRef(false);
@@ -208,6 +224,7 @@ export function SoftwareOverlay({
 
   profileRef.current = profile;
   qaListRef.current = qaList;
+  isEngineRunningRef.current = isEngineRunning;
   isConnectedRef.current = isConnected;
   glitchActiveRef.current = glitchCountdown > 0;
   videoDurationRef.current = videoDurationSec;
@@ -239,6 +256,7 @@ export function SoftwareOverlay({
       onTokenChange(data.token);
       if (data.profile) onProfileChange(data.profile);
     } catch (err) {
+      console.error("[Crackpilot Overlay] Token authentication failed:", err);
       setAuthError(
         err instanceof Error ? err.message : "Could not authenticate token."
       );
@@ -256,12 +274,71 @@ export function SoftwareOverlay({
       if (data.profile) onProfileChange(data.profile);
       setIsConnected(true);
     } catch (err) {
+      console.error("[Crackpilot Overlay] Start session failed:", err);
       setAuthError(
         err instanceof Error ? err.message : "Failed to start session."
       );
     } finally {
       setStartingSession(false);
     }
+  };
+
+  const handleMinimizeWindow = () => {
+    const bridge = window.crackpilotDesktop;
+    if (bridge?.isElectron) {
+      console.log("[Crackpilot Overlay] Minimize button clicked -> IPC crackpilot:minimize");
+      void bridge
+        .minimizeWindow()
+        .catch((err) => {
+          console.error("[Crackpilot Overlay] Async minimizeWindow IPC failed, trying sync fallback:", err);
+          if (bridge.minimizeWindowSync) {
+            const ok = bridge.minimizeWindowSync();
+            if (!ok) {
+              setStatusNotice("Could not minimize window — press Alt+H to hide.");
+            }
+          }
+        });
+      return;
+    }
+
+    if (desktopMode) {
+      console.error(
+        "[Crackpilot Overlay] Desktop mode detected but window.crackpilotDesktop preload bridge is missing! Check electron/main.cjs preload path."
+      );
+      setIsHidden(true);
+      return;
+    }
+
+    setIsCompact((c) => !c);
+  };
+
+  const handleToggleMaximize = () => {
+    setIsCompact(false);
+    const bridge = window.crackpilotDesktop;
+    if (bridge?.isElectron) {
+      console.log("[Crackpilot Overlay] Maximize button clicked -> IPC crackpilot:toggle-maximize");
+      void bridge
+        .toggleMaximize()
+        .then((max) => setIsMaximized(Boolean(max)))
+        .catch((err) => {
+          console.error("[Crackpilot Overlay] toggleMaximize IPC failed:", err);
+        });
+      return;
+    }
+    setIsMaximized((m) => !m);
+  };
+
+  const handleHideWindow = () => {
+    const bridge = window.crackpilotDesktop;
+    if (bridge?.isElectron) {
+      console.log("[Crackpilot Overlay] Hide/Close button clicked -> IPC crackpilot:hide");
+      void bridge.hideWindow().catch((err) => {
+        console.error("[Crackpilot Overlay] hideWindow IPC failed:", err);
+        setIsHidden(true);
+      });
+      return;
+    }
+    setIsHidden(true);
   };
 
   // Document Picture-in-Picture Always-On-Top Float Across Browser Tabs
@@ -374,16 +451,18 @@ export function SoftwareOverlay({
       endpoint: "/api/answer" | "/api/analyze-screen" | "/api/analyze-video",
       body: Record<string, unknown>
     ) => {
-      if (!isConnectedRef.current || glitchActiveRef.current) {
+      if (!isEngineRunningRef.current || !isConnectedRef.current || glitchActiveRef.current) {
         setQaList((prev) =>
           prev.map((q) =>
             q.id === qaId
               ? {
                   ...q,
                   isStreaming: false,
-                  error: glitchActiveRef.current
-                    ? "Network paused (Glitch active). Waiting to restore..."
-                    : "Session disconnected. Click Reconnect (Alt+R).",
+                  error: !isEngineRunningRef.current
+                    ? "Software is paused. Click Start to resume AI answers and live listening."
+                    : glitchActiveRef.current
+                      ? "Network paused (Glitch active). Waiting to restore..."
+                      : "Session disconnected. Click Reconnect (Alt+R).",
                 }
               : q
           )
@@ -397,23 +476,45 @@ export function SoftwareOverlay({
       const controller = new AbortController();
       abortRef.current = controller;
 
+      const targetUrl = apiUrl(endpoint);
+      if (!hasConfiguredBackend()) {
+        const msg =
+          "No live AI backend server URL is configured in Desktop mode. Open the ••• menu above and set your Crackpilot Node.js Server URL (e.g. http://localhost:3000).";
+        console.error("[Crackpilot AI] Blocked request — no backend URL configured:", endpoint);
+        setQaList((prev) =>
+          prev.map((q) =>
+            q.id === qaId ? { ...q, isStreaming: false, error: msg } : q
+          )
+        );
+        return;
+      }
+
       try {
-        const resp = await fetch(apiUrl(endpoint), {
+        const resp = await fetch(targetUrl, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           signal: controller.signal,
           body: JSON.stringify(body),
         });
 
-        const contentType = resp.headers.get("content-type") || "";
-        if (!resp.ok || !resp.body || contentType.includes("text/html")) {
+        const contentType = (resp.headers.get("content-type") || "").toLowerCase();
+        if (!resp.ok || !resp.body || !contentType.includes("text/event-stream")) {
           const errText = await resp.text();
-          if (contentType.includes("text/html") || errText.trim().startsWith("<")) {
+          const preview = errText.trim().slice(0, 160).replace(/\s+/g, " ");
+          console.error(
+            `[Crackpilot AI] Invalid response from ${targetUrl} (status=${resp.status}, content-type="${contentType || "none"}", preview="${preview}")`
+          );
+          if (
+            contentType.includes("text/html") ||
+            contentType.includes("text/plain") ||
+            errText.trim().startsWith("<") ||
+            resp.status === 404
+          ) {
             throw new Error(
-              "Live AI backend server is not reachable from this build. Run Crackpilot with your Node.js server or set VITE_API_BASE_URL."
+              "Live AI backend server is not reachable at this URL. Start your Crackpilot Node.js server (npm run dev) or set the Server URL in the ••• settings menu."
             );
           }
-          throw new Error(errText || `Server returned ${resp.status}`);
+          throw new Error(preview || `Server returned ${resp.status}`);
         }
 
         const reader = resp.body.getReader();
@@ -548,52 +649,79 @@ export function SoftwareOverlay({
     [streamAnswerFromEndpoint]
   );
 
-  // Sync live events (Dashboard Start Session, Target Profile updates, Python loopback audio questions)
-  const connectEventStream = useCallback(() => {
+  // Sync live events (Dashboard Start Session, Target Profile updates, Python loopback audio)
+  // Probed via /api/health first so static Vercel & standalone Electron never spam EventSource MIME errors
+  const connectEventStream = useCallback(async (forceProbe = false): Promise<boolean> => {
     if (sseRef.current) {
       sseRef.current.close();
       sseRef.current = null;
     }
-    const source = new EventSource(apiUrl("/api/events"));
-    source.onopen = () => {
-      setIsConnected(true);
-      setIsReconnecting(false);
-    };
-    source.onmessage = (ev) => {
-      try {
-        const data = JSON.parse(ev.data) as {
-          type?: string;
-          question?: string;
-          token?: SessionTokenState | null;
-          profile?: TargetProfile;
-        };
-        if (data.token !== undefined) {
-          onTokenChange(data.token);
+
+    const healthy = await probeBackendHealth(forceProbe);
+    if (!healthy) {
+      return false;
+    }
+
+    const eventsUrl = apiUrl("/api/events");
+    try {
+      const source = new EventSource(eventsUrl);
+      source.onopen = () => {
+        setIsConnected(true);
+        setIsReconnecting(false);
+      };
+      source.onmessage = (ev) => {
+        try {
+          const data = JSON.parse(ev.data) as {
+            type?: string;
+            question?: string;
+            token?: SessionTokenState | null;
+            profile?: TargetProfile;
+          };
+          // Keep fresh Desktop .exe launch at Gate 1 (do not auto-skip from initial "connected" snapshot)
+          if (
+            data.token !== undefined &&
+            !(isDesktopApp() && data.type === "connected")
+          ) {
+            onTokenChange(data.token);
+          }
+          if (data.profile) {
+            onProfileChange(data.profile);
+          }
+          if (
+            data.type === "incoming_question" &&
+            data.question &&
+            sessionActiveRef.current &&
+            isEngineRunningRef.current
+          ) {
+            void askQuestion(data.question);
+          }
+        } catch (parseErr) {
+          console.warn("[Crackpilot Overlay SSE] Malformed SSE payload:", parseErr);
         }
-        if (data.profile) {
-          onProfileChange(data.profile);
+      };
+      source.onerror = () => {
+        console.warn(
+          "[Crackpilot Overlay SSE] EventSource error on",
+          eventsUrl,
+          "— closing stream cleanly."
+        );
+        source.close();
+        if (sseRef.current === source) {
+          sseRef.current = null;
         }
-        if (
-          data.type === "incoming_question" &&
-          data.question &&
-          sessionActiveRef.current
-        ) {
-          void askQuestion(data.question);
+        if (isConnectedRef.current && !glitchActiveRef.current) {
+          setStatusNotice("Live backend stream paused — press Reconnect (Alt+R).");
         }
-      } catch {
-        // Ignore malformed SSE payload
-      }
-    };
-    source.onerror = () => {
-      if (isConnectedRef.current && !glitchActiveRef.current) {
-        setStatusNotice("Connection interrupted — press Reconnect (Alt+R).");
-      }
-    };
-    sseRef.current = source;
+      };
+      sseRef.current = source;
+      return true;
+    } catch (err) {
+      console.error("[Crackpilot Overlay SSE] Failed to open EventSource:", err);
+      return false;
+    }
   }, [askQuestion, onProfileChange, onTokenChange]);
 
   useEffect(() => {
-    connectEventStream();
     const unsubLocal = subscribeLocalSync((msg) => {
       if (msg.token !== undefined) onTokenChange(msg.token);
       if (msg.profile) onProfileChange(msg.profile);
@@ -602,15 +730,15 @@ export function SoftwareOverlay({
       unsubLocal();
       sseRef.current?.close();
     };
-  }, [connectEventStream, onProfileChange, onTokenChange]);
+  }, [onProfileChange, onTokenChange]);
 
   useEffect(() => {
     const onOffline = () => {
       setStatusNotice("Internet disconnected — press Reconnect (Alt+R) when back.");
     };
     const onOnline = () => {
-      if (isConnectedRef.current && !glitchActiveRef.current) {
-        connectEventStream();
+      if (isEngineRunningRef.current && isConnectedRef.current && !glitchActiveRef.current) {
+        void connectEventStream();
         setStatusNotice("Internet restored — live stream reconnected.");
         setTimeout(() => setStatusNotice(null), 2000);
       }
@@ -744,10 +872,18 @@ export function SoftwareOverlay({
       const blob = new Blob(chunks, { type: mimeType });
       if (blob.size < 2200) return;
 
+      if (!hasConfiguredBackend()) {
+        setStatusNotice(
+          "Configure a Crackpilot Node.js Server URL in ••• Settings to transcribe captured system audio."
+        );
+        return;
+      }
+
       setIsTranscribing(true);
+      const transcribeUrl = apiUrl("/api/transcribe");
       try {
         const audioBase64 = await blobToBase64(blob);
-        const resp = await fetch(apiUrl("/api/transcribe"), {
+        const resp = await fetch(transcribeUrl, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -757,13 +893,27 @@ export function SoftwareOverlay({
               profileRef.current.answerLanguage === "Hindi" ? "hi" : "auto",
           }),
         });
-        const contentType = resp.headers.get("content-type") || "";
-        if (!contentType.includes("application/json")) {
+        const contentType = (resp.headers.get("content-type") || "").toLowerCase();
+        const rawText = await resp.text();
+        if (
+          !contentType.includes("application/json") ||
+          !rawText.trim() ||
+          rawText.trim().startsWith("<")
+        ) {
+          console.error(
+            `[Crackpilot Transcribe] Non-JSON response from ${transcribeUrl} (status=${resp.status}, content-type="${contentType || "none"}", preview="${rawText.trim().slice(0, 120)}")`
+          );
           throw new Error(
-            "Transcription server returned a non-JSON response. Please check your Crackpilot server connection."
+            "Transcription server returned a non-JSON response. Check your Server URL in ••• Settings."
           );
         }
-        const data = (await resp.json()) as { text?: string; error?: string };
+        let data: { text?: string; error?: string };
+        try {
+          data = JSON.parse(rawText) as { text?: string; error?: string };
+        } catch (parseErr) {
+          console.error("[Crackpilot Transcribe] JSON parse failed:", parseErr);
+          throw new Error("Transcription server returned invalid JSON.");
+        }
         if (!resp.ok) {
           throw new Error(data.error || "Transcription failed.");
         }
@@ -771,6 +921,7 @@ export function SoftwareOverlay({
           void askQuestion(data.text.trim(), fastMode);
         }
       } catch (err) {
+        console.error("[Crackpilot Transcribe] Error:", err);
         setStatusNotice(
           err instanceof Error ? err.message : "Audio transcription error."
         );
@@ -1226,18 +1377,21 @@ export function SoftwareOverlay({
     setStatusNotice("Reconnecting...");
 
     try {
-      const resp = await fetch(apiUrl("/api/health"), { cache: "no-store" });
-      const contentType = resp.headers.get("content-type") || "";
-      if (!resp.ok || !contentType.includes("application/json")) {
-        throw new Error("Server unreachable");
-      }
+      resetBackendHealthCache();
+      const connected = await connectEventStream(true);
       setIsConnected(true);
-      connectEventStream();
-      setStatusNotice("Reconnected — Live Stream Active.");
-      setTimeout(() => setStatusNotice(null), 1800);
-    } catch {
+      if (connected) {
+        setStatusNotice("Reconnected — Live Stream Active.");
+      } else {
+        setStatusNotice(
+          "Local session active (no remote Node.js backend connected). Set Server URL in ••• Settings for live AI streaming."
+        );
+      }
+      setTimeout(() => setStatusNotice(null), 2600);
+    } catch (err) {
+      console.error("[Crackpilot Overlay] Reconnect failed:", err);
       setStatusNotice(
-        "Reconnect failed — check your internet and press Alt+R again."
+        "Reconnect failed — check your internet or Server URL and press Alt+R again."
       );
     } finally {
       setIsReconnecting(false);
@@ -1274,15 +1428,78 @@ export function SoftwareOverlay({
           glitchTimerRef.current = null;
         }
         setIsConnected(true);
-        connectEventStream();
+        void connectEventStream();
         setStatusNotice("Glitch ended — connection restored automatically.");
         setTimeout(() => setStatusNotice(null), 2200);
       }
     }, 1000);
   }, [connectEventStream]);
 
+  // Master Start / Stop Toggle: starts or cleanly pauses all audio capture, live stream, shortcuts, and AI processing
+  const handleToggleEngineStartStop = useCallback(async () => {
+    if (isEngineRunningRef.current) {
+      isEngineRunningRef.current = false;
+      setIsEngineRunning(false);
+
+      if (glitchTimerRef.current !== null) {
+        window.clearInterval(glitchTimerRef.current);
+        glitchTimerRef.current = null;
+      }
+      if (videoScanTimerRef.current !== null) {
+        window.clearInterval(videoScanTimerRef.current);
+        videoScanTimerRef.current = null;
+      }
+      if (videoFrameIntervalRef.current !== null) {
+        window.clearInterval(videoFrameIntervalRef.current);
+        videoFrameIntervalRef.current = null;
+      }
+      setGlitchCountdown(0);
+      setVideoScanCountdown(0);
+
+      stopAudioListening();
+
+      if (sseRef.current) {
+        sseRef.current.close();
+        sseRef.current = null;
+      }
+      if (abortRef.current) {
+        abortRef.current.abort();
+        abortRef.current = null;
+      }
+      setQaList((prev) =>
+        prev.map((q) => (q.isStreaming ? { ...q, isStreaming: false } : q))
+      );
+      setStatusNotice("Stopped — audio listening, live stream, and AI processing paused.");
+      return;
+    }
+
+    // Start core functionality immediately
+    isEngineRunningRef.current = true;
+    setIsEngineRunning(true);
+    setIsConnected(true);
+    setStatusNotice("Started — live stream & audio listening active.");
+
+    try {
+      resetBackendHealthCache();
+      await connectEventStream(true);
+    } catch (err) {
+      console.error("[Crackpilot Overlay] Start stream failed:", err);
+    }
+
+    if (isEngineRunningRef.current && !isListeningRef.current) {
+      void startMicListening();
+    }
+    setTimeout(() => {
+      setStatusNotice((curr) =>
+        curr === "Started — live stream & audio listening active." ? null : curr
+      );
+    }, 2400);
+  }, [connectEventStream, startMicListening, stopAudioListening]);
+
   // Disconnect (Alt+D)
   const handleDisconnect = useCallback(() => {
+    isEngineRunningRef.current = false;
+    setIsEngineRunning(false);
     if (glitchTimerRef.current !== null) {
       window.clearInterval(glitchTimerRef.current);
       glitchTimerRef.current = null;
@@ -1317,7 +1534,7 @@ export function SoftwareOverlay({
     });
   }, []);
 
-  // All keyboard shortcuts active when session is live
+  // All keyboard shortcuts active when session is live (AI triggers gated by Start/Stop toggle)
   useEffect(() => {
     if (!isSessionLive) return;
     const onKeyDown = (e: KeyboardEvent) => {
@@ -1330,6 +1547,36 @@ export function SoftwareOverlay({
       }
 
       if (!e.altKey) return;
+
+      if (key === "h") {
+        e.preventDefault();
+        if (window.crackpilotDesktop?.isElectron) {
+          void window.crackpilotDesktop.hideWindow();
+        } else {
+          setIsHidden((h) => !h);
+        }
+        return;
+      }
+
+      if (key === "f") {
+        e.preventDefault();
+        handleFontIncreaseCycle();
+        return;
+      }
+
+      if (key === "d") {
+        e.preventDefault();
+        handleDisconnect();
+        return;
+      }
+
+      if (!isEngineRunningRef.current) {
+        if (key === "x" || key === "s" || key === "v" || key === "r" || key === "t") {
+          e.preventDefault();
+          setStatusNotice("Software is stopped — click Start to activate shortcuts and AI.");
+        }
+        return;
+      }
 
       if (key === "t") {
         e.preventDefault();
@@ -1346,19 +1593,6 @@ export function SoftwareOverlay({
       } else if (key === "r") {
         e.preventDefault();
         void handleReconnect();
-      } else if (key === "h") {
-        e.preventDefault();
-        if (window.crackpilotDesktop?.isElectron) {
-          void window.crackpilotDesktop.hideWindow();
-        } else {
-          setIsHidden((h) => !h);
-        }
-      } else if (key === "f") {
-        e.preventDefault();
-        handleFontIncreaseCycle();
-      } else if (key === "d") {
-        e.preventDefault();
-        handleDisconnect();
       }
     };
 
@@ -1474,9 +1708,9 @@ export function SoftwareOverlay({
             ? undefined
             : { width: `min(100%, ${hudWidthPx}px)` }
         }
-        className={`relative flex flex-col overflow-hidden rounded-xl border border-slate-500/35 shadow-2xl backdrop-blur-md transition-colors ${
-          currentLayer.bg
-        } ${
+        className={`relative flex flex-col overflow-hidden rounded-xl border border-slate-500/35 shadow-2xl transition-colors ${
+          desktopMode ? "" : "backdrop-blur-md"
+        } ${currentLayer.bg} ${
           desktopMode
             ? "h-full w-full"
             : isMaximized
@@ -1508,10 +1742,10 @@ export function SoftwareOverlay({
           </>
         )}
 
-        {/* Clean Top Window Bar — ONLY Crackpilot (No "Node + Python", No "Live HUD") */}
-        <header className="app-drag flex h-10 shrink-0 items-center justify-between gap-4 border-b border-slate-700/60 bg-[#0d1220]/95 px-4">
-          {/* Left: Clean Brand Name Only */}
-          <div className="flex items-center gap-2.5 min-w-0">
+        {/* Clean Top Window Bar — Sibling drag spacers NEVER wrap interactive buttons (fixes Windows 11 Electron click hit-testing) */}
+        <header className="relative z-30 flex h-10 shrink-0 items-center justify-between gap-2 border-b border-slate-700/60 bg-[#0d1220]/95 px-3">
+          {/* Left Brand + Drag Zone */}
+          <div className="app-drag flex flex-1 h-full items-center gap-2.5 min-w-0 pl-1">
             <span className="flex h-5 w-5 items-center justify-center rounded bg-[#405fe8] text-[11px] font-bold text-white shrink-0">
               C
             </span>
@@ -1520,22 +1754,40 @@ export function SoftwareOverlay({
             </span>
           </div>
 
-          {/* Center: Classic "..." Handle */}
-          <button
-            type="button"
-            onClick={() => setShowContextPanel((v) => !v)}
-            title="Width, Target Profile & Quick Test Settings"
-            className={`app-no-drag rounded-md px-2.5 py-1 transition-colors cursor-pointer ${
-              showContextPanel
-                ? "bg-slate-700/80 text-sky-300"
-                : "text-slate-400 hover:bg-slate-800 hover:text-slate-100"
-            }`}
-          >
-            <MoreHorizontal className="h-4 w-4" />
-          </button>
+          {/* Center: Classic "..." Handle + Live A/B Engine Toggle (Siblings outside app-drag) */}
+          <div className="app-no-drag relative z-30 flex items-center gap-1.5 shrink-0">
+            <button
+              type="button"
+              onClick={() => setShowContextPanel((v) => !v)}
+              title="Width, Server URL, Target Profile & Quick Test Settings"
+              className={`app-no-drag rounded-md px-2.5 py-1 transition-colors cursor-pointer ${
+                showContextPanel
+                  ? "bg-slate-700/80 text-sky-300"
+                  : "text-slate-400 hover:bg-slate-800 hover:text-slate-100"
+              }`}
+            >
+              <MoreHorizontal className="h-4 w-4" />
+            </button>
+            <button
+              type="button"
+              onClick={() => setShowLiveQaBench((v) => !v)}
+              title="Dual-Pipeline Ultra-Low-Latency Live Audio Q&A (Deepgram+Groq vs Gemini Live)"
+              className={`app-no-drag inline-flex items-center gap-1 rounded-md border px-2 py-1 text-[11px] font-semibold transition-colors cursor-pointer ${
+                showLiveQaBench
+                  ? "border-[#c6f527]/60 bg-[#1a2610] text-[#c6f527]"
+                  : "border-slate-700/80 bg-slate-800/70 text-slate-300 hover:text-white"
+              }`}
+            >
+              <Zap className="h-3 w-3 text-[#c6f527]" />
+              <span>Live A/B</span>
+            </button>
+          </div>
 
-          {/* Right: Float on Top (PiP) + Window Controls (— □ ×) */}
-          <div className="app-no-drag flex items-center gap-1 shrink-0 text-slate-400">
+          {/* Right Drag Spacer */}
+          <div className="app-drag flex-1 h-full" />
+
+          {/* Right: Float on Top (PiP) + Window Controls (— □ ×) — Sibling outside app-drag */}
+          <div className="app-no-drag relative z-30 flex items-center gap-1 shrink-0 text-slate-400">
             {!desktopMode && (
               <button
                 type="button"
@@ -1548,30 +1800,15 @@ export function SoftwareOverlay({
             )}
             <button
               type="button"
-              onClick={() => {
-                if (window.crackpilotDesktop?.isElectron) {
-                  void window.crackpilotDesktop.minimizeWindow();
-                } else {
-                  setIsCompact((c) => !c);
-                }
-              }}
-              title={desktopMode ? "Minimize to Taskbar" : "Compact / Normal height"}
+              onClick={handleMinimizeWindow}
+              title={desktopMode ? "Minimize / Hide (Alt+H to restore)" : "Compact / Normal height"}
               className="app-no-drag rounded p-1.5 hover:bg-slate-800 hover:text-white transition-colors cursor-pointer"
             >
               <Minus className="h-3.5 w-3.5" />
             </button>
             <button
               type="button"
-              onClick={() => {
-                setIsCompact(false);
-                if (window.crackpilotDesktop?.isElectron) {
-                  void window.crackpilotDesktop
-                    .toggleMaximize()
-                    .then((max) => setIsMaximized(max));
-                } else {
-                  setIsMaximized((m) => !m);
-                }
-              }}
+              onClick={handleToggleMaximize}
               title="Maximize / Restore"
               className="app-no-drag rounded p-1.5 hover:bg-slate-800 hover:text-white transition-colors cursor-pointer"
             >
@@ -1579,13 +1816,7 @@ export function SoftwareOverlay({
             </button>
             <button
               type="button"
-              onClick={() => {
-                if (window.crackpilotDesktop?.isElectron) {
-                  void window.crackpilotDesktop.hideWindow();
-                } else {
-                  setIsHidden(true);
-                }
-              }}
+              onClick={handleHideWindow}
               title="Hide Overlay (Alt+H)"
               className="app-no-drag rounded p-1.5 hover:bg-rose-500/80 hover:text-white transition-colors cursor-pointer"
             >
@@ -1670,6 +1901,50 @@ export function SoftwareOverlay({
               </span>
             </div>
 
+            {desktopMode && (
+              <div className="flex flex-wrap items-center gap-2 border-t border-slate-800 pt-2.5">
+                <span className="text-[11px] font-medium text-slate-400 shrink-0">
+                  AI Server URL:
+                </span>
+                <input
+                  type="text"
+                  value={backendUrlInput}
+                  onChange={(e) => setBackendUrlInput(e.target.value)}
+                  placeholder="http://localhost:3000 or https://your-api.com (optional)"
+                  className="flex-1 min-w-[200px] rounded-md border border-slate-700 bg-[#090e1a] px-2.5 py-1 font-mono text-[11px] text-sky-300 placeholder-slate-500 focus:border-sky-500 focus:outline-none"
+                />
+                <button
+                  type="button"
+                  onClick={() => {
+                    try {
+                      const saved = setApiBaseUrl(backendUrlInput);
+                      setBackendUrlInput(saved);
+                      resetBackendHealthCache();
+                      setBackendSaveNotice(
+                        saved
+                          ? `Saved backend: ${saved}`
+                          : "Cleared — standalone local mode active."
+                      );
+                      void connectEventStream(true);
+                      setTimeout(() => setBackendSaveNotice(null), 2500);
+                    } catch (err) {
+                      setBackendSaveNotice(
+                        err instanceof Error ? err.message : "Invalid URL."
+                      );
+                    }
+                  }}
+                  className="rounded-md bg-[#405fe8] px-2.5 py-1 text-[11px] font-semibold text-white hover:bg-[#3552d6] cursor-pointer"
+                >
+                  Save URL
+                </button>
+                {backendSaveNotice && (
+                  <span className="text-[11px] text-emerald-300">
+                    {backendSaveNotice}
+                  </span>
+                )}
+              </div>
+            )}
+
             {isSessionLive && (
               <div className="flex flex-wrap items-center gap-1.5 pt-1">
                 <span className="text-[11px] text-slate-400 mr-1">
@@ -1693,6 +1968,13 @@ export function SoftwareOverlay({
           </div>
         )}
 
+        {/* Dual-Pipeline Ultra-Low-Latency Live Audio Q&A Panel */}
+        {showLiveQaBench && (
+          <div className="shrink-0 max-h-[75vh] overflow-y-auto hud-scroll border-b border-slate-700/70 bg-[#080d17]/98 p-3">
+            <LiveAudioQAEngine compact />
+          </div>
+        )}
+
         {/* GATE 1: Token Authentication Screen */}
         {!isAuthenticated ? (
           <div className="flex-1 flex items-center justify-center p-6">
@@ -1710,7 +1992,7 @@ export function SoftwareOverlay({
                       Authenticate Crackpilot
                     </h2>
                     <span className="rounded bg-slate-800 px-1.5 py-0.5 font-mono text-[10px] text-sky-300">
-                      v1.0.2
+                      v1.0.4
                     </span>
                   </div>
                   <p className="text-xs text-slate-400">
@@ -2183,6 +2465,35 @@ export function SoftwareOverlay({
 
               {/* Row 1 Control Buttons */}
               <div className="flex flex-wrap items-center gap-2">
+                {/* Single Master Start / Stop Toggle Button (exact same position) */}
+                <button
+                  type="button"
+                  onClick={() => void handleToggleEngineStartStop()}
+                  title={
+                    isEngineRunning
+                      ? "Stop audio listening, live stream, and AI processing"
+                      : "Start audio listening, live stream, shortcuts, and AI processing"
+                  }
+                  className={`inline-flex items-center gap-2 rounded-lg px-4 py-1.5 text-xs font-bold transition-colors cursor-pointer min-w-[88px] justify-center ${
+                    isEngineRunning
+                      ? "bg-rose-600 text-white hover:bg-rose-500 shadow-sm shadow-rose-950/60"
+                      : "bg-[#c6f527] text-[#050709] hover:bg-[#b5e41c] shadow-sm shadow-[#c6f527]/25"
+                  }`}
+                >
+                  {isEngineRunning ? (
+                    <>
+                      <span className="h-2 w-2 rounded-full bg-white animate-pulse" />
+                      <Square className="h-3 w-3 fill-current" />
+                      <span>Stop</span>
+                    </>
+                  ) : (
+                    <>
+                      <Play className="h-3.5 w-3.5 fill-current" />
+                      <span>Start</span>
+                    </>
+                  )}
+                </button>
+
                 <button
                   type="button"
                   onClick={() => handleToggleAutoScroll()}

@@ -1,0 +1,6 @@
+{
+  "name": "VoiceBrief",
+  "description": "Real-time interview audio listener, live speech transcription, AI answer copilot, and Node.js + Python desktop source kit.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

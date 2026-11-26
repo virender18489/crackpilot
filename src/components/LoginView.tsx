@@ -52,6 +52,7 @@ export function LoginView({ onBackHome, onLoginSuccess }: LoginViewProps) {
       });
       onLoginSuccess(user);
     } catch (err) {
+      console.error("[Crackpilot LoginView] Authentication failed:", err);
       setError(err instanceof Error ? err.message : "Could not sign in.");
     } finally {
       setSubmitting(false);

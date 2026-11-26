@@ -1,11 +1,39 @@
 import "dotenv/config";
 import crypto from "crypto";
 import fs from "fs";
+import http from "http";
 import express from "express";
 import path from "path";
 import { fileURLToPath } from "url";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, ThinkingLevel } from "@google/genai";
+import {
+  attachLiveQaWebSocketServer,
+  getLiveQaServerStatus,
+} from "./server/liveQaBridge.ts";
+import {
+  type AccountStatus,
+  type AccountType,
+  adjustAccountQuotas,
+  buildAdminClearCookieHeader,
+  buildAdminSetCookieHeader,
+  buildQuotaSnapshot,
+  checkQuotaForAction,
+  claimFirstRunAdmin,
+  consumeAccountUsage,
+  createManagedAccount,
+  deleteAccountByToken,
+  findAccountByToken,
+  getAdminAuthConfigStatus,
+  getAdminCookieName,
+  listAllAccounts,
+  parseCookieHeader,
+  registerRegularToken,
+  signAdminSessionToken,
+  updateAccountStatus,
+  verifyAdminCredentials,
+  verifyAdminSessionToken,
+} from "./server/adminStore.ts";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -211,8 +239,13 @@ async function startServer() {
   const app = express();
   app.use(express.json({ limit: "20mb" }));
 
-  // Allow the packaged Electron Desktop (.exe) app to call backend APIs & SSE
+  // Allow the packaged Electron Desktop (.exe) app to call non-admin backend APIs & SSE.
+  // Never emit wildcard CORS on authenticated /api/admin/* routes.
   app.use("/api", (req, res, next) => {
+    if (req.path.startsWith("/admin")) {
+      next();
+      return;
+    }
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization");
@@ -222,6 +255,53 @@ async function startServer() {
     }
     next();
   });
+
+  // Strict CSRF protection for cookie-authenticated admin state mutations
+  const verifyAdminCsrf = (req: express.Request, res: express.Response): boolean => {
+    const requestedWith = req.get("x-requested-with");
+    if (requestedWith !== "CrackpilotAdmin") {
+      res.status(403).json({ error: "Missing required admin request header." });
+      return false;
+    }
+    const origin = req.get("origin");
+    if (origin) {
+      try {
+        const parsedOrigin = new URL(origin);
+        const forwardedHost = (req.get("x-forwarded-host") || req.get("host") || "")
+          .split(",")[0]
+          .trim()
+          .toLowerCase();
+        if (forwardedHost && parsedOrigin.host.toLowerCase() !== forwardedHost) {
+          res.status(403).json({ error: "Cross-origin admin mutation blocked." });
+          return false;
+        }
+      } catch {
+        res.status(403).json({ error: "Invalid Origin header." });
+        return false;
+      }
+    }
+    return true;
+  };
+
+  // Read & verify super-admin signed JWT from HttpOnly cookie
+  const getAuthenticatedAdmin = (req: express.Request): { subject: string; exp: number } | null => {
+    const cookies = parseCookieHeader(req.headers.cookie);
+    const cookieJwt = cookies[getAdminCookieName()];
+    if (!cookieJwt) return null;
+    const verified = verifyAdminSessionToken(cookieJwt);
+    if (!verified.valid) return null;
+    return { subject: verified.subject, exp: verified.exp };
+  };
+
+  const requireAdminAuth: express.RequestHandler = (req, res, next) => {
+    const admin = getAuthenticatedAdmin(req);
+    if (!admin) {
+      res.status(401).json({ error: "Unauthorized. Super-Admin sign-in required." });
+      return;
+    }
+    (req as express.Request & { adminSubject?: string }).adminSubject = admin.subject;
+    next();
+  };
 
   const sseClients = new Set<express.Response>();
 
@@ -247,6 +327,10 @@ async function startServer() {
     });
   });
 
+  app.get("/api/live-qa/status", (_req, res) => {
+    res.json(getLiveQaServerStatus());
+  });
+
   // Auth routes
   app.get("/api/auth/me", (_req, res) => {
     res.json({ user: currentUser, token: activeToken, profile: activeProfile });
@@ -270,45 +354,128 @@ async function startServer() {
     res.json({ ok: true });
   });
 
-  // Token Generation & Software Authentication Flow
+  // Token Generation & Software Authentication Flow (integrated with AdminStore quotas)
   app.get("/api/token/current", (_req, res) => {
-    res.json({ token: activeToken });
+    if (!activeToken) {
+      res.json({ token: null });
+      return;
+    }
+    const acc = findAccountByToken(activeToken.token);
+    res.json({
+      token: {
+        ...activeToken,
+        quota: acc ? buildQuotaSnapshot(acc) : undefined,
+      },
+    });
   });
 
   app.post("/api/token/generate", (_req, res) => {
     const raw = `CP-${crypto.randomBytes(3).toString("hex").toUpperCase()}-${crypto.randomBytes(3).toString("hex").toUpperCase()}-${crypto.randomBytes(2).toString("hex").toUpperCase()}`;
+    const acc = registerRegularToken({
+      token: raw,
+      label: currentUser?.name || "Candidate Session",
+      email: currentUser?.email || "",
+      minutes: 240,
+      captureLimit: 80,
+      promptLimit: 80,
+    });
+    const quota = buildQuotaSnapshot(acc);
     activeToken = {
       token: raw,
-      createdAt: new Date().toISOString(),
+      createdAt: acc.createdAt,
       authenticated: false,
       sessionActive: false,
     };
-    broadcastEvent({ type: "token_generated", token: activeToken });
-    res.json({ ok: true, token: activeToken });
+    const tokenPayload = { ...activeToken, quota };
+    broadcastEvent({ type: "token_generated", token: tokenPayload });
+    res.json({ ok: true, token: tokenPayload });
   });
 
   app.post("/api/token/verify", (req, res) => {
     const { token } = req.body as { token?: string };
     const submitted = (token || "").trim();
     if (!submitted) {
-      res.status(400).json({ error: "Please paste your generated token." });
+      res.status(400).json({ error: "Please paste your generated token or Demo ID." });
       return;
     }
-    if (!activeToken) {
-      res.status(404).json({
-        error: "No active token found. Generate a token in Dashboard → Overview first.",
-      });
-      return;
-    }
-    if (submitted !== activeToken.token) {
+
+    const managedAccount = findAccountByToken(submitted);
+    const matchesActive = Boolean(activeToken && submitted === activeToken.token);
+
+    if (!managedAccount && !matchesActive) {
       res.status(401).json({
-        error: "Invalid token. Copy the exact token from Dashboard → Overview.",
+        error: "Invalid token or Demo ID. Copy the exact token from Dashboard → Overview or Admin Panel.",
       });
       return;
     }
-    activeToken = { ...activeToken, authenticated: true };
-    broadcastEvent({ type: "token_authenticated", token: activeToken });
-    res.json({ ok: true, token: activeToken, profile: activeProfile });
+
+    const account =
+      managedAccount ||
+      registerRegularToken({
+        token: submitted,
+        label: currentUser?.name || "Candidate Session",
+        email: currentUser?.email || "",
+      });
+
+    const quota = buildQuotaSnapshot(account);
+    if (quota.blockedReason) {
+      res.status(403).json({ error: quota.blockedReason, quota });
+      return;
+    }
+
+    activeToken = {
+      token: account.token,
+      createdAt: account.createdAt,
+      authenticated: true,
+      // Demo IDs created by Admin activate straight into live overlay ready state
+      sessionActive: account.accountType === "DEMO" ? true : Boolean(activeToken?.sessionActive),
+    };
+    const tokenPayload = { ...activeToken, quota };
+    broadcastEvent({ type: "token_authenticated", token: tokenPayload });
+    res.json({ ok: true, token: tokenPayload, profile: activeProfile, quota });
+  });
+
+  // Live Quota Sync for Desktop Overlay (on Reconnect + periodic background sync)
+  app.get("/api/token/quota", (req, res) => {
+    const requestedToken = String(req.query.token || activeToken?.token || "").trim();
+    if (!requestedToken) {
+      res.status(404).json({ error: "No active token provided." });
+      return;
+    }
+    const acc = findAccountByToken(requestedToken);
+    if (!acc) {
+      res.status(404).json({
+        error: "This token has been revoked or deleted by the administrator.",
+        revoked: true,
+      });
+      return;
+    }
+    const quota = buildQuotaSnapshot(acc);
+    res.json({ ok: true, quota });
+  });
+
+  // Sync elapsed active session seconds from desktop overlay
+  app.post("/api/token/consume", (req, res) => {
+    const { token, elapsedSeconds } = req.body as {
+      token?: string;
+      elapsedSeconds?: number;
+    };
+    const targetToken = (token || activeToken?.token || "").trim();
+    if (!targetToken) {
+      res.status(400).json({ error: "Missing token." });
+      return;
+    }
+    const updated = consumeAccountUsage(targetToken, {
+      elapsedSeconds: typeof elapsedSeconds === "number" ? elapsedSeconds : 0,
+    });
+    if (!updated) {
+      res.status(404).json({
+        error: "This token has been revoked or deleted by the administrator.",
+        revoked: true,
+      });
+      return;
+    }
+    res.json({ ok: true, quota: updated });
   });
 
   app.post("/api/session/start", (_req, res) => {
@@ -318,13 +485,25 @@ async function startServer() {
       });
       return;
     }
+    const acc = findAccountByToken(activeToken.token);
+    if (acc) {
+      const quota = buildQuotaSnapshot(acc);
+      if (quota.blockedReason) {
+        res.status(403).json({ error: quota.blockedReason, quota });
+        return;
+      }
+    }
     activeToken = { ...activeToken, sessionActive: true };
+    const tokenPayload = {
+      ...activeToken,
+      quota: acc ? buildQuotaSnapshot(acc) : undefined,
+    };
     broadcastEvent({
       type: "session_started",
-      token: activeToken,
+      token: tokenPayload,
       profile: activeProfile,
     });
-    res.json({ ok: true, token: activeToken, profile: activeProfile });
+    res.json({ ok: true, token: tokenPayload, profile: activeProfile });
   });
 
   app.post("/api/session/stop", (_req, res) => {
@@ -332,6 +511,208 @@ async function startServer() {
       activeToken = { ...activeToken, sessionActive: false };
     }
     broadcastEvent({ type: "session_stopped" });
+    res.json({ ok: true });
+  });
+
+  // =========================================================================
+  // Hidden Owner-Only Super-Admin API (/api/admin/*)
+  // =========================================================================
+  app.get("/api/admin/auth/status", (req, res) => {
+    const config = getAdminAuthConfigStatus();
+    const admin = getAuthenticatedAdmin(req);
+    res.setHeader("Cache-Control", "no-store");
+    res.json({
+      authenticated: Boolean(admin),
+      subject: admin?.subject ?? null,
+      ...config,
+    });
+  });
+
+  app.post("/api/admin/auth/setup", (req, res) => {
+    if (!verifyAdminCsrf(req, res)) return;
+    const { identifier, password } = req.body as {
+      identifier?: string;
+      password?: string;
+    };
+    const claim = claimFirstRunAdmin({
+      identifier: String(identifier || ""),
+      password: String(password || ""),
+    });
+    if (!claim.ok) {
+      res.status(claim.status).json({ error: claim.error });
+      return;
+    }
+    const jwt = signAdminSessionToken(claim.email);
+    res.setHeader("Set-Cookie", buildAdminSetCookieHeader(jwt));
+    res.setHeader("Cache-Control", "no-store");
+    res.json({ ok: true, authenticated: true, subject: claim.email });
+  });
+
+  app.post("/api/admin/auth/login", (req, res) => {
+    if (!verifyAdminCsrf(req, res)) return;
+    const { identifier, password } = req.body as {
+      identifier?: string;
+      password?: string;
+    };
+    const result = verifyAdminCredentials(
+      String(identifier || ""),
+      String(password || "")
+    );
+    if (!result.valid) {
+      res.status(401).json({ error: "Invalid Super-Admin email/username or password." });
+      return;
+    }
+    const jwt = signAdminSessionToken(result.subject);
+    res.setHeader("Set-Cookie", buildAdminSetCookieHeader(jwt));
+    res.setHeader("Cache-Control", "no-store");
+    res.json({ ok: true, authenticated: true, subject: result.subject });
+  });
+
+  app.post("/api/admin/auth/logout", (req, res) => {
+    if (!verifyAdminCsrf(req, res)) return;
+    res.setHeader("Set-Cookie", buildAdminClearCookieHeader());
+    res.setHeader("Cache-Control", "no-store");
+    res.json({ ok: true });
+  });
+
+  app.get("/api/admin/accounts", requireAdminAuth, (req, res) => {
+    const search = String(req.query.search || "");
+    const rawFilter = String(req.query.filter || "all");
+    const filter =
+      rawFilter === "active" || rawFilter === "demo" || rawFilter === "expired"
+        ? rawFilter
+        : "all";
+
+    const all = listAllAccounts();
+    const filtered = listAllAccounts({ search, filter });
+
+    res.setHeader("Cache-Control", "no-store");
+    res.json({
+      ok: true,
+      accounts: filtered,
+      stats: {
+        total: all.length,
+        active: all.filter((a) => a.status === "Active").length,
+        demo: all.filter((a) => a.accountType === "DEMO").length,
+        expiredOrSuspended: all.filter(
+          (a) => a.status === "Expired" || a.status === "Suspended"
+        ).length,
+      },
+    });
+  });
+
+  app.post("/api/admin/accounts/demo", requireAdminAuth, (req, res) => {
+    if (!verifyAdminCsrf(req, res)) return;
+    const {
+      label,
+      email,
+      accountType,
+      minutes,
+      captureLimit,
+      promptLimit,
+      expiryHours,
+      notes,
+    } = req.body as {
+      label?: string;
+      email?: string;
+      accountType?: AccountType;
+      minutes?: number;
+      captureLimit?: number;
+      promptLimit?: number;
+      expiryHours?: number | null;
+      notes?: string;
+    };
+
+    const cleanLabel = String(label || "").trim();
+    if (!cleanLabel) {
+      res.status(400).json({ error: "Team member / user name is required." });
+      return;
+    }
+
+    const type: AccountType = accountType === "REGULAR" ? "REGULAR" : "DEMO";
+    const created = createManagedAccount({
+      label: cleanLabel,
+      email: typeof email === "string" ? email : "",
+      accountType: type,
+      minutes: Number(minutes) || 30,
+      captureLimit: Number(captureLimit) || 15,
+      promptLimit: promptLimit ? Number(promptLimit) : undefined,
+      expiryHours:
+        expiryHours === null ? null : Number(expiryHours) > 0 ? Number(expiryHours) : 24,
+      notes: typeof notes === "string" ? notes : undefined,
+    });
+
+    res.status(201).json({
+      ok: true,
+      account: created,
+      quota: buildQuotaSnapshot(created),
+    });
+  });
+
+  app.patch("/api/admin/accounts/:token/status", requireAdminAuth, (req, res) => {
+    if (!verifyAdminCsrf(req, res)) return;
+    const { status } = req.body as { status?: AccountStatus };
+    if (status !== "Active" && status !== "Suspended" && status !== "Expired") {
+      res.status(400).json({ error: "Status must be Active, Suspended, or Expired." });
+      return;
+    }
+    const updated = updateAccountStatus(req.params.token, status);
+    if (!updated) {
+      res.status(404).json({ error: "Account token not found." });
+      return;
+    }
+    const quota = buildQuotaSnapshot(updated);
+    broadcastEvent({ type: "quota_updated", tokenValue: updated.token, quota });
+    res.json({ ok: true, account: updated, quota });
+  });
+
+  app.post("/api/admin/accounts/:token/quotas", requireAdminAuth, (req, res) => {
+    if (!verifyAdminCsrf(req, res)) return;
+    const {
+      deltaMinutes,
+      deltaCaptures,
+      deltaPrompts,
+      resetUsed,
+      extendExpiryHours,
+    } = req.body as {
+      deltaMinutes?: number;
+      deltaCaptures?: number;
+      deltaPrompts?: number;
+      resetUsed?: boolean;
+      extendExpiryHours?: number;
+    };
+
+    const updated = adjustAccountQuotas(req.params.token, {
+      deltaMinutes: typeof deltaMinutes === "number" ? deltaMinutes : undefined,
+      deltaCaptures: typeof deltaCaptures === "number" ? deltaCaptures : undefined,
+      deltaPrompts: typeof deltaPrompts === "number" ? deltaPrompts : undefined,
+      resetUsed: Boolean(resetUsed),
+      extendExpiryHours:
+        typeof extendExpiryHours === "number" ? extendExpiryHours : undefined,
+    });
+
+    if (!updated) {
+      res.status(404).json({ error: "Account token not found." });
+      return;
+    }
+
+    const quota = buildQuotaSnapshot(updated);
+    broadcastEvent({ type: "quota_updated", tokenValue: updated.token, quota });
+    res.json({ ok: true, account: updated, quota });
+  });
+
+  app.delete("/api/admin/accounts/:token", requireAdminAuth, (req, res) => {
+    if (!verifyAdminCsrf(req, res)) return;
+    const targetToken = req.params.token.trim();
+    const deleted = deleteAccountByToken(targetToken);
+    if (!deleted) {
+      res.status(404).json({ error: "Account token not found." });
+      return;
+    }
+    if (activeToken && activeToken.token === targetToken) {
+      activeToken = null;
+    }
+    broadcastEvent({ type: "account_revoked", tokenValue: targetToken });
     res.json({ ok: true });
   });
 
@@ -487,6 +868,7 @@ async function startServer() {
   // Live Streaming Interview Answer (tailored to Target Profile + Resume + JD)
   app.post("/api/answer", async (req, res) => {
     const {
+      token,
       question,
       role,
       experience,
@@ -497,6 +879,7 @@ async function startServer() {
       answerStyle,
       history = [],
     } = req.body as {
+      token?: string;
       question?: string;
       role?: string;
       experience?: string;
@@ -511,6 +894,23 @@ async function startServer() {
     if (!question || !question.trim()) {
       res.status(400).json({ error: "Question text is required." });
       return;
+    }
+
+    const effectiveToken = (token || activeToken?.token || "").trim();
+    const quotaCheck = checkQuotaForAction(effectiveToken, "answer");
+    if (!quotaCheck.allowed) {
+      res.status(403).json({ error: quotaCheck.reason, quota: quotaCheck.quota });
+      return;
+    }
+    if (effectiveToken && quotaCheck.account) {
+      const updatedQuota = consumeAccountUsage(effectiveToken, { addPrompts: 1 });
+      if (updatedQuota) {
+        broadcastEvent({
+          type: "quota_updated",
+          tokenValue: effectiveToken,
+          quota: updatedQuota,
+        });
+      }
     }
 
     res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
@@ -631,12 +1031,14 @@ async function startServer() {
   // Screen & Chat Box Capture Solver
   app.post("/api/analyze-screen", async (req, res) => {
     const {
+      token,
       imageBase64,
       mimeType = "image/jpeg",
       role,
       answerLanguage,
       answerStyle,
     } = req.body as {
+      token?: string;
       imageBase64?: string;
       mimeType?: string;
       role?: string;
@@ -647,6 +1049,26 @@ async function startServer() {
     if (!imageBase64) {
       res.status(400).json({ error: "Missing imageBase64 payload." });
       return;
+    }
+
+    const effectiveToken = (token || activeToken?.token || "").trim();
+    const quotaCheck = checkQuotaForAction(effectiveToken, "capture");
+    if (!quotaCheck.allowed) {
+      res.status(403).json({ error: quotaCheck.reason, quota: quotaCheck.quota });
+      return;
+    }
+    if (effectiveToken && quotaCheck.account) {
+      const updatedQuota = consumeAccountUsage(effectiveToken, {
+        addCaptures: 1,
+        addPrompts: 1,
+      });
+      if (updatedQuota) {
+        broadcastEvent({
+          type: "quota_updated",
+          tokenValue: effectiveToken,
+          quota: updatedQuota,
+        });
+      }
     }
 
     res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
@@ -765,6 +1187,7 @@ async function startServer() {
   // Multi-frame 4s–10s Video Page Scanner
   app.post("/api/analyze-video", async (req, res) => {
     const {
+      token,
       frames = [],
       mimeType = "image/jpeg",
       durationSec = 4,
@@ -772,6 +1195,7 @@ async function startServer() {
       answerLanguage,
       answerStyle,
     } = req.body as {
+      token?: string;
       frames?: string[];
       mimeType?: string;
       durationSec?: number;
@@ -783,6 +1207,26 @@ async function startServer() {
     if (!Array.isArray(frames) || frames.length === 0) {
       res.status(400).json({ error: "No video frames captured." });
       return;
+    }
+
+    const effectiveToken = (token || activeToken?.token || "").trim();
+    const quotaCheck = checkQuotaForAction(effectiveToken, "capture");
+    if (!quotaCheck.allowed) {
+      res.status(403).json({ error: quotaCheck.reason, quota: quotaCheck.quota });
+      return;
+    }
+    if (effectiveToken && quotaCheck.account) {
+      const updatedQuota = consumeAccountUsage(effectiveToken, {
+        addCaptures: 1,
+        addPrompts: 1,
+      });
+      if (updatedQuota) {
+        broadcastEvent({
+          type: "quota_updated",
+          tokenValue: effectiveToken,
+          quota: updatedQuota,
+        });
+      }
     }
 
     const boundedFrames = frames.slice(0, 8);
@@ -969,7 +1413,10 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
+  const httpServer = http.createServer(app);
+  attachLiveQaWebSocketServer(httpServer);
+
+  httpServer.listen(PORT, "0.0.0.0", () => {
     console.log(`Crackpilot server running on http://localhost:${PORT}`);
   });
 }

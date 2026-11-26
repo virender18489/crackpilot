@@ -7,6 +7,7 @@ import { apiUrl, isDesktopApp } from "./lib/api";
 import {
   hydrateWorkspaceState,
   logoutAccount,
+  probeBackendHealth,
   subscribeLocalSync,
 } from "./lib/clientStore";
 import type {
@@ -51,41 +52,58 @@ export default function App() {
   // Hydrate auth, token, and target profile safely from backend or local storage
   useEffect(() => {
     let active = true;
-    void hydrateWorkspaceState(DEFAULT_PROFILE).then((state) => {
-      if (!active) return;
-      if (state.user) setUser(state.user);
-      if (state.token) setTokenState(state.token);
-      if (state.profile) setProfile(state.profile);
-    });
+    const desktop = isDesktopApp();
+
+    void hydrateWorkspaceState(DEFAULT_PROFILE)
+      .then((state) => {
+        if (!active) return;
+        if (state.user) setUser(state.user);
+        if (state.token) setTokenState(state.token);
+        if (state.profile) setProfile(state.profile);
+      })
+      .catch((err) => {
+        console.error("[Crackpilot App] Workspace hydration failed:", err);
+      });
 
     const unsubLocal = subscribeLocalSync((msg) => {
       if (msg.token !== undefined) setTokenState(msg.token);
       if (msg.profile) setProfile(msg.profile);
     });
 
-    // Keep Dashboard & Software tabs synced via server SSE events when backend is present
+    // Only open SSE when /api/health confirms a real Express backend is running.
+    // Prevents MIME/HTML EventSource errors on Vercel static hosting & standalone Electron.
     let sse: EventSource | null = null;
-    try {
-      sse = new EventSource(apiUrl("/api/events"));
-      sse.onmessage = (ev) => {
-        try {
-          const msg = JSON.parse(ev.data) as {
-            token?: SessionTokenState | null;
-            profile?: TargetProfile;
-          };
-          if (msg.token !== undefined) setTokenState(msg.token);
-          if (msg.profile) setProfile(msg.profile);
-        } catch {
-          // Ignore malformed payloads
-        }
-      };
-      sse.onerror = () => {
-        // Close silently if hosted on static frontend without SSE server
-        sse?.close();
-      };
-    } catch {
-      sse = null;
-    }
+    void probeBackendHealth().then((healthy) => {
+      if (!active || !healthy) return;
+      try {
+        const eventsUrl = apiUrl("/api/events");
+        sse = new EventSource(eventsUrl);
+        sse.onmessage = (ev) => {
+          try {
+            const msg = JSON.parse(ev.data) as {
+              type?: string;
+              token?: SessionTokenState | null;
+              profile?: TargetProfile;
+            };
+            // On fresh Desktop .exe boot, never auto-skip Gate 1 from initial "connected" payload
+            if (msg.token !== undefined && !(desktop && msg.type === "connected")) {
+              setTokenState(msg.token);
+            }
+            if (msg.profile) setProfile(msg.profile);
+          } catch (parseErr) {
+            console.warn("[Crackpilot App SSE] Malformed event payload:", parseErr);
+          }
+        };
+        sse.onerror = () => {
+          console.warn("[Crackpilot App SSE] Stream error on", eventsUrl, "— closing.");
+          sse?.close();
+          sse = null;
+        };
+      } catch (err) {
+        console.error("[Crackpilot App SSE] Failed to initialize EventSource:", err);
+        sse = null;
+      }
+    });
 
     return () => {
       active = false;

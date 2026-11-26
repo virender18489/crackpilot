@@ -1,5 +1,5 @@
 import type { SessionTokenState, TargetProfile, UserAccount } from "../types";
-import { apiUrl, isDesktopApp } from "./api";
+import { apiUrl, getApiBaseUrl, hasConfiguredBackend, isDesktopApp } from "./api";
 
 const STORAGE_KEYS = {
   user: "crackpilot_user_v1",
@@ -17,13 +17,28 @@ export interface SyncPayload {
   question?: string;
 }
 
+export type ApiJsonResult<T> =
+  | { reachable: true; ok: boolean; status: number; data: T }
+  | { reachable: false; reason: string; status?: number; contentType?: string };
+
+let cachedBackendHealth: boolean | null = null;
+let inflightHealthProbe: Promise<boolean> | null = null;
+let loggedStandaloneNotice = false;
+
+export function resetBackendHealthCache(): void {
+  cachedBackendHealth = null;
+  inflightHealthProbe = null;
+  loggedStandaloneNotice = false;
+}
+
 function readStorage<T>(key: string): T | null {
   if (typeof window === "undefined") return null;
   try {
     const raw = window.localStorage.getItem(key);
     if (!raw) return null;
     return JSON.parse(raw) as T;
-  } catch {
+  } catch (err) {
+    console.warn(`[Crackpilot Store] Failed to parse localStorage key "${key}":`, err);
     return null;
   }
 }
@@ -36,8 +51,8 @@ function writeStorage<T>(key: string, value: T | null): void {
     } else {
       window.localStorage.setItem(key, JSON.stringify(value));
     }
-  } catch {
-    // Ignore private-mode storage quota errors
+  } catch (err) {
+    console.warn(`[Crackpilot Store] Failed to write localStorage key "${key}":`, err);
   }
 }
 
@@ -49,8 +64,8 @@ export function broadcastLocalSync(payload: SyncPayload): void {
       ch.postMessage(payload);
       ch.close();
     }
-  } catch {
-    // Ignore BroadcastChannel errors
+  } catch (err) {
+    console.warn("[Crackpilot Sync] BroadcastChannel post failed:", err);
   }
 }
 
@@ -68,7 +83,8 @@ export function subscribeLocalSync(
         }
       };
     }
-  } catch {
+  } catch (err) {
+    console.warn("[Crackpilot Sync] BroadcastChannel unavailable:", err);
     channel = null;
   }
 
@@ -98,39 +114,133 @@ function randomHex(len: number): string {
 }
 
 /**
- * Safely fetches JSON from the backend API with a 3.5s timeout. Returns
- * `{ reachable: true, ... }` ONLY when the response is valid JSON, so HTML/404
- * pages from Vercel or auth proxies can never trigger "Unexpected token '<'".
+ * Safely fetches JSON from the backend API with a 3.5s timeout and detailed debug logging.
+ * Returns `{ reachable: true, ... }` ONLY when the server returns valid JSON, so HTML
+ * pages (Vercel SPA rewrites, Google Login proxies) or plain-text 404 responses can NEVER
+ * trigger "Unexpected token '<'" or "Unexpected token 'T'".
  */
 export async function tryApiJson<T>(
   path: string,
   init?: RequestInit
-): Promise<
-  | { reachable: true; ok: boolean; status: number; data: T }
-  | { reachable: false }
-> {
+): Promise<ApiJsonResult<T>> {
+  if (!hasConfiguredBackend()) {
+    if (!loggedStandaloneNotice) {
+      loggedStandaloneNotice = true;
+      console.info(
+        "[Crackpilot API] Standalone Desktop mode (no remote backend server URL configured). Using local auth/workspace store."
+      );
+    }
+    return { reachable: false, reason: "no-backend-configured" };
+  }
+
+  const targetUrl = apiUrl(path);
   const controller = new AbortController();
-  const timer = window.setTimeout(() => controller.abort(), 3500);
+  const timer =
+    typeof window !== "undefined"
+      ? window.setTimeout(() => controller.abort(), 3500)
+      : setTimeout(() => controller.abort(), 3500);
+
   try {
-    const resp = await fetch(apiUrl(path), {
+    const resp = await fetch(targetUrl, {
       ...init,
       signal: init?.signal ?? controller.signal,
     });
-    const contentType = resp.headers.get("content-type") || "";
+    const contentType = (resp.headers.get("content-type") || "").toLowerCase();
+    const rawText = await resp.text();
+    const snippet = rawText.trim().slice(0, 120).replace(/\s+/g, " ");
+
     if (!contentType.includes("application/json")) {
-      return { reachable: false };
+      console.warn(
+        `[Crackpilot API] Non-JSON response from ${targetUrl} (status=${resp.status}, content-type="${contentType || "none"}", preview="${snippet}"). Switching to local workspace fallback.`
+      );
+      return {
+        reachable: false,
+        reason: "non-json-response",
+        status: resp.status,
+        contentType,
+      };
     }
-    const text = await resp.text();
-    if (!text.trim() || text.trim().startsWith("<")) {
-      return { reachable: false };
+
+    if (!rawText.trim() || rawText.trim().startsWith("<")) {
+      console.warn(
+        `[Crackpilot API] Empty or HTML body from ${targetUrl} (status=${resp.status}, preview="${snippet}"). Switching to local workspace fallback.`
+      );
+      return {
+        reachable: false,
+        reason: "html-or-empty-body",
+        status: resp.status,
+        contentType,
+      };
     }
-    const data = JSON.parse(text) as T;
-    return { reachable: true, ok: resp.ok, status: resp.status, data };
-  } catch {
-    return { reachable: false };
+
+    try {
+      const data = JSON.parse(rawText) as T;
+      return { reachable: true, ok: resp.ok, status: resp.status, data };
+    } catch (parseErr) {
+      console.error(
+        `[Crackpilot API] JSON.parse failed for ${targetUrl} (status=${resp.status}, preview="${snippet}"):`,
+        parseErr
+      );
+      return {
+        reachable: false,
+        reason: "invalid-json",
+        status: resp.status,
+        contentType,
+      };
+    }
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    const isTimeout = err instanceof Error && err.name === "AbortError";
+    console.warn(
+      `[Crackpilot API] Request failed for ${targetUrl} (${isTimeout ? "timeout 3.5s" : errMsg}). Switching to local workspace fallback.`
+    );
+    return {
+      reachable: false,
+      reason: isTimeout ? "timeout" : "network-error",
+    };
   } finally {
-    window.clearTimeout(timer);
+    if (typeof window !== "undefined") {
+      window.clearTimeout(timer as number);
+    } else {
+      clearTimeout(timer);
+    }
   }
+}
+
+/**
+ * Probes GET /api/health ONCE (cached until reset or forced) before opening SSE streams.
+ * Prevents EventSource MIME console errors on static Vercel deployments and standalone Electron.
+ */
+export async function probeBackendHealth(force = false): Promise<boolean> {
+  if (!hasConfiguredBackend()) {
+    cachedBackendHealth = false;
+    return false;
+  }
+  if (!force && cachedBackendHealth !== null) {
+    return cachedBackendHealth;
+  }
+  if (!force && inflightHealthProbe) {
+    return inflightHealthProbe;
+  }
+
+  inflightHealthProbe = tryApiJson<{ ok?: boolean }>("/api/health", {
+    cache: "no-store",
+  })
+    .then((res) => {
+      const healthy = Boolean(res.reachable && res.ok && res.data?.ok);
+      cachedBackendHealth = healthy;
+      if (!healthy) {
+        console.info(
+          `[Crackpilot Health] Backend not detected at "${getApiBaseUrl() || "same-origin"}/api/health" (reason=${res.reachable ? `status-${res.status}` : res.reason}). Running in static/local sync mode.`
+        );
+      }
+      return healthy;
+    })
+    .finally(() => {
+      inflightHealthProbe = null;
+    });
+
+  return inflightHealthProbe;
 }
 
 export async function hydrateWorkspaceState(defaultProfile: TargetProfile): Promise<{
@@ -147,6 +257,7 @@ export async function hydrateWorkspaceState(defaultProfile: TargetProfile): Prom
 
   if (res.reachable && res.ok) {
     const user = res.data.user ?? readStorage<UserAccount>(STORAGE_KEYS.user);
+    // In Desktop .exe, always start at Gate 1 (Authenticate Crackpilot) on fresh launch
     const token = desktop
       ? null
       : res.data.token ?? readStorage<SessionTokenState>(STORAGE_KEYS.token);
@@ -184,7 +295,9 @@ export async function loginAccount(params: {
 
   if (res.reachable) {
     if (!res.ok || !res.data.user) {
-      throw new Error(res.data.error || "Sign in failed.");
+      const msg = res.data.error || "Sign in failed.";
+      console.error("[Crackpilot Auth] /api/auth/login rejected:", res.status, msg);
+      throw new Error(msg);
     }
     writeStorage(STORAGE_KEYS.user, res.data.user);
     return res.data.user;
@@ -197,6 +310,7 @@ export async function loginAccount(params: {
     email: cleanEmail,
   };
   writeStorage(STORAGE_KEYS.user, localUser);
+  console.info("[Crackpilot Auth] Created local session for:", cleanEmail);
   return localUser;
 }
 
@@ -213,7 +327,9 @@ export async function generateSessionToken(): Promise<SessionTokenState> {
 
   if (res.reachable) {
     if (!res.ok || !res.data.token) {
-      throw new Error(res.data.error || "Could not generate token.");
+      const msg = res.data.error || "Could not generate token.";
+      console.error("[Crackpilot Token] /api/token/generate failed:", res.status, msg);
+      throw new Error(msg);
     }
     writeStorage(STORAGE_KEYS.token, res.data.token);
     broadcastLocalSync({ type: "token_generated", token: res.data.token });
@@ -228,6 +344,7 @@ export async function generateSessionToken(): Promise<SessionTokenState> {
   };
   writeStorage(STORAGE_KEYS.token, localToken);
   broadcastLocalSync({ type: "token_generated", token: localToken });
+  console.info("[Crackpilot Token] Generated local 48h token:", localToken.token);
   return localToken;
 }
 
@@ -252,7 +369,9 @@ export async function verifySessionToken(submittedToken: string): Promise<{
 
   if (res.reachable) {
     if (!res.ok || !res.data.token) {
-      throw new Error(res.data.error || "Token verification failed.");
+      const msg = res.data.error || "Token verification failed.";
+      console.error("[Crackpilot Token] /api/token/verify rejected:", res.status, msg);
+      throw new Error(msg);
     }
     writeStorage(STORAGE_KEYS.token, res.data.token);
     if (res.data.profile) writeStorage(STORAGE_KEYS.profile, res.data.profile);
@@ -270,17 +389,20 @@ export async function verifySessionToken(submittedToken: string): Promise<{
   // In Desktop .exe standalone mode, accept any freshly generated CP-... token from Dashboard
   if (isDesktopApp()) {
     if (!validFormat) {
+      console.error("[Crackpilot Token] Desktop standalone format validation failed:", submitted);
       throw new Error(
         "Invalid token format. Copy your CP-XXXX-XXXX-XXXX token from Dashboard → Overview."
       );
     }
   } else {
     if (stored && submitted !== stored.token) {
+      console.error("[Crackpilot Token] Local web token mismatch.");
       throw new Error(
         "Invalid token. Copy the exact token from Dashboard → Overview."
       );
     }
     if (!stored && !validFormat) {
+      console.error("[Crackpilot Token] Local web token missing/invalid format.");
       throw new Error(
         "Invalid token format. Generate a token in Dashboard → Overview first."
       );
@@ -300,6 +422,7 @@ export async function verifySessionToken(submittedToken: string): Promise<{
     token: verified,
     profile: savedProfile,
   });
+  console.info("[Crackpilot Token] Authenticated locally:", submitted);
   return { token: verified, profile: savedProfile };
 }
 
@@ -315,7 +438,9 @@ export async function startLiveSession(): Promise<{
 
   if (res.reachable) {
     if (!res.ok || !res.data.token) {
-      throw new Error(res.data.error || "Could not start session.");
+      const msg = res.data.error || "Could not start session.";
+      console.error("[Crackpilot Session] /api/session/start rejected:", res.status, msg);
+      throw new Error(msg);
     }
     writeStorage(STORAGE_KEYS.token, res.data.token);
     broadcastLocalSync({
@@ -328,6 +453,7 @@ export async function startLiveSession(): Promise<{
 
   const stored = readStorage<SessionTokenState>(STORAGE_KEYS.token);
   if (!stored || !stored.authenticated) {
+    console.error("[Crackpilot Session] Attempted start without authenticated token.");
     throw new Error("Authenticate your Crackpilot software token first.");
   }
   const active: SessionTokenState = { ...stored, sessionActive: true };

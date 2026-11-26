@@ -36,6 +36,7 @@ import {
   saveTargetProfile,
   startLiveSession,
 } from "../lib/clientStore";
+import { LiveAudioQAEngine } from "./LiveAudioQAEngine";
 import type {
   AnswerLanguage,
   AnswerStyle,
@@ -170,6 +171,7 @@ export function Dashboard({
         "48h Auth Token generated! Copy it, open Crackpilot Software, paste the token, and click Authenticate."
       );
     } catch (err) {
+      console.error("[Crackpilot Dashboard] Generate token failed:", err);
       setOverviewNotice(
         err instanceof Error ? err.message : "Could not generate token."
       );
@@ -208,6 +210,7 @@ export function Dashboard({
       onTokenChange(result.token);
       onOpenSoftware();
     } catch (err) {
+      console.error("[Crackpilot Dashboard] Start session failed:", err);
       setOverviewNotice(
         err instanceof Error ? err.message : "Failed to start session."
       );
@@ -237,6 +240,7 @@ export function Dashboard({
         `${kind === "resume" ? "Resume" : "Job Description"} extracted from "${file.name}". Click Save Target Profile to sync with Crackpilot.`
       );
     } catch (err) {
+      console.error("[Crackpilot Dashboard] Document extract failed:", err);
       setProfileNotice(
         err instanceof Error ? err.message : "Could not process document."
       );
@@ -257,6 +261,7 @@ export function Dashboard({
         "Target Profile saved & synced! Crackpilot software will now tailor every answer to this Role, Resume, and JD."
       );
     } catch (err) {
+      console.error("[Crackpilot Dashboard] Save profile failed:", err);
       setProfileNotice(
         err instanceof Error ? err.message : "Failed to save Target Profile."
       );
@@ -1019,11 +1024,14 @@ export function Dashboard({
                   Testing Lab (Practice Mode)
                 </h1>
                 <p className="mt-1 text-xs text-zinc-400">
-                  Verify Cross-Tab Always-On-Top overlay, Headphone / WhatsApp /
-                  Meet audio capture, OS screen-share privacy settings, and
-                  keyboard shortcuts before your real interview.
+                  Benchmark Dual-Pipeline Live Audio Q&amp;A (Deepgram Nova-3 +
+                  Groq vs Gemini Live API), verify Always-On-Top overlay,
+                  Headphone / System audio capture, and keyboard shortcuts.
                 </p>
               </div>
+
+              {/* Real-Time Ultra-Low-Latency Dual-Pipeline Live Audio Q&A Engine */}
+              <LiveAudioQAEngine />
 
               {/* 1. Cross-Tab Always-On-Top */}
               <div className="rounded-2xl border border-white/[0.08] bg-[#0c1015] p-6 space-y-4">

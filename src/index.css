@@ -24,9 +24,13 @@
 /* Native frameless Electron window dragging */
 .app-drag {
   -webkit-app-region: drag;
+  app-region: drag;
+  user-select: none;
 }
-.app-no-drag {
+.app-no-drag,
+.app-no-drag * {
   -webkit-app-region: no-drag;
+  app-region: no-drag;
 }
 
 /* Subtle dark scrollbar for the HUD feed */
