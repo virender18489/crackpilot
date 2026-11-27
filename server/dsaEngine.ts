@@ -63,10 +63,10 @@ const ANTI_AI_HUMAN_RULES = [
 ].join("\n");
 
 const PRONUNCIATION_NORMALIZATION_RULE = [
-  "SMART PHONETIC AUTO-CORRECTION & ACCENT NORMALIZATION (CRITICAL FOR LIVE SPEECH TRANSCRIPTS):",
-  "- The incoming question often comes from live speech-to-text (STT) with Indian English or regional accents that can produce phonetic slips or slightly garbled technical terms (for example: 'multi conscious' or 'multi context' -> 'multiple contexts', 'use context' -> 'useContext', 'virtual dome and lingual dome' or 'real dome' -> 'Virtual DOM and Real DOM', 'Jawa Script' or 'java script' -> 'JavaScript', 'use affect' -> 'useEffect', 'use estate' -> 'useState', 'red ducks' -> 'Redux', 'hoist thing' -> 'Hoisting', 'closer' -> 'Closure', 'next js' -> 'Next.js', 'node js' -> 'Node.js', 'type script' -> 'TypeScript', 'eye dock' -> 'IDoc', 'bappy' -> 'BAPI', 's four hana' -> 'S/4HANA', 'cube netties' -> 'Kubernetes', 'pie spark' -> 'PySpark', 'see quel' -> 'SQL').",
-  "- ALWAYS silently infer the true intended technical interview question using the Candidate Target Role, Core Skills & Tech Stack, Resume, and Job Description, and answer the true intended concept directly in crisp, natural human spoken English.",
-  "- STRICTLY FORBIDDEN: NEVER mention, quote, point out, or complain about speech recognition typos or weird phrasing (for example, NEVER say 'There is no concept called lingual dome', 'You probably meant...', 'Assuming you mean...', 'I think there was a typo', or 'Did you mean...?'). Just answer the real technical question smoothly as if you heard it perfectly.",
+  "SMART PHONETIC AUTO-CORRECTION & DIRECT TECHNICAL ANSWER RULE (MANDATORY):",
+  "- The incoming question often comes from live speech-to-text (STT) with Indian English or regional accents that can produce phonetic slips (for example: 'jawascript' or 'java script' -> 'JavaScript', 'virtual dome' -> 'Virtual DOM', 'lingual dome' or 'real dome' -> 'Real DOM', 'multi conscious' -> 'multiple contexts', 'use context' -> 'useContext', 'use affect' -> 'useEffect', 'use estate' -> 'useState', 'red ducks' -> 'Redux', 'hoist thing' -> 'Hoisting', 'closer' -> 'Closure', 'next js' -> 'Next.js', 'node js' -> 'Node.js', 'type script' -> 'TypeScript', 'micro services' -> 'Microservices').",
+  "- ALWAYS silently infer the true intended technical interview question and answer it DIRECTLY in 3 to 4 crisp, natural spoken-English sentences.",
+  "- STRICTLY FORBIDDEN UNDER ALL CIRCUMSTANCES: NEVER say 'I\\'m guessing you\\'re referring to...', 'If you meant...', 'You probably meant...', 'Assuming you mean...', 'It sounds like you meant...', 'There is no concept called...', 'I think there was a typo', or mention speech-to-text, transcription, or spelling mistakes in any way. Answer directly as if you heard the exact technical term perfectly.",
 ].join("\n");
 
 export function buildHumanInterviewSystemPrompt(params: HumanPromptParams): string {
@@ -236,10 +236,9 @@ function getGeminiClient(): GoogleGenAI {
 }
 
 const GEMINI_FALLBACK_MODELS = [
-  "gemini-4-hydrogen",
-  "gemini-4-neon",
-  "gemini-3.1-flash-lite",
   "gemini-2.5-flash",
+  "gemini-2.5-flash-lite",
+  "gemini-2.0-flash",
 ] as const;
 
 function isFallbackEligibleError(err: unknown): boolean {
@@ -264,8 +263,8 @@ function adaptConfigForModel<T extends { thinkingConfig?: unknown } | undefined>
   config: T
 ): T {
   if (!config) return config;
-  if (model === "gemini-4-hydrogen" || model === "gemini-4-neon") {
-    return config;
+  if (model.startsWith("gemini-2.5-flash")) {
+    return { ...config, thinkingConfig: { thinkingBudget: 0 } };
   }
   return { ...config, thinkingConfig: undefined };
 }

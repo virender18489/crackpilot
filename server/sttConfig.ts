@@ -1,30 +1,32 @@
 export const TECH_KEYTERMS = [
+  "JavaScript",
   "React",
-  "multiple contexts",
-  "useContext",
+  "React.js",
   "Virtual DOM",
   "Real DOM",
-  "JavaScript",
-  "TypeScript",
   "Next.js",
+  "TypeScript",
   "Redux",
   "Node.js",
   "HTML",
   "CSS",
+  "Hooks",
+  "useState",
+  "useEffect",
+  "useContext",
+  "multiple contexts",
   "performance",
   "optimization",
-  "API",
   "Closure",
   "Hoisting",
   "Promise",
   "Async",
-  "Hooks",
-  "useEffect",
-  "useState",
+  "API",
+  "Microservices",
 ] as const;
 
 export const GROQ_WHISPER_TECH_PROMPT =
-  "Technical software engineering interview in English. Vocabulary: React, multiple contexts, useContext, Virtual DOM, Real DOM, JavaScript, TypeScript, Next.js, Redux, Node.js, HTML, CSS, performance, optimization, API, Closure, Hoisting, Promise, Async, Hooks, useEffect, useState.";
+  "Technical software engineering interview in English. Vocabulary: JavaScript, React, React.js, Virtual DOM, Real DOM, Next.js, TypeScript, Redux, Node.js, HTML, CSS, Hooks, useState, useEffect, useContext, multiple contexts, performance, optimization, Closure, Hoisting, Promise, Async, API, Microservices.";
 
 function getFileExtension(mimeType: string): string {
   if (mimeType.includes("wav")) return "wav";

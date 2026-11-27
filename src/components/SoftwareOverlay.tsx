@@ -2,9 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ArrowUp,
   Camera,
-  Check,
   Code2,
-  Copy,
   ExternalLink,
   Eye,
   EyeOff,
@@ -30,8 +28,11 @@ import {
   X,
   Zap,
 } from "lucide-react";
-import { AnswerView } from "./AnswerView";
-import { DsaTeleprompterView } from "./DsaTeleprompterView";
+import {
+  AudioLevelMeter,
+  QACardItem,
+  SessionTimerDisplay,
+} from "./HudTelemetryWidgets";
 import { LiveAudioQAEngine } from "./LiveAudioQAEngine";
 import { SAMPLE_INTERVIEW_QUESTIONS } from "../data/crackpilotPackages";
 import {
@@ -115,12 +116,6 @@ function formatNow(): string {
   });
 }
 
-function formatTimer(totalSeconds: number): string {
-  const mins = Math.floor(totalSeconds / 60);
-  const secs = totalSeconds % 60;
-  return `${String(mins).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
-}
-
 export function SoftwareOverlay({
   tokenState: _externalTokenState,
   profile,
@@ -147,8 +142,8 @@ export function SoftwareOverlay({
   const [hudWidthPx, setHudWidthPx] = useState<number>(1060);
   const [isResizing, setIsResizing] = useState(false);
 
-  // Overlay HUD controls
-  const [autoScroll, setAutoScroll] = useState(true);
+  // Overlay HUD controls — Scroll defaults to OFF so user can always scroll freely through all answers
+  const [autoScroll, setAutoScroll] = useState(false);
   const [videoDurationSec, setVideoDurationSec] = useState<number>(4);
   const [glitchDurationSec, setGlitchDurationSec] = useState<number>(4);
   const [isHidden, setIsHidden] = useState(false);
@@ -182,10 +177,10 @@ export function SoftwareOverlay({
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [interimText, setInterimText] = useState("");
   const [statusNotice, setStatusNotice] = useState<string | null>(null);
-  const [audioLevel, setAudioLevel] = useState(0);
 
-  // Session counters & live Admin quota state (initialized cleanly; populated after token authentication)
-  const [secondsLeft, setSecondsLeft] = useState(240 * 60);
+  // Session counters & live Admin quota state (1s ticks isolated inside SessionTimerDisplay)
+  const [timerBaseSeconds, setTimerBaseSeconds] = useState(240 * 60);
+  const [timerSyncVersion, setTimerSyncVersion] = useState(0);
   const [promptsUsed, setPromptsUsed] = useState(0);
   const [maxPrompts, setMaxPrompts] = useState(80);
   const [capturesUsed, setCapturesUsed] = useState(0);
@@ -248,12 +243,11 @@ export function SoftwareOverlay({
   const liveSpeechTickRef = useRef<number | null>(null);
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
   const mixAudioCtxRef = useRef<AudioContext | null>(null);
   const monitorGainRef = useRef<GainNode | null>(null);
-  const rafLevelRef = useRef<number | null>(null);
   const sseRef = useRef<EventSource | null>(null);
   const abortRef = useRef<AbortController | null>(null);
-  const countdownTimerRef = useRef<number | null>(null);
   const glitchTimerRef = useRef<number | null>(null);
   const videoScanTimerRef = useRef<number | null>(null);
   const videoFrameIntervalRef = useRef<number | null>(null);
@@ -321,7 +315,8 @@ export function SoftwareOverlay({
 
   const applyQuotaSnapshot = useCallback(
     (quota: AccountQuotaSnapshot) => {
-      setSecondsLeft(quota.remainingSeconds);
+      setTimerBaseSeconds(quota.remainingSeconds);
+      setTimerSyncVersion((v) => v + 1);
       setPromptsUsed(quota.promptsUsed);
       setMaxPrompts(quota.promptLimit);
       setCapturesUsed(quota.capturesUsed);
@@ -349,7 +344,8 @@ export function SoftwareOverlay({
 
   useEffect(() => {
     if (isAuthenticated && activeSessionToken?.quota) {
-      setSecondsLeft(activeSessionToken.quota.remainingSeconds);
+      setTimerBaseSeconds(activeSessionToken.quota.remainingSeconds);
+      setTimerSyncVersion((v) => v + 1);
       setPromptsUsed(activeSessionToken.quota.promptsUsed);
       setMaxPrompts(activeSessionToken.quota.promptLimit);
       setCapturesUsed(activeSessionToken.quota.capturesUsed);
@@ -434,10 +430,6 @@ export function SoftwareOverlay({
       };
 
       // Always land directly on the main workspace with timer PAUSED & audio in Standby (Monitor: OFF)
-      if (countdownTimerRef.current !== null) {
-        window.clearInterval(countdownTimerRef.current);
-        countdownTimerRef.current = null;
-      }
       isEngineRunningRef.current = false;
       setIsEngineRunning(false);
       setMonitorAudio(false);
@@ -445,7 +437,8 @@ export function SoftwareOverlay({
       setIsConnected(true);
       setQuotaBlockedReason(verifiedToken.quota?.blockedReason ?? null);
       if (verifiedToken.quota) {
-        setSecondsLeft(verifiedToken.quota.remainingSeconds);
+        setTimerBaseSeconds(verifiedToken.quota.remainingSeconds);
+        setTimerSyncVersion((v) => v + 1);
         setPromptsUsed(verifiedToken.quota.promptsUsed);
         setMaxPrompts(verifiedToken.quota.promptLimit);
         setCapturesUsed(verifiedToken.quota.capturesUsed);
@@ -699,53 +692,14 @@ export function SoftwareOverlay({
     void checkServerDiagnostics();
   }, [isSessionLive, checkServerDiagnostics]);
 
-  // Session countdown timer — STRICTLY frozen whenever isSessionRunning === false (never ticks on app launch)
-  useEffect(() => {
-    if (countdownTimerRef.current !== null) {
-      window.clearInterval(countdownTimerRef.current);
-      countdownTimerRef.current = null;
-    }
-    if (
-      !isSessionLive ||
-      !isConnected ||
-      !isSessionRunning ||
-      isHidden ||
-      glitchCountdown > 0
-    ) {
-      return;
-    }
-    countdownTimerRef.current = window.setInterval(() => {
-      if (!isEngineRunningRef.current) {
-        if (countdownTimerRef.current !== null) {
-          window.clearInterval(countdownTimerRef.current);
-          countdownTimerRef.current = null;
-        }
-        return;
-      }
-      unsyncedSecondsRef.current += 1;
-      setSecondsLeft((prev) => {
-        const next = prev > 0 ? prev - 1 : 0;
-        if (next === 0) {
-          if (countdownTimerRef.current !== null) {
-            window.clearInterval(countdownTimerRef.current);
-            countdownTimerRef.current = null;
-          }
-          setQuotaBlockedReason(
-            "Remaining time is 0 minutes. Ask the admin to add extra time, then click Reconnect."
-          );
-          isEngineRunningRef.current = false;
-          setIsEngineRunning(false);
-        }
-        return next;
-      });
-    }, 1000);
-    return () => {
-      if (countdownTimerRef.current !== null) {
-        window.clearInterval(countdownTimerRef.current);
-        countdownTimerRef.current = null;
-      }
-    };
-  }, [isSessionLive, isConnected, isSessionRunning, isHidden, glitchCountdown]);
+  // Called only when isolated SessionTimerDisplay hits 00:00
+  const handleTimeExhausted = useCallback(() => {
+    setQuotaBlockedReason(
+      "Remaining time is 0 minutes. Ask the admin to add extra time, then click Reconnect."
+    );
+    isEngineRunningRef.current = false;
+    setIsEngineRunning(false);
+  }, []);
 
   // Background 20s quota sync with AdminStore (ONLY deducts elapsed seconds when Start actually ran)
   useEffect(() => {
@@ -798,13 +752,8 @@ export function SoftwareOverlay({
     setHasUnseenLatest(false);
   }, []);
 
-  // Only keep anchored at top when the user is ALREADY near the top (< 60px) and Scroll: ON
-  useEffect(() => {
-    if (!autoScroll || !feedRef.current) return;
-    if (isAtTopRef.current && feedRef.current.scrollTop < 60) {
-      feedRef.current.scrollTop = 0;
-    }
-  }, [qaList.length, autoScroll]);
+  // Never hijack feedRef.current.scrollTop automatically on streaming updates,
+  // timer ticks, or audio levels. User scrolls 100% freely unless clicking Latest Answer.
 
   useEffect(() => {
     if (monitorGainRef.current) {
@@ -1274,7 +1223,7 @@ export function SoftwareOverlay({
     liveTranscriptRef.current = "";
     setLiveSpeechSeconds(0);
     setIsSpeechDetected(false);
-    setAudioLevel(0);
+    analyserRef.current = null;
 
     activeQuestionEpochRef.current += 1;
     orderedChunkTextsRef.current.clear();
@@ -1294,10 +1243,6 @@ export function SoftwareOverlay({
     if (liveSpeechTickRef.current !== null) {
       window.clearInterval(liveSpeechTickRef.current);
       liveSpeechTickRef.current = null;
-    }
-    if (rafLevelRef.current !== null) {
-      cancelAnimationFrame(rafLevelRef.current);
-      rafLevelRef.current = null;
     }
     if (recognitionRef.current) {
       try {
@@ -1617,6 +1562,7 @@ export function SoftwareOverlay({
         silentSink.connect(ctx.destination);
 
         audioCtxRef.current = ctx;
+        analyserRef.current = analyser;
         monitorGainRef.current = gain;
         pcmProcessorRef.current = processor;
 
@@ -1627,8 +1573,8 @@ export function SoftwareOverlay({
         preRollPcmRef.current = [];
         speechPcmRef.current = [];
 
-        const ROLLING_CHUNK_MS = 3_000; // Strictly non-overlapping 3s WAV micro-chunks (~94 KB each)
-        const PAUSE_TRIGGER_MS = 850; // Fast 850ms silence pause triggers sub-second AI streaming
+        const ROLLING_CHUNK_MS = 3_500; // Strictly non-overlapping 3.5s max WAV micro-chunks
+        const PAUSE_TRIGGER_MS = 750; // Fast 750ms silence pause triggers sub-second AI streaming
 
         // Compact ~0.25s pre-roll ONLY prepended on silence -> speech transition (cleared immediately, zero overlap)
         const maxPreRollFrames = Math.max(
@@ -1805,30 +1751,7 @@ export function SoftwareOverlay({
           }
         };
 
-        const data = new Uint8Array(analyser.fftSize);
-        let smoothedLevel = 0;
-
-        const tick = () => {
-          if (!isListeningRef.current) return;
-          if (ctx.state === "suspended") {
-            void ctx.resume().catch(() => {});
-          }
-          analyser.getByteTimeDomainData(data);
-          let sum = 0;
-          for (let i = 0; i < data.length; i++) {
-            const v = (data[i] - 128) / 128;
-            sum += v * v;
-          }
-          const rms = Math.sqrt(sum / data.length);
-          const targetLevel = Math.min(100, Math.round(rms * 520));
-          smoothedLevel =
-            targetLevel > smoothedLevel
-              ? targetLevel
-              : Math.max(0, Math.round(smoothedLevel * 0.82 + targetLevel * 0.18));
-          setAudioLevel(smoothedLevel);
-          rafLevelRef.current = requestAnimationFrame(tick);
-        };
-        rafLevelRef.current = requestAnimationFrame(tick);
+        // Audio level animation is isolated inside memoized AudioLevelMeter (GPU scaleX, 0 parent re-renders)
       } catch (err) {
         console.warn("[Crackpilot Audio] Web Audio PCM WAV init warning:", err);
       }
@@ -1945,7 +1868,7 @@ export function SoftwareOverlay({
                 setInterimText("");
               }
 
-              // Reset 850ms silence trigger on every live word for fast response after speech ends
+              // Reset 750ms silence trigger on every live word for fast response after speech ends
               if (pauseTriggerTimerRef.current !== null) {
                 window.clearTimeout(pauseTriggerTimerRef.current);
               }
@@ -1953,7 +1876,7 @@ export function SoftwareOverlay({
                 pauseTriggerTimerRef.current = window.setTimeout(() => {
                   pendingFinalizeRef.current = { fastMode: false };
                   commitPendingAnswerIfReady();
-                }, 850);
+                }, 750);
               }
             };
 
@@ -2602,10 +2525,6 @@ export function SoftwareOverlay({
   // Cleanly pause/stop active session & freeze timer (used by Stop button, Minimize, Hide, and OS minimize)
   const pauseEngineSession = useCallback(
     (notice?: string) => {
-      if (countdownTimerRef.current !== null) {
-        window.clearInterval(countdownTimerRef.current);
-        countdownTimerRef.current = null;
-      }
       isEngineRunningRef.current = false;
       setIsEngineRunning(false);
       flushElapsedSeconds();
@@ -2943,39 +2862,48 @@ export function SoftwareOverlay({
     };
   }, [stopAudioListening, stopScreenStream]);
 
-  const handleCopyCard = async (item: QAItem) => {
+  const handleCopyCard = useCallback((item: QAItem) => {
     try {
       const content =
         item.id === "system-init"
           ? `${item.question}\n${item.answer}`
           : item.answer || item.question;
-      await navigator.clipboard.writeText(content);
-      setCopiedId(item.id);
-      setTimeout(() => setCopiedId(null), 1500);
+      void navigator.clipboard.writeText(content).then(() => {
+        setCopiedId(item.id);
+        window.setTimeout(() => {
+          setCopiedId((cur) => (cur === item.id ? null : cur));
+        }, 1500);
+      });
     } catch {
-      // Ignore
+      // Ignore clipboard failures in restricted iframes
     }
-  };
+  }, []);
 
-  const handleSpeakCard = (item: QAItem) => {
-    if (!("speechSynthesis" in window) || !item.answer) return;
-    if (speakingId === item.id) {
-      window.speechSynthesis.cancel();
+  const handleSpeakCard = useCallback((item: QAItem) => {
+    try {
+      if (!("speechSynthesis" in window) || !item.answer) return;
+      setSpeakingId((prevId) => {
+        if (prevId === item.id) {
+          window.speechSynthesis.cancel();
+          return null;
+        }
+        window.speechSynthesis.cancel();
+        const plain = item.answer
+          .replace(/```[\s\S]*?```/g, "")
+          .replace(/[#*`]/g, "")
+          .trim();
+        const utter = new SpeechSynthesisUtterance(plain);
+        utter.lang =
+          profileRef.current.answerLanguage === "Hindi" ? "hi-IN" : "en-IN";
+        utter.onend = () => setSpeakingId(null);
+        utter.onerror = () => setSpeakingId(null);
+        window.speechSynthesis.speak(utter);
+        return item.id;
+      });
+    } catch {
       setSpeakingId(null);
-      return;
     }
-    window.speechSynthesis.cancel();
-    const plain = item.answer
-      .replace(/```[\s\S]*?```/g, "")
-      .replace(/[#*`]/g, "")
-      .trim();
-    const utter = new SpeechSynthesisUtterance(plain);
-    utter.lang = profile.answerLanguage === "Hindi" ? "hi-IN" : "en-IN";
-    utter.onend = () => setSpeakingId(null);
-    utter.onerror = () => setSpeakingId(null);
-    setSpeakingId(item.id);
-    window.speechSynthesis.speak(utter);
-  };
+  }, []);
 
   const handleSendSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -3011,17 +2939,15 @@ export function SoftwareOverlay({
 
   return (
     <div
-      className={`${
+      className={`h-screen w-screen overflow-hidden flex items-center justify-center ${
         desktopMode
-          ? "h-screen min-h-screen w-screen bg-transparent p-0"
-          : "min-h-screen w-full bg-gradient-to-br from-[#0a1322] via-[#13263f] to-[#0b1526] p-2 sm:p-4"
-      } flex items-center justify-center ${
-        isResizing ? "select-none cursor-ew-resize" : ""
-      }`}
+          ? "bg-transparent p-0"
+          : "bg-gradient-to-br from-[#0a1322] via-[#13263f] to-[#0b1526] p-2 sm:p-4"
+      } ${isResizing ? "select-none cursor-ew-resize" : ""}`}
     >
       <video ref={hiddenVideoRef} className="hidden" muted playsInline />
 
-      {/* Resizable Floating Translucent Overlay Window */}
+      {/* Rock-Solid Viewport-Locked Overlay Window */}
       <div
         style={
           desktopMode || isMaximized
@@ -3034,12 +2960,12 @@ export function SoftwareOverlay({
           desktopMode ? "" : "backdrop-blur-md"
         } ${DEFAULT_OVERLAY_BG} ${
           desktopMode
-            ? "h-full min-h-[420px] w-full"
+            ? "h-full w-full"
             : isMaximized
-              ? "h-[calc(100vh-1rem)] min-h-[460px] w-full"
+              ? "h-full w-full"
               : isCompact
-                ? "h-[460px]"
-                : "h-[calc(100vh-2rem)] min-h-[500px] max-h-[840px]"
+                ? "h-[460px] max-h-full"
+                : "h-full max-h-[860px]"
         }`}
       >
         {/* Left & Right Drag-to-Resize Width Handles */}
@@ -3064,8 +2990,8 @@ export function SoftwareOverlay({
           </>
         )}
 
-        {/* Clean Top Window Bar — Sibling drag spacers NEVER wrap interactive buttons (fixes Windows 11 Electron click hit-testing) */}
-        <header className="relative z-30 flex h-10 shrink-0 items-center justify-between gap-2 border-b border-slate-700/60 bg-[#0d1220]/95 px-3">
+        {/* Fixed-Height Top Header (shrink-0 h-11, never wraps) */}
+        <header className="relative z-30 flex h-11 shrink-0 items-center justify-between gap-2 overflow-hidden whitespace-nowrap border-b border-slate-700/60 bg-[#0d1220]/95 px-3">
           {/* Left Brand + Drag Zone */}
           <div className="app-drag flex flex-1 h-full items-center gap-2.5 min-w-0 pl-1">
             <span className="flex h-5 w-5 items-center justify-center rounded bg-[#405fe8] text-[11px] font-bold text-white shrink-0">
@@ -3419,13 +3345,60 @@ export function SoftwareOverlay({
         ) : (
           /* ACTIVE LIVE HUD OVERLAY — Opens directly after token auth (Timer PAUSED, Monitor OFF until Start) */
           <>
-            {/* Scrollable Q&A Stream Feed (Newest-First Stack + Top-Pinned Live Listening + Free Scroll) */}
-            <div className="relative flex-1 min-h-0 flex flex-col">
+            {/* Isolated Middle Q&A Scroll Container (Zero Layout Shift + Free Scrolling) */}
+            <div className="relative flex-1 min-h-0 flex flex-col overflow-hidden">
+              {/* Floating Notification Pill — NEVER shifts or pushes the Q&A feed */}
+              {(glitchCountdown > 0 || videoScanCountdown > 0 || statusNotice) && (
+                <div className="pointer-events-none absolute top-2.5 left-1/2 z-30 -translate-x-1/2 max-w-[92%]">
+                  {glitchCountdown > 0 ? (
+                    <div className="pointer-events-auto inline-flex items-center gap-2.5 rounded-full border border-amber-500/50 bg-amber-950/92 px-3.5 py-1.5 text-xs text-amber-200 shadow-xl backdrop-blur-md">
+                      <WifiOff className="h-3.5 w-3.5 shrink-0 text-amber-400" />
+                      <span className="truncate">
+                        Glitch Active: auto-restoring in{" "}
+                        <strong className="font-mono text-white tabular-nums">
+                          {glitchCountdown}s
+                        </strong>
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => void handleReconnect()}
+                        className="rounded-full bg-amber-500/25 px-2 py-0.5 text-[11px] font-semibold text-amber-100 hover:bg-amber-500/40 cursor-pointer shrink-0"
+                      >
+                        Restore
+                      </button>
+                    </div>
+                  ) : videoScanCountdown > 0 ? (
+                    <div className="pointer-events-auto inline-flex items-center gap-2 rounded-full border border-sky-500/50 bg-sky-950/92 px-3.5 py-1.5 text-xs text-sky-200 shadow-xl backdrop-blur-md">
+                      <Video className="h-3.5 w-3.5 shrink-0 text-sky-400" />
+                      <span className="truncate">
+                        Video Scan:{" "}
+                        <strong className="font-mono text-white tabular-nums">
+                          {videoScanCountdown}s
+                        </strong>{" "}
+                        ({videoFramesCount} frames)
+                      </span>
+                    </div>
+                  ) : statusNotice ? (
+                    <div className="pointer-events-auto inline-flex items-center gap-2 rounded-full border border-slate-600/70 bg-[#0d1424]/95 px-3.5 py-1.5 text-xs text-slate-200 shadow-xl backdrop-blur-md">
+                      <span className="truncate max-w-[520px]">{statusNotice}</span>
+                      <button
+                        type="button"
+                        onClick={() => setStatusNotice(null)}
+                        aria-label="Dismiss notice"
+                        className="text-slate-400 hover:text-white cursor-pointer shrink-0"
+                      >
+                        <X className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
+                  ) : null}
+                </div>
+              )}
+
               {showJumpToTop && (
                 <button
                   type="button"
                   onClick={jumpToLatestTop}
-                  className={`absolute top-3 right-5 z-20 inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-semibold shadow-xl backdrop-blur-md transition-all cursor-pointer ${
+                  className={`absolute top-3 right-5 z-20 inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-semibold shadow-xl backdrop-blur-md transition-colors cursor-pointer ${
                     hasUnseenLatest
                       ? "border-[#b4f416]/70 bg-[#b4f416] text-slate-950 hover:bg-[#c8ff3d]"
                       : "border-sky-400/50 bg-[#0f192d]/95 text-sky-100 hover:bg-[#162440]"
@@ -3439,14 +3412,14 @@ export function SoftwareOverlay({
               <div
                 ref={feedRef}
                 onScroll={handleFeedScroll}
-                className="hud-scroll flex-1 overflow-y-auto px-4 py-4 space-y-3"
+                style={{ overflowAnchor: "none" }}
+                className="hud-scroll flex-1 min-h-0 overflow-y-auto overscroll-contain px-4 py-3 pb-8 space-y-3"
               >
-                {/* Pinned Real-Time Live Transcribed Q Card at the VERY TOP */}
+                {/* Pinned Real-Time Live Transcribed Q Card — never flickers on raw volume spikes */}
                 {(liveTranscript ||
                   interimText ||
                   isTranscribing ||
-                  isSpeechDetected ||
-                  (isListening && audioLevel >= 14)) && (
+                  isSpeechDetected) && (
                   <div className="rounded-xl border border-sky-400/50 bg-[#0f192d]/95 px-4 py-3 text-xs text-sky-100 flex items-start justify-between gap-3 shadow-lg">
                     <div className="flex items-start gap-2.5 min-w-0 flex-1">
                       <span className="mt-0.5 font-mono text-sm font-bold text-sky-400 shrink-0">
@@ -3455,10 +3428,10 @@ export function SoftwareOverlay({
                       <div className="min-w-0 flex-1">
                         <div className="flex flex-wrap items-center gap-2 mb-1">
                           <span className="inline-flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-wider text-sky-300">
-                            <span className="h-1.5 w-1.5 rounded-full bg-[#b4f416] animate-pulse" />
+                            <span className="h-1.5 w-1.5 rounded-full bg-[#b4f416]" />
                             {isTranscribing
                               ? "Transcribing live chunk..."
-                              : "LIVE LISTENING (3s micro-chunks)"}
+                              : "LIVE LISTENING (3.5s micro-chunks)"}
                           </span>
                           {liveSpeechSeconds > 0 && (
                             <span className="rounded bg-slate-800/90 px-1.5 py-0.5 font-mono text-[10px] text-[#b4f416] tabular-nums">
@@ -3474,7 +3447,7 @@ export function SoftwareOverlay({
                               : "Speech detected — capturing interviewer question...")}
                         </p>
                         <p className="mt-1 text-[10px] font-mono text-sky-300/75">
-                          Auto-answers after 0.85s pause, or click Answer Now anytime
+                          Auto-answers after 0.75s pause, or click Answer Now anytime
                         </p>
                       </div>
                     </div>
@@ -3488,154 +3461,19 @@ export function SoftwareOverlay({
                   </div>
                 )}
 
-                {/* Active Glitch Offline / Video Scan / Status Banners */}
-                {glitchCountdown > 0 && (
-                  <div className="rounded-xl border border-amber-500/45 bg-amber-950/75 px-4 py-2.5 text-xs text-amber-200 flex items-center justify-between">
-                    <span className="inline-flex items-center gap-2 font-medium">
-                      <WifiOff className="h-4 w-4 text-amber-400" />
-                      <span>
-                        Glitch Active: Internet paused — auto-restoring in{" "}
-                        <strong className="font-mono text-white">
-                          {glitchCountdown}s
-                        </strong>
-                      </span>
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => void handleReconnect()}
-                      className="rounded bg-amber-500/25 px-2 py-0.5 text-[11px] font-semibold text-amber-100 hover:bg-amber-500/40 cursor-pointer"
-                    >
-                      Restore Now
-                    </button>
-                  </div>
-                )}
-
-                {videoScanCountdown > 0 && (
-                  <div className="rounded-xl border border-sky-500/50 bg-sky-950/75 px-4 py-2.5 text-xs text-sky-200 flex items-center justify-between">
-                    <span className="inline-flex items-center gap-2 font-medium">
-                      <Video className="h-4 w-4 text-sky-400" />
-                      <span>
-                        Recording Page Video Scan: scroll through questions now —{" "}
-                        <strong className="font-mono text-white">
-                          {videoScanCountdown}s left
-                        </strong>{" "}
-                        ({videoFramesCount} frames captured)
-                      </span>
-                    </span>
-                  </div>
-                )}
-
-                {statusNotice &&
-                  glitchCountdown === 0 &&
-                  videoScanCountdown === 0 && (
-                    <div className="rounded-lg border border-slate-700/70 bg-[#0d1424]/90 px-3.5 py-2 text-xs text-slate-300 flex items-center justify-between gap-2">
-                      <span>{statusNotice}</span>
-                      <button
-                        type="button"
-                        onClick={() => setStatusNotice(null)}
-                        className="text-slate-400 hover:text-white cursor-pointer"
-                      >
-                        <X className="h-3.5 w-3.5" />
-                      </button>
-                    </div>
-                  )}
-
-                {/* Q&A Cards in Newest-First (Reverse Chronological) Order */}
+                {/* Memoized Q&A Cards in Newest-First (Reverse Chronological) Order */}
                 {qaList.map((item) => (
-                  <article
+                  <QACardItem
                     key={item.id}
-                    className="rounded-xl border border-slate-700/60 bg-[#0e1525]/92 px-5 py-4 shadow-lg"
-                  >
-                    <div className="flex items-start justify-between gap-3">
-                      <div className="flex items-start gap-2.5 min-w-0">
-                        <span
-                          style={{ fontSize: `${questionFontPx}px` }}
-                          className="mt-0.5 font-mono font-bold text-sky-400 shrink-0"
-                        >
-                          Q
-                        </span>
-                        <h2
-                          style={{ fontSize: `${questionFontPx}px` }}
-                          className="font-semibold text-white leading-snug break-words"
-                        >
-                          {item.question}
-                        </h2>
-                      </div>
-
-                      <div className="flex items-center gap-1.5 shrink-0">
-                        {typeof item.latencyMs === "number" && (
-                          <span
-                            className={`inline-flex items-center gap-1 rounded-md border px-2 py-0.5 font-mono text-[10px] font-semibold tabular-nums ${
-                              item.latencyMs < 1000
-                                ? "border-[#b4f416]/45 bg-[#b4f416]/15 text-[#d9ff66]"
-                                : "border-sky-500/40 bg-sky-500/15 text-sky-200"
-                            }`}
-                            title="Time to first streamed answer token"
-                          >
-                            <Zap className="h-2.5 w-2.5" />
-                            <span>{item.latencyMs}ms</span>
-                          </span>
-                        )}
-                        {item.id !== "system-init" && item.answer && (
-                          <button
-                            type="button"
-                            onClick={() => handleSpeakCard(item)}
-                            title="Read aloud"
-                            className={`inline-flex items-center gap-1 rounded-md border px-2 py-1 text-[11px] font-medium transition-colors cursor-pointer ${
-                              speakingId === item.id
-                                ? "border-sky-500/50 bg-sky-500/20 text-sky-200"
-                                : "border-slate-700/80 bg-[#172136] text-slate-300 hover:text-white"
-                            }`}
-                          >
-                            <Volume2 className="h-3 w-3" />
-                          </button>
-                        )}
-                        <button
-                          type="button"
-                          onClick={() => void handleCopyCard(item)}
-                          className="inline-flex items-center gap-1.5 rounded-md border border-slate-700/80 bg-[#172136] px-2.5 py-1 text-[11px] font-medium text-slate-200 hover:bg-slate-700/80 transition-colors cursor-pointer"
-                        >
-                          {copiedId === item.id ? (
-                            <Check className="h-3 w-3 text-emerald-400" />
-                          ) : (
-                            <Copy className="h-3 w-3 text-slate-400" />
-                          )}
-                          <span>{copiedId === item.id ? "Copied" : "Copy"}</span>
-                        </button>
-                      </div>
-                    </div>
-
-                    <div className="mt-2.5 flex items-start gap-2.5">
-                      <span
-                        style={{ fontSize: `${fontSizePx}px` }}
-                        className="mt-0.5 font-mono font-bold text-rose-400 shrink-0"
-                      >
-                        A
-                      </span>
-                      <div className="flex-1 min-w-0">
-                        {item.error ? (
-                          <p className="text-xs text-rose-300">{item.error}</p>
-                        ) : item.dsaData ? (
-                          <DsaTeleprompterView
-                            data={item.dsaData}
-                            fontSizePx={fontSizePx}
-                          />
-                        ) : item.answer ? (
-                          <AnswerView
-                            markdown={item.answer}
-                            isStreaming={item.isStreaming}
-                            fontSizePx={fontSizePx}
-                          />
-                        ) : (
-                          <p className="text-xs text-slate-400">
-                            {profile.dsaModeEnabled
-                              ? "Parsing problem & preparing structured DSA teleprompter..."
-                              : "Generating personalized human answer..."}
-                          </p>
-                        )}
-                      </div>
-                    </div>
-                  </article>
+                    item={item}
+                    fontSizePx={fontSizePx}
+                    questionFontPx={questionFontPx}
+                    dsaModeEnabled={Boolean(profile.dsaModeEnabled)}
+                    isCopied={copiedId === item.id}
+                    isSpeaking={speakingId === item.id}
+                    onCopy={handleCopyCard}
+                    onSpeak={handleSpeakCard}
+                  />
                 ))}
               </div>
             </div>
@@ -3769,26 +3607,20 @@ export function SoftwareOverlay({
               {/* Compact Status Line */}
               <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-300">
                 <div className="flex flex-wrap items-center gap-2.5">
-                  <span className="inline-flex items-center gap-1.5 tabular-nums">
-                    <span
-                      className={`h-1.5 w-1.5 rounded-full ${
-                        isEngineRunning
-                          ? "bg-[#b4f416] animate-pulse"
-                          : "bg-amber-400/80"
-                      }`}
-                    />
-                    <span>Time:</span>
-                    <strong className="font-semibold text-white">
-                      {formatTimer(secondsLeft)}
-                    </strong>
-                    <span
-                      className={`font-mono text-[10px] uppercase tracking-wider ${
-                        isEngineRunning ? "text-[#b4f416]" : "text-amber-300"
-                      }`}
-                    >
-                      {isEngineRunning ? "Running" : "Paused"}
-                    </span>
-                  </span>
+                  <SessionTimerDisplay
+                    initialSeconds={timerBaseSeconds}
+                    syncVersion={timerSyncVersion}
+                    isRunning={
+                      isSessionLive &&
+                      isConnected &&
+                      isSessionRunning &&
+                      !isHidden &&
+                      glitchCountdown === 0
+                    }
+                    isEngineRunning={isEngineRunning}
+                    unsyncedSecondsRef={unsyncedSecondsRef}
+                    onTimeExhausted={handleTimeExhausted}
+                  />
                   <span className="text-slate-500">·</span>
                   <span className="tabular-nums">
                     Captures:{" "}
@@ -3925,36 +3757,20 @@ export function SoftwareOverlay({
 
                   {/* Live Mic / Audio Level Meter + Hardware Mic Selector */}
                   <div className="inline-flex items-center gap-2 rounded-md border border-slate-700/80 bg-[#0c1424]/90 px-2 py-0.5">
-                    <span
-                      className={`inline-flex items-center gap-1 text-[11px] font-medium ${
-                        isListening ? "text-[#c6f527]" : "text-slate-400"
-                      }`}
-                    >
-                      <span>
-                        {isListening
+                    <AudioLevelMeter
+                      analyserRef={analyserRef}
+                      audioCtxRef={audioCtxRef}
+                      isListening={isListening}
+                      label={
+                        isListening
                           ? selectedAudioInput === "call-both"
                             ? "Call + Mic Live"
                             : listenMode === "tab"
                               ? "Loopback Live"
                               : "Mic Live"
-                          : "Audio Standby"}
-                      </span>
-                    </span>
-                    <span
-                      aria-label="Live audio input level"
-                      className="inline-block h-1.5 w-12 overflow-hidden rounded-full bg-slate-800"
-                    >
-                      <span
-                        className={`block h-full transition-all duration-75 ${
-                          audioLevel > 12 ? "bg-[#b4f416]" : "bg-emerald-400/60"
-                        }`}
-                        style={{
-                          width: isListening
-                            ? `${Math.max(6, audioLevel)}%`
-                            : "0%",
-                        }}
-                      />
-                    </span>
+                          : "Audio Standby"
+                      }
+                    />
                     {selectedAudioInput !== "system-loopback" &&
                       selectedAudioInput !== "call-both" && (
                         <select

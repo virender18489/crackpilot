@@ -2,12 +2,11 @@ export const GROQ_MODELS_URL = "https://api.groq.com/openai/v1/models";
 export const GROQ_CHAT_COMPLETIONS_URL =
   "https://api.groq.com/openai/v1/chat/completions";
 
-export const DEFAULT_GROQ_CHAT_MODEL = "llama-3.1-8b-instant";
+export const DEFAULT_GROQ_CHAT_MODEL = "openai/gpt-oss-20b";
 
 export const PREFERRED_GROQ_MODELS = [
-  "llama-3.1-8b-instant",
-  "meta-llama/llama-4-scout-17b-16e-instruct",
   "openai/gpt-oss-20b",
+  "llama-3.1-8b-instant",
   "openai/gpt-oss-120b",
 ] as const;
 
@@ -123,21 +122,31 @@ export interface StreamGroqChatParams {
   onDelta: (text: string) => void;
 }
 
+// Track models that returned 404/decommissioned so subsequent requests skip them with zero extra round-trip
+const deadModelsUntil = new Map<string, number>();
+const DEAD_MODEL_TTL_MS = 60 * 60 * 1000;
+
 export async function streamGroqChatCompletion(
   params: StreamGroqChatParams
 ): Promise<{ model: string; emittedChars: number }> {
-  const candidates = await getGroqCandidateModels(params.apiKey);
-  const modelsToTry = candidates.slice(0, 2);
+  const now = Date.now();
+  // Fast path: try llama-3.1-8b-instant immediately with ZERO blocking /models pre-flight lookup
+  const fastOrder = PREFERRED_GROQ_MODELS.filter(
+    (m) => (deadModelsUntil.get(m) || 0) <= now
+  );
+  const modelsToTry: string[] =
+    fastOrder.length > 0 ? [...fastOrder] : await getGroqCandidateModels(params.apiKey);
+
   let lastError: Error = new Error("Groq chat completion unavailable.");
 
-  for (let i = 0; i < modelsToTry.length; i++) {
+  for (let i = 0; i < Math.min(modelsToTry.length, 3); i++) {
     const model = modelsToTry[i];
     const isGptOssReasoning = /^openai\/gpt-oss/i.test(model);
     const requestPayload: Record<string, unknown> = {
       model,
       stream: true,
-      temperature: params.temperature ?? 0.35,
-      max_tokens: params.maxTokens ?? 1400,
+      temperature: params.temperature ?? 0.2,
+      max_tokens: params.maxTokens ?? 180,
       messages: params.messages,
     };
     if (isGptOssReasoning) {
@@ -160,10 +169,11 @@ export async function streamGroqChatCompletion(
         `Groq upstream status ${upstream.status}${errBody ? `: ${errBody.slice(0, 140)}` : ""}`
       );
       if (upstream.status === 404 || /model_not_found|decommissioned/i.test(errBody)) {
+        deadModelsUntil.set(model, Date.now() + DEAD_MODEL_TTL_MS);
         invalidateGroqModelCache();
         continue;
       }
-      // For 400/401/403/429/5xx, immediately abort Groq so caller falls back to Gemini
+      // For 400/401/403/429/5xx, immediately abort Groq so caller falls back to Gemini without delay
       throw lastError;
     }
 

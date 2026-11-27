@@ -23,6 +23,7 @@ import {
   normalizeProgrammingLanguage,
 } from "./server/dsaEngine.ts";
 import { streamGroqChatCompletion } from "./server/groqHelper.ts";
+import { sanitizePhoneticQuestion } from "./server/phoneticSanitizer.ts";
 import {
   transcribeWithDeepgramEnglish,
   transcribeWithGroqWhisperEnglish,
@@ -1317,7 +1318,10 @@ async function startServer() {
     res.setHeader("Cache-Control", "no-cache, no-transform");
     res.setHeader("Connection", "keep-alive");
     res.setHeader("X-Accel-Buffering", "no");
+    res.setHeader("Content-Encoding", "none");
     res.flushHeaders();
+
+    const cleanQuestion = sanitizePhoneticQuestion(question.trim());
 
     const sendEvent = (payload: Record<string, unknown>) => {
       res.write(`data: ${JSON.stringify(payload)}\n\n`);
@@ -1337,7 +1341,7 @@ async function startServer() {
 
     const isDsaFollowUp = Boolean(effectiveDsaMode && boundProblem);
 
-    const isCodeReq = !isDsaFollowUp && isCodeCreationRequest(question);
+    const isCodeReq = !isDsaFollowUp && isCodeCreationRequest(cleanQuestion);
 
     const systemPrompt = isDsaFollowUp
       ? buildDsaFollowUpSystemPrompt({
@@ -1356,7 +1360,7 @@ async function startServer() {
           answerLanguage,
           answerStyle,
           fastMode: Boolean(fastMode),
-          question: question.trim(),
+          question: cleanQuestion,
         });
 
     const recentContext =
@@ -1372,15 +1376,15 @@ async function startServer() {
 
     const userPrompt = isDsaFollowUp
       ? recentContext
-        ? `Recent coding discussion:\n${recentContext}\n\nInterviewer's live follow-up question on the current problem (${boundProblem!.title}):\n"${question.trim()}"\n\nAnswer directly with natural spoken guidance, updated ${effectiveProgLang} code, and updated Time/Space complexity.`
-        : `Interviewer's live follow-up question on the current problem (${boundProblem!.title}):\n"${question.trim()}"\n\nAnswer directly with natural spoken guidance, updated ${effectiveProgLang} code, and updated Time/Space complexity.`
+        ? `Recent coding discussion:\n${recentContext}\n\nInterviewer's live follow-up question on the current problem (${boundProblem!.title}):\n"${cleanQuestion}"\n\nAnswer directly with natural spoken guidance, updated ${effectiveProgLang} code, and updated Time/Space complexity.`
+        : `Interviewer's live follow-up question on the current problem (${boundProblem!.title}):\n"${cleanQuestion}"\n\nAnswer directly with natural spoken guidance, updated ${effectiveProgLang} code, and updated Time/Space complexity.`
       : isCodeReq
         ? recentContext
-          ? `Recent interview context:\n${recentContext}\n\nInterviewer just asked:\n"${question.trim()}"\n\nRespond strictly in two parts: (1) one crisp 3-4 sentence first-person developer summary paragraph with backticked identifiers and zero AI filler, immediately followed by (2) one complete runnable fenced code block with the exact language tag. Output zero text after the code block.`
-          : `Interviewer just asked:\n"${question.trim()}"\n\nRespond strictly in two parts: (1) one crisp 3-4 sentence first-person developer summary paragraph with backticked identifiers and zero AI filler, immediately followed by (2) one complete runnable fenced code block with the exact language tag. Output zero text after the code block.`
+          ? `Recent interview context:\n${recentContext}\n\nInterviewer just asked:\n"${cleanQuestion}"\n\nRespond strictly in two parts: (1) one crisp 3-4 sentence first-person developer summary paragraph with backticked identifiers and zero AI filler, immediately followed by (2) one complete runnable fenced code block with the exact language tag. Output zero text after the code block.`
+          : `Interviewer just asked:\n"${cleanQuestion}"\n\nRespond strictly in two parts: (1) one crisp 3-4 sentence first-person developer summary paragraph with backticked identifiers and zero AI filler, immediately followed by (2) one complete runnable fenced code block with the exact language tag. Output zero text after the code block.`
         : recentContext
-          ? `Recent interview context:\n${recentContext}\n\nInterviewer just asked:\n"${question.trim()}"\n\nAnswer directly in natural human spoken language matching the exact Answer Style rules.`
-          : `Interviewer just asked:\n"${question.trim()}"\n\nAnswer directly in natural human spoken language matching the exact Answer Style rules.`;
+          ? `Recent interview context:\n${recentContext}\n\nInterviewer just asked:\n"${cleanQuestion}"\n\nAnswer directly in natural human spoken language matching the exact Answer Style rules.`
+          : `Interviewer just asked:\n"${cleanQuestion}"\n\nAnswer directly in natural human spoken language matching the exact Answer Style rules.`;
 
     let streamedAnyChunk = false;
     const groqKey = (process.env.GROQ_API_KEY || "")
@@ -1398,8 +1402,8 @@ async function startServer() {
             { role: "system", content: systemPrompt },
             { role: "user", content: userPrompt },
           ],
-          temperature: 0.35,
-          maxTokens: isCodeReq || isDsaFollowUp ? 1400 : 360,
+          temperature: 0.2,
+          maxTokens: isCodeReq || isDsaFollowUp ? 1400 : 180,
           onMeta: (model) => {
             sendEvent({ meta: { engine: "groq", model } });
           },
@@ -1516,7 +1520,9 @@ async function startServer() {
         contents: userPrompt,
         config: {
           systemInstruction: systemPrompt,
-          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+          temperature: 0.2,
+          maxOutputTokens: isCodeReq || isDsaFollowUp ? 1400 : 220,
+          thinkingConfig: { thinkingBudget: 0 },
         },
       });
       sendEvent({ meta: { engine: "gemini", model } });

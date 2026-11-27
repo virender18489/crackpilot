@@ -1,5 +1,4 @@
 import type { IncomingMessage, ServerResponse } from "http";
-import { ThinkingLevel } from "@google/genai";
 import {
   buildDsaFollowUpSystemPrompt,
   buildHumanInterviewSystemPrompt,
@@ -8,6 +7,7 @@ import {
   normalizeProgrammingLanguage,
 } from "../server/dsaEngine.ts";
 import { streamGroqChatCompletion } from "../server/groqHelper.ts";
+import { sanitizePhoneticQuestion } from "../server/phoneticSanitizer.ts";
 import type { ActiveProblemContext } from "../src/types.ts";
 
 interface AnswerBody {
@@ -152,18 +152,20 @@ export default async function handler(
     return;
   }
 
-  const cleanQuestion = typeof body.question === "string" ? body.question.trim() : "";
-  if (!cleanQuestion) {
+  const rawQuestion = typeof body.question === "string" ? body.question.trim() : "";
+  if (!rawQuestion) {
     res.statusCode = 400;
     res.setHeader("Content-Type", "application/json");
     res.end(JSON.stringify({ error: "Question is required." }));
     return;
   }
+  const cleanQuestion = sanitizePhoneticQuestion(rawQuestion);
 
   res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
   res.setHeader("Cache-Control", "no-cache, no-transform");
   res.setHeader("Connection", "keep-alive");
   res.setHeader("X-Accel-Buffering", "no");
+  res.setHeader("Content-Encoding", "none");
   if (typeof (res as ServerResponse & { flushHeaders?: () => void }).flushHeaders === "function") {
     (res as ServerResponse & { flushHeaders?: () => void }).flushHeaders?.();
   }
@@ -234,8 +236,8 @@ export default async function handler(
           { role: "system", content: systemPrompt },
           { role: "user", content: userPrompt },
         ],
-        temperature: 0.35,
-        maxTokens: isCodeReq || useDsaFollowUp ? 1400 : 360,
+        temperature: 0.2,
+        maxTokens: isCodeReq || useDsaFollowUp ? 1400 : 180,
         onMeta: (model) => {
           sendEvent({ meta: { engine: "groq", model } });
         },
@@ -303,7 +305,9 @@ export default async function handler(
         contents: userPrompt,
         config: {
           systemInstruction: systemPrompt,
-          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+          temperature: 0.2,
+          maxOutputTokens: isCodeReq || useDsaFollowUp ? 1400 : 220,
+          thinkingConfig: { thinkingBudget: 0 },
         },
       });
       sendEvent({ meta: { engine: "gemini", model } });
