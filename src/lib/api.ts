@@ -60,11 +60,17 @@ export function isAuthWalledPreviewUrl(url: string): boolean {
 
 export function isDesktopApp(): boolean {
   if (typeof window === "undefined") return false;
-  return Boolean(
-    window.crackpilotDesktop?.isElectron ||
-      window.location.protocol === "file:" ||
-      navigator.userAgent.includes("Electron")
-  );
+  try {
+    return Boolean(
+      window.crackpilotDesktop?.isElectron ||
+        window.location?.protocol === "file:" ||
+        (typeof navigator !== "undefined" &&
+          typeof navigator.userAgent === "string" &&
+          navigator.userAgent.includes("Electron"))
+    );
+  } catch {
+    return false;
+  }
 }
 
 export function getApiBaseUrl(): string {

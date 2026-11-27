@@ -309,13 +309,15 @@ export function SoftwareOverlay({
   activeProblemContextRef.current = activeProblemContext;
   selectedAudioInputRef.current = selectedAudioInput;
 
-  // Strictly wipe any stale persisted auth tokens on every fresh SoftwareOverlay mount
+  // Mount-only auth wipe: never re-run on parent callback identity changes
+  const onTokenChangeRef = useRef(onTokenChange);
+  onTokenChangeRef.current = onTokenChange;
   useEffect(() => {
     clearOverlayAuthStorage();
     setIsAuthenticated(false);
     setActiveSessionToken(null);
-    onTokenChange(null);
-  }, [onTokenChange]);
+    onTokenChangeRef.current(null);
+  }, []);
 
   const applyQuotaSnapshot = useCallback(
     (quota: AccountQuotaSnapshot) => {
@@ -2991,8 +2993,8 @@ export function SoftwareOverlay({
 
   const questionFontPx = Math.min(30, fontSizePx + 1);
 
-  // Hidden state (Alt+H brings back immediately)
-  if (isHidden) {
+  // Hidden state (only allowed after authentication; never hide the Authenticate Crackpilot screen)
+  if (isHidden && isSessionLive) {
     return (
       <div className="min-h-screen bg-[#070c16] flex items-end justify-end p-5">
         <button
@@ -3011,8 +3013,8 @@ export function SoftwareOverlay({
     <div
       className={`${
         desktopMode
-          ? "h-screen w-screen bg-transparent p-0"
-          : "min-h-screen bg-gradient-to-br from-[#0a1322] via-[#13263f] to-[#0b1526] p-2 sm:p-4"
+          ? "h-screen min-h-screen w-screen bg-transparent p-0"
+          : "min-h-screen w-full bg-gradient-to-br from-[#0a1322] via-[#13263f] to-[#0b1526] p-2 sm:p-4"
       } flex items-center justify-center ${
         isResizing ? "select-none cursor-ew-resize" : ""
       }`}
@@ -3032,12 +3034,12 @@ export function SoftwareOverlay({
           desktopMode ? "" : "backdrop-blur-md"
         } ${DEFAULT_OVERLAY_BG} ${
           desktopMode
-            ? "h-full w-full"
+            ? "h-full min-h-[420px] w-full"
             : isMaximized
-              ? "h-[calc(100vh-1rem)] w-full"
+              ? "h-[calc(100vh-1rem)] min-h-[460px] w-full"
               : isCompact
                 ? "h-[460px]"
-                : "h-[calc(100vh-2rem)] max-h-[840px]"
+                : "h-[calc(100vh-2rem)] min-h-[500px] max-h-[840px]"
         }`}
       >
         {/* Left & Right Drag-to-Resize Width Handles */}

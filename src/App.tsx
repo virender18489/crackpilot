@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { AdminPanel } from "./components/AdminPanel";
 import { Dashboard } from "./components/Dashboard";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 import { LandingPage } from "./components/LandingPage";
 import { LoginView } from "./components/LoginView";
 import { SoftwareOverlay } from "./components/SoftwareOverlay";
@@ -41,7 +42,10 @@ const DEFAULT_PROFILE: TargetProfile = {
   preferredLanguage: "Python",
 };
 
-function sanitizeProfile(raw: TargetProfile): TargetProfile {
+function sanitizeProfile(raw: TargetProfile | null | undefined): TargetProfile {
+  if (!raw || typeof raw !== "object") {
+    return { ...DEFAULT_PROFILE };
+  }
   return {
     ...DEFAULT_PROFILE,
     ...raw,
@@ -53,16 +57,22 @@ function sanitizeProfile(raw: TargetProfile): TargetProfile {
 
 function getViewFromLocation(): RootView {
   if (typeof window === "undefined") return "landing";
-  const pathname = window.location.pathname.replace(/\/+$/, "").toLowerCase();
-  const params = new URLSearchParams(window.location.search);
-  const mode = params.get("mode");
+  try {
+    const pathname = (window.location?.pathname || "/")
+      .replace(/\/+$/, "")
+      .toLowerCase();
+    const params = new URLSearchParams(window.location?.search || "");
+    const mode = params.get("mode");
 
-  if (pathname === "/admin" || mode === "admin") return "admin";
-  if (pathname === "/overlay" || mode === "software") return "software";
-  if (pathname === "/dashboard" || mode === "dashboard") return "dashboard";
-  if (pathname === "/login" || mode === "login") return "login";
-  if (isDesktopApp()) return "software";
-  return "landing";
+    if (pathname === "/admin" || mode === "admin") return "admin";
+    if (pathname === "/overlay" || mode === "software") return "software";
+    if (pathname === "/dashboard" || mode === "dashboard") return "dashboard";
+    if (pathname === "/login" || mode === "login") return "login";
+    if (isDesktopApp()) return "software";
+    return "landing";
+  } catch {
+    return isDesktopApp() ? "software" : "landing";
+  }
 }
 
 export default function App() {
@@ -212,16 +222,18 @@ export default function App() {
 
   if (view === "software") {
     return (
-      <SoftwareOverlay
-        tokenState={tokenState}
-        profile={profile}
-        onTokenChange={setTokenState}
-        onProfileChange={setProfile}
-        onGoDashboard={() => {
-          setDashboardTab("overview");
-          navigateClean("dashboard", "/");
-        }}
-      />
+      <ErrorBoundary fallbackTitle="Authenticate Crackpilot — Recovery">
+        <SoftwareOverlay
+          tokenState={tokenState}
+          profile={profile}
+          onTokenChange={setTokenState}
+          onProfileChange={setProfile}
+          onGoDashboard={() => {
+            setDashboardTab("overview");
+            navigateClean("dashboard", "/");
+          }}
+        />
+      </ErrorBoundary>
     );
   }
 

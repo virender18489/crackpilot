@@ -1,6 +1,10 @@
 {
   "rewrites": [
     {
+      "source": "/.+/assets/(.*)",
+      "destination": "/assets/$1"
+    },
+    {
       "source": "/((?!api/|assets/|favicon\\.ico|.*\\.[a-zA-Z0-9]+$).*)",
       "destination": "/index.html"
     }

@@ -18,7 +18,7 @@ function normalizeProfileRecord(
   raw: TargetProfile | null | undefined,
   fallback: TargetProfile
 ): TargetProfile {
-  if (!raw) return fallback;
+  if (!raw || typeof raw !== "object") return fallback;
   return {
     ...fallback,
     ...raw,
