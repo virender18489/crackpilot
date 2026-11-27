@@ -2,7 +2,6 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Camera,
   Check,
-  CheckCircle2,
   Code2,
   Copy,
   ExternalLink,
@@ -130,7 +129,6 @@ export function SoftwareOverlay({
   // Token auth gate state
   const [tokenInput, setTokenInput] = useState("");
   const [verifyingToken, setVerifyingToken] = useState(false);
-  const [startingSession, setStartingSession] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
 
   // Settings & font drawers
@@ -403,9 +401,9 @@ export function SoftwareOverlay({
       : DEFAULT_PRODUCTION_API_URL);
 
   const isAuthenticated = Boolean(tokenState?.authenticated);
-  const isSessionLive = Boolean(tokenState?.authenticated && tokenState?.sessionActive);
+  const isSessionLive = isAuthenticated;
 
-  // Verify token submitted by user
+  // Verify token submitted by user and jump directly into the main workspace (timer PAUSED, audio Standby)
   const handleVerifyToken = async (e: React.FormEvent) => {
     e.preventDefault();
     setAuthError(null);
@@ -417,8 +415,29 @@ export function SoftwareOverlay({
     setVerifyingToken(true);
     try {
       const data = await verifySessionToken(tokenInput.trim());
-      onTokenChange(data.token);
-      if (data.profile) onProfileChange(data.profile);
+
+      // Always land directly on the main workspace with timer PAUSED & audio in Standby (Monitor: OFF)
+      if (countdownTimerRef.current !== null) {
+        window.clearInterval(countdownTimerRef.current);
+        countdownTimerRef.current = null;
+      }
+      isEngineRunningRef.current = false;
+      setIsEngineRunning(false);
+      setMonitorAudio(false);
+      setIsListening(false);
+      setIsConnected(true);
+
+      onTokenChange({
+        ...data.token,
+        authenticated: true,
+        sessionActive: true,
+      });
+      if (data.profile) {
+        onProfileChange(data.profile);
+      }
+
+      // Sync session-ready status silently in the background without blocking workspace entry
+      void startLiveSession().catch(() => {});
     } catch (err) {
       console.error("[Crackpilot Overlay] Token authentication failed:", err);
       setAuthError(
@@ -426,31 +445,6 @@ export function SoftwareOverlay({
       );
     } finally {
       setVerifyingToken(false);
-    }
-  };
-
-  const handleStartSession = async () => {
-    setAuthError(null);
-    setStartingSession(true);
-    try {
-      const data = await startLiveSession();
-      // Always land on the live HUD in PAUSED standby — timer MUST stay frozen until user clicks ▶ Start
-      if (countdownTimerRef.current !== null) {
-        window.clearInterval(countdownTimerRef.current);
-        countdownTimerRef.current = null;
-      }
-      isEngineRunningRef.current = false;
-      setIsEngineRunning(false);
-      onTokenChange(data.token);
-      if (data.profile) onProfileChange(data.profile);
-      setIsConnected(true);
-    } catch (err) {
-      console.error("[Crackpilot Overlay] Start session failed:", err);
-      setAuthError(
-        err instanceof Error ? err.message : "Failed to start session."
-      );
-    } finally {
-      setStartingSession(false);
     }
   };
 
@@ -3255,94 +3249,8 @@ export function SoftwareOverlay({
               </div>
             </form>
           </div>
-        ) : !isSessionLive ? (
-          /* GATE 2: Authenticated — Ready for Start Session (or auto-triggered from Dashboard!) */
-          <div className="flex-1 flex items-center justify-center p-6">
-            <div className="w-full max-w-lg rounded-xl border border-slate-700/70 bg-[#0d1424]/95 p-6 space-y-5 shadow-2xl">
-              <div className="flex items-start gap-3">
-                <CheckCircle2 className="h-6 w-6 text-emerald-400 shrink-0 mt-0.5" />
-                <div>
-                  <h2 className="text-base font-semibold text-white">
-                    Token Authenticated — Ready to Start Session
-                  </h2>
-                  <p className="mt-1 text-xs text-slate-400">
-                    Click <strong className="text-white">Start Session</strong>{" "}
-                    below (or click Start Session inside your Dashboard) to
-                    activate live Crackpilot answers.
-                  </p>
-                </div>
-              </div>
-
-              {/* Loaded Target Profile summary */}
-              <div className="rounded-lg border border-slate-800 bg-[#090e1a] p-4 space-y-1.5 text-xs text-slate-300">
-                <p className="text-[11px] uppercase tracking-wider text-slate-500">
-                  Synced Target Profile
-                </p>
-                <p>
-                  <span className="text-slate-500">Role:</span>{" "}
-                  <strong className="text-white">{profile.role}</strong> (
-                  {profile.experience})
-                </p>
-                <p>
-                  <span className="text-slate-500">Language &amp; Style:</span>{" "}
-                  {profile.answerLanguage} · {profile.answerStyle}
-                </p>
-                <p>
-                  <span className="text-slate-500">Resume:</span>{" "}
-                  {profile.resumeText ? (
-                    <span className="text-emerald-400">
-                      Attached ({profile.resumeFileName || "Custom Resume"})
-                    </span>
-                  ) : (
-                    <span className="text-amber-300">
-                      Optional — upload in Dashboard → Target Profile
-                    </span>
-                  )}
-                </p>
-                <p>
-                  <span className="text-slate-500">Job Description:</span>{" "}
-                  {profile.jdText ? (
-                    <span className="text-emerald-400">
-                      Attached ({profile.jdFileName || "Custom JD"})
-                    </span>
-                  ) : (
-                    <span className="text-amber-300">
-                      Optional — upload in Dashboard → Target Profile
-                    </span>
-                  )}
-                </p>
-              </div>
-
-              {authError && (
-                <p className="rounded-lg border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-xs text-rose-300">
-                  {authError}
-                </p>
-              )}
-
-              <div className="flex flex-wrap items-center gap-3">
-                <button
-                  type="button"
-                  onClick={() => void handleStartSession()}
-                  disabled={startingSession}
-                  className="flex-1 inline-flex items-center justify-center gap-2 rounded-lg bg-emerald-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-emerald-500 transition-colors cursor-pointer disabled:opacity-60"
-                >
-                  <Play className="h-4 w-4" />
-                  <span>
-                    {startingSession ? "Starting..." : "Start Session"}
-                  </span>
-                </button>
-                <button
-                  type="button"
-                  onClick={onGoDashboard}
-                  className="rounded-lg border border-slate-700 bg-slate-800 px-3.5 py-2.5 text-xs font-medium text-slate-200 hover:bg-slate-700 cursor-pointer"
-                >
-                  Edit Profile
-                </button>
-              </div>
-            </div>
-          </div>
         ) : (
-          /* ACTIVE LIVE HUD OVERLAY */
+          /* ACTIVE LIVE HUD OVERLAY — Opens directly after token auth (Timer PAUSED, Monitor OFF until Start) */
           <>
             {/* Scrollable Q&A Stream Feed */}
             <div

@@ -262,7 +262,7 @@ export async function hydrateWorkspaceState(defaultProfile: TargetProfile): Prom
   token: SessionTokenState | null;
   profile: TargetProfile;
 }> {
-  const desktop = isDesktopApp();
+  const savedLocalToken = readStorage<SessionTokenState>(STORAGE_KEYS.token);
   const res = await tryApiJson<{
     user?: UserAccount | null;
     token?: SessionTokenState | null;
@@ -271,20 +271,33 @@ export async function hydrateWorkspaceState(defaultProfile: TargetProfile): Prom
 
   if (res.reachable && res.ok) {
     const user = res.data.user ?? readStorage<UserAccount>(STORAGE_KEYS.user);
-    // In Desktop .exe, always start at Gate 1 (Authenticate Crackpilot) on fresh launch
-    const token = desktop
-      ? null
-      : res.data.token ?? readStorage<SessionTokenState>(STORAGE_KEYS.token);
+    const serverToken = res.data.token;
+    const rawToken =
+      serverToken?.authenticated
+        ? serverToken
+        : savedLocalToken?.authenticated
+          ? savedLocalToken
+          : serverToken ?? savedLocalToken;
+    const token = rawToken?.authenticated
+      ? { ...rawToken, sessionActive: true }
+      : rawToken ?? null;
     const profile = normalizeProfileRecord(
       res.data.profile ?? readStorage<TargetProfile>(STORAGE_KEYS.profile),
       defaultProfile
     );
+    if (res.data.profile) {
+      writeStorage(STORAGE_KEYS.profile, profile);
+    }
     return { user, token, profile };
   }
 
+  const fallbackToken = savedLocalToken?.authenticated
+    ? { ...savedLocalToken, sessionActive: true }
+    : savedLocalToken;
+
   return {
     user: readStorage<UserAccount>(STORAGE_KEYS.user),
-    token: desktop ? null : readStorage<SessionTokenState>(STORAGE_KEYS.token),
+    token: fallbackToken ?? null,
     profile: normalizeProfileRecord(
       readStorage<TargetProfile>(STORAGE_KEYS.profile),
       defaultProfile
@@ -395,14 +408,19 @@ export async function verifySessionToken(submittedToken: string): Promise<{
       console.error("[Crackpilot Token] /api/token/verify rejected:", res.status, msg);
       throw new Error(msg);
     }
-    writeStorage(STORAGE_KEYS.token, res.data.token);
+    const readyToken: SessionTokenState = {
+      ...res.data.token,
+      authenticated: true,
+      sessionActive: true,
+    };
+    writeStorage(STORAGE_KEYS.token, readyToken);
     if (res.data.profile) writeStorage(STORAGE_KEYS.profile, res.data.profile);
     broadcastLocalSync({
       type: "token_authenticated",
-      token: res.data.token,
+      token: readyToken,
       profile: res.data.profile,
     });
-    return { token: res.data.token, profile: res.data.profile };
+    return { token: readyToken, profile: res.data.profile };
   }
 
   const stored = readStorage<SessionTokenState>(STORAGE_KEYS.token);
@@ -435,7 +453,7 @@ export async function verifySessionToken(submittedToken: string): Promise<{
     token: submitted,
     createdAt: new Date().toISOString(),
     authenticated: true,
-    sessionActive: false,
+    sessionActive: true,
   };
   const savedProfile = readStorage<TargetProfile>(STORAGE_KEYS.profile) ?? undefined;
   writeStorage(STORAGE_KEYS.token, verified);
