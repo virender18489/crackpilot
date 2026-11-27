@@ -8,10 +8,17 @@ import {
 } from "../server/dsaEngine.ts";
 import { streamGroqChatCompletion } from "../server/groqHelper.ts";
 import { sanitizePhoneticQuestion } from "../server/phoneticSanitizer.ts";
+import {
+  normalizeImagePayload,
+  streamScreenVisionSSE,
+} from "../server/visionHelper.ts";
 import type { ActiveProblemContext } from "../src/types.ts";
 
 interface AnswerBody {
   question?: string;
+  image?: string;
+  imageBase64?: string;
+  mimeType?: string;
   role?: string;
   experience?: string;
   skills?: string;
@@ -152,14 +159,15 @@ export default async function handler(
     return;
   }
 
+  const normalizedImage = normalizeImagePayload(body);
   const rawQuestion = typeof body.question === "string" ? body.question.trim() : "";
-  if (!rawQuestion) {
+
+  if (!normalizedImage && !rawQuestion) {
     res.statusCode = 400;
     res.setHeader("Content-Type", "application/json");
-    res.end(JSON.stringify({ error: "Question is required." }));
+    res.end(JSON.stringify({ error: "Question or screenshot image is required." }));
     return;
   }
-  const cleanQuestion = sanitizePhoneticQuestion(rawQuestion);
 
   res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
   res.setHeader("Cache-Control", "no-cache, no-transform");
@@ -173,6 +181,20 @@ export default async function handler(
   const sendEvent = (payload: Record<string, unknown>) => {
     res.write(`data: ${JSON.stringify(payload)}\n\n`);
   };
+
+  // MULTIMODAL VISION ROUTE: Never send screenshot payloads to a text-only LLM
+  if (normalizedImage) {
+    await streamScreenVisionSSE({
+      image: normalizedImage,
+      question: rawQuestion,
+      answerLanguage: body.answerLanguage || "English",
+      sendEvent,
+    });
+    res.end();
+    return;
+  }
+
+  const cleanQuestion = sanitizePhoneticQuestion(rawQuestion);
 
   const role = body.role || "Frontend Development (React, Next.js, Vue, Web)";
   const experience = body.experience || "Junior (1-3 Years)";
@@ -237,7 +259,7 @@ export default async function handler(
           { role: "user", content: userPrompt },
         ],
         temperature: 0.2,
-        maxTokens: isCodeReq || useDsaFollowUp ? 1400 : 180,
+        maxTokens: isCodeReq || useDsaFollowUp ? 1400 : 150,
         onMeta: (model) => {
           sendEvent({ meta: { engine: "groq", model } });
         },

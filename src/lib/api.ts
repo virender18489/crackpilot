@@ -16,6 +16,14 @@ export interface CrackpilotDesktopBridge {
   setBehindHoverInteractive?: (hovering: boolean) => Promise<boolean>;
   openExternal: (url: string) => Promise<void>;
   reloadLiveApp?: () => Promise<{ ok: boolean } | void>;
+  captureScreen?: () => Promise<{
+    ok: boolean;
+    base64?: string;
+    mimeType?: string;
+    dataUrl?: string;
+    byteLength?: number;
+    error?: string;
+  }>;
   onBehindModeChanged?: (callback: (enabled: boolean) => void) => () => void;
   onWindowMinimized?: (callback: () => void) => () => void;
   onWindowClosing?: (callback: () => void) => () => void;

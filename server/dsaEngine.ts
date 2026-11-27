@@ -237,8 +237,8 @@ function getGeminiClient(): GoogleGenAI {
 
 const GEMINI_FALLBACK_MODELS = [
   "gemini-2.5-flash",
-  "gemini-2.5-flash-lite",
-  "gemini-2.0-flash",
+  "gemini-4-hydrogen",
+  "gemini-3.1-flash-lite",
 ] as const;
 
 function isFallbackEligibleError(err: unknown): boolean {
@@ -258,15 +258,31 @@ function shouldSkipModelImmediately(err: unknown): boolean {
   );
 }
 
-function adaptConfigForModel<T extends { thinkingConfig?: unknown } | undefined>(
-  model: string,
-  config: T
-): T {
+function adaptConfigForModel<
+  T extends
+    | {
+        thinkingConfig?: unknown;
+        temperature?: number;
+        topP?: number;
+        topK?: number;
+      }
+    | undefined,
+>(model: string, config: T): T {
   if (!config) return config;
   if (model.startsWith("gemini-2.5-flash")) {
     return { ...config, thinkingConfig: { thinkingBudget: 0 } };
   }
-  return { ...config, thinkingConfig: undefined };
+  if (model.startsWith("gemini-4-")) {
+    const { temperature: _t, topP: _p, topK: _k, ...rest } = config;
+    return {
+      ...rest,
+      thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+    } as T;
+  }
+  return {
+    ...config,
+    thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+  };
 }
 
 export async function generateContentResilient(
@@ -287,7 +303,7 @@ export async function generateContentResilient(
         lastErr = err;
         if (!isFallbackEligibleError(err)) throw err;
         if (shouldSkipModelImmediately(err)) break;
-        await new Promise((r) => setTimeout(r, 800 * (attempt + 1)));
+        await new Promise((r) => setTimeout(r, 400 * (attempt + 1)));
       }
     }
   }
@@ -305,21 +321,17 @@ export async function generateContentStreamResilient(
   const ai = getGeminiClient();
   let lastErr: unknown;
   for (const model of GEMINI_FALLBACK_MODELS) {
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        const config = adaptConfigForModel(model, params.config);
-        const stream = await ai.models.generateContentStream({
-          ...params,
-          model,
-          config,
-        });
-        return { model, stream };
-      } catch (err) {
-        lastErr = err;
-        if (!isFallbackEligibleError(err)) throw err;
-        if (shouldSkipModelImmediately(err)) break;
-        await new Promise((r) => setTimeout(r, 800 * (attempt + 1)));
-      }
+    try {
+      const config = adaptConfigForModel(model, params.config);
+      const stream = await ai.models.generateContentStream({
+        ...params,
+        model,
+        config,
+      });
+      return { model, stream };
+    } catch (err) {
+      lastErr = err;
+      if (!isFallbackEligibleError(err)) throw err;
     }
   }
   throw lastErr instanceof Error

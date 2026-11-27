@@ -1009,7 +1009,7 @@ async function startServer() {
       // Extract clean text from PDF / image resumes or JDs via Gemini multimodal
       const ai = getGeminiClient();
       const response = await ai.models.generateContent({
-        model: "gemini-4-hydrogen",
+        model: "gemini-2.5-flash",
         contents: {
           parts: [
             {
@@ -1027,7 +1027,7 @@ async function startServer() {
           ],
         },
         config: {
-          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+          thinkingConfig: { thinkingBudget: 0 },
         },
       });
 
@@ -1627,7 +1627,7 @@ async function startServer() {
 
     if (effectiveDsaMode) {
       try {
-        sendEvent({ meta: { engine: "gemini", model: "gemini-4-hydrogen (DSA Mode)" } });
+        sendEvent({ meta: { engine: "gemini", model: "gemini-2.5-flash (DSA Mode)" } });
         const dsaData = await analyzeDsaProblem({
           images: [{ data: imageBase64, mimeType }],
           preferredLanguage: preferredLanguage || activeProfile.preferredLanguage,
@@ -1826,7 +1826,7 @@ async function startServer() {
 
     if (effectiveDsaMode) {
       try {
-        sendEvent({ meta: { engine: "gemini", model: "gemini-4-hydrogen (DSA Video)" } });
+        sendEvent({ meta: { engine: "gemini", model: "gemini-2.5-flash (DSA Video)" } });
         const dsaData = await analyzeDsaProblem({
           images: boundedFrames.map((data) => ({ data, mimeType })),
           preferredLanguage: preferredLanguage || activeProfile.preferredLanguage,

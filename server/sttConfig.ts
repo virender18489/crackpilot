@@ -1,3 +1,5 @@
+import { sanitizePhoneticQuestion } from "./phoneticSanitizer.ts";
+
 export const TECH_KEYTERMS = [
   "JavaScript",
   "React",
@@ -62,8 +64,8 @@ export function buildDeepgramLiveWsUrl(langCode: "en-IN" | "en" = "en-IN"): stri
   params.set("channels", "1");
   params.set("smart_format", "true");
   params.set("interim_results", "true");
-  params.set("endpointing", "900");
-  params.set("utterance_end_ms", "1200");
+  params.set("endpointing", "550");
+  params.set("utterance_end_ms", "850");
   for (const term of TECH_KEYTERMS) {
     params.append("keyterm", term);
   }
@@ -106,10 +108,13 @@ export async function transcribeWithDeepgramEnglish(
           }>;
         };
       };
-      const text = (
+      const rawText = (
         dgJson.results?.channels?.[0]?.alternatives?.[0]?.transcript || ""
       ).trim();
-      return { text, language: attempt.lang };
+      return {
+        text: sanitizePhoneticQuestion(rawText),
+        language: attempt.lang,
+      };
     }
 
     const errBody = await dgRes.text().catch(() => "");
@@ -166,5 +171,5 @@ export async function transcribeWithGroqWhisperEnglish(
   }
 
   const groqJson = (await groqRes.json()) as { text?: string };
-  return (groqJson.text || "").trim();
+  return sanitizePhoneticQuestion(groqJson.text || "");
 }

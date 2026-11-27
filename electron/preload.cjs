@@ -36,6 +36,7 @@ try {
       invokeSafe("crackpilot:set-behind-hover", Boolean(hovering)),
     openExternal: (url) => invokeSafe("crackpilot:open-external", url),
     reloadLiveApp: () => invokeSafe("crackpilot:reload-live"),
+    captureScreen: () => invokeSafe("capture-screen"),
     onBehindModeChanged: (callback) => {
       if (typeof callback !== "function") return () => {};
       const handler = (_event, enabled) => callback(Boolean(enabled));

@@ -400,6 +400,87 @@ function registerIpcHandlers() {
     logError("Blocked invalid external URL:", url);
   });
 
+  // Reliable background Screen Capture (Alt+S):
+  // Briefly hides overlay via opacity 0 for ~120ms so Notepad / VS Code / Browser behind CrackPilot is captured cleanly.
+  ipcMain.handle("capture-screen", async () => {
+    const win = mainWindow && !mainWindow.isDestroyed() ? mainWindow : null;
+    let prevOpacity = 1;
+    let hidOverlay = false;
+
+    try {
+      if (win) {
+        try {
+          prevOpacity = typeof win.getOpacity === "function" ? win.getOpacity() : 1;
+          win.setOpacity(0);
+          hidOverlay = true;
+          // Wait ~120ms so OS compositor repaints the background window cleanly
+          await new Promise((resolve) => setTimeout(resolve, 120));
+        } catch (opErr) {
+          logError("capture-screen setOpacity(0) warning:", opErr);
+        }
+      }
+
+      const sources = await desktopCapturer.getSources({
+        types: ["screen"],
+        thumbnailSize: { width: 1280, height: 720 },
+      });
+
+      const primaryScreen =
+        sources.find((s) => s.id.startsWith("screen:")) || sources[0];
+
+      if (!primaryScreen || !primaryScreen.thumbnail || primaryScreen.thumbnail.isEmpty()) {
+        return {
+          ok: false,
+          error: "Screen capture returned an empty frame. Check OS screen capture permissions.",
+        };
+      }
+
+      let jpegBuffer = primaryScreen.thumbnail.toJPEG(75);
+      // Guarantee lightweight payload under 250KB for sub-second Vision upload
+      if (jpegBuffer.length > 250 * 1024) {
+        jpegBuffer = primaryScreen.thumbnail.toJPEG(60);
+      }
+      if (jpegBuffer.length > 250 * 1024) {
+        const resized = primaryScreen.thumbnail.resize({ width: 1024 });
+        jpegBuffer = resized.toJPEG(60);
+      }
+
+      const base64 = jpegBuffer.toString("base64");
+      if (!base64 || base64.length < 64) {
+        return {
+          ok: false,
+          error: "Captured JPEG frame was empty.",
+        };
+      }
+
+      logInfo(
+        `IPC capture-screen succeeded (${Math.round(jpegBuffer.length / 1024)}KB JPEG).`
+      );
+      return {
+        ok: true,
+        base64,
+        mimeType: "image/jpeg",
+        dataUrl: `data:image/jpeg;base64,${base64}`,
+        byteLength: jpegBuffer.length,
+      };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      logError("IPC capture-screen failed:", message);
+      return {
+        ok: false,
+        error: `Screen capture failed: ${message}`,
+      };
+    } finally {
+      if (hidOverlay && win && !win.isDestroyed()) {
+        try {
+          win.setOpacity(prevOpacity > 0.05 ? prevOpacity : 1);
+        } catch (restoreErr) {
+          logError("capture-screen restore opacity warning:", restoreErr);
+        }
+      }
+    }
+  });
+
   ipcMain.handle("crackpilot:reload-live", async () => {
     if (!mainWindow || mainWindow.isDestroyed()) return { ok: false };
     try {

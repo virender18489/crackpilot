@@ -162,7 +162,6 @@ export function SoftwareOverlay({
   const [isReconnecting, setIsReconnecting] = useState(false);
   const [glitchCountdown, setGlitchCountdown] = useState<number>(0);
   const [videoScanCountdown, setVideoScanCountdown] = useState<number>(0);
-  const [videoFramesCount, setVideoFramesCount] = useState<number>(0);
 
   const [isListening, setIsListening] = useState(false);
   const [listenMode, setListenMode] = useState<"mic" | "tab" | null>(null);
@@ -174,9 +173,6 @@ export function SoftwareOverlay({
   );
   const [hasSharedScreen, setHasSharedScreen] = useState(false);
   const [monitorAudio, setMonitorAudio] = useState(false);
-  const [isTranscribing, setIsTranscribing] = useState(false);
-  const [interimText, setInterimText] = useState("");
-  const [statusNotice, setStatusNotice] = useState<string | null>(null);
 
   // Session counters & live Admin quota state (1s ticks isolated inside SessionTimerDisplay)
   const [timerBaseSeconds, setTimerBaseSeconds] = useState(240 * 60);
@@ -240,7 +236,6 @@ export function SoftwareOverlay({
   >(null);
   const chunkTimerRef = useRef<number | null>(null);
   const pauseTriggerTimerRef = useRef<number | null>(null);
-  const liveSpeechTickRef = useRef<number | null>(null);
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
@@ -253,9 +248,6 @@ export function SoftwareOverlay({
   const videoFrameIntervalRef = useRef<number | null>(null);
   const capturedVideoFramesRef = useRef<string[]>([]);
 
-  const [liveTranscript, setLiveTranscript] = useState("");
-  const [liveSpeechSeconds, setLiveSpeechSeconds] = useState(0);
-  const [isSpeechDetected, setIsSpeechDetected] = useState(false);
   const [showJumpToTop, setShowJumpToTop] = useState(false);
   const [hasUnseenLatest, setHasUnseenLatest] = useState(false);
   const isAtTopRef = useRef<boolean>(true);
@@ -322,9 +314,6 @@ export function SoftwareOverlay({
       setCapturesUsed(quota.capturesUsed);
       setCaptureLimit(quota.captureLimit);
       setQuotaBlockedReason(quota.blockedReason);
-      if (quota.blockedReason) {
-        setStatusNotice(quota.blockedReason);
-      }
       const curTok = tokenStateRef.current;
       if (
         curTok &&
@@ -497,10 +486,7 @@ export function SoftwareOverlay({
         .catch((err) => {
           console.error("[Crackpilot Overlay] Async minimizeWindow IPC failed, trying sync fallback:", err);
           if (bridge.minimizeWindowSync) {
-            const ok = bridge.minimizeWindowSync();
-            if (!ok) {
-              setStatusNotice("Could not minimize window — timer is paused.");
-            }
+            bridge.minimizeWindowSync();
           }
         });
       return;
@@ -562,9 +548,6 @@ export function SoftwareOverlay({
     ).documentPictureInPicture;
 
     if (!docPip) {
-      setStatusNotice(
-        "Use Chrome/Edge desktop for browser Always-On-Top PiP, or install Crackpilot Desktop Kit for OS-wide always-on-top."
-      );
       return;
     }
 
@@ -585,7 +568,7 @@ export function SoftwareOverlay({
       iframe.allow = "microphone; display-capture; clipboard-write";
       pipWin.document.body.appendChild(iframe);
     } catch {
-      setStatusNotice("Could not open floating always-on-top window.");
+      // Ignore PiP cancellation
     }
   };
 
@@ -1000,21 +983,15 @@ export function SoftwareOverlay({
       const cleaned = questionText.trim();
       if (!cleaned) return;
       if (quotaBlockedReasonRef.current) {
-        setStatusNotice(quotaBlockedReasonRef.current);
         return;
       }
       if (!allowWhenPaused && !isEngineRunningRef.current) {
-        setStatusNotice(
-          "Session is stopped — click Start first to start your timer and live audio listening."
-        );
         return;
       }
       if (!isConnectedRef.current) {
-        setStatusNotice("Session is Disconnected. Press Reconnect (Alt+R) first.");
         return;
       }
       if (glitchActiveRef.current) {
-        setStatusNotice("Glitch pause active — internet temporarily off.");
         return;
       }
 
@@ -1170,9 +1147,6 @@ export function SoftwareOverlay({
         if (sseRef.current === source) {
           sseRef.current = null;
         }
-        if (isConnectedRef.current && !glitchActiveRef.current) {
-          setStatusNotice("Live backend stream paused — press Reconnect (Alt+R).");
-        }
       };
       sseRef.current = source;
       return true;
@@ -1194,20 +1168,13 @@ export function SoftwareOverlay({
   }, [onProfileChange]);
 
   useEffect(() => {
-    const onOffline = () => {
-      setStatusNotice("Internet disconnected — press Reconnect (Alt+R) when back.");
-    };
     const onOnline = () => {
       if (isEngineRunningRef.current && isConnectedRef.current && !glitchActiveRef.current) {
         void connectEventStream();
-        setStatusNotice("Internet restored — live stream reconnected.");
-        setTimeout(() => setStatusNotice(null), 2000);
       }
     };
-    window.addEventListener("offline", onOffline);
     window.addEventListener("online", onOnline);
     return () => {
-      window.removeEventListener("offline", onOffline);
       window.removeEventListener("online", onOnline);
     };
   }, [connectEventStream]);
@@ -1217,12 +1184,8 @@ export function SoftwareOverlay({
     setIsListening(false);
     setListenMode(null);
     setMonitorAudio(false);
-    setInterimText("");
     interimTextRef.current = "";
-    setLiveTranscript("");
     liveTranscriptRef.current = "";
-    setLiveSpeechSeconds(0);
-    setIsSpeechDetected(false);
     analyserRef.current = null;
 
     activeQuestionEpochRef.current += 1;
@@ -1239,10 +1202,6 @@ export function SoftwareOverlay({
     if (pauseTriggerTimerRef.current !== null) {
       window.clearTimeout(pauseTriggerTimerRef.current);
       pauseTriggerTimerRef.current = null;
-    }
-    if (liveSpeechTickRef.current !== null) {
-      window.clearInterval(liveSpeechTickRef.current);
-      liveSpeechTickRef.current = null;
     }
     if (recognitionRef.current) {
       try {
@@ -1297,7 +1256,6 @@ export function SoftwareOverlay({
       videoFrameIntervalRef.current = null;
     }
     setVideoScanCountdown(0);
-    setVideoFramesCount(0);
 
     if (screenStreamRef.current) {
       screenStreamRef.current.getTracks().forEach((t) => t.stop());
@@ -1351,7 +1309,6 @@ export function SoftwareOverlay({
 
     const merged = accWords.join(" ").replace(/\s+/g, " ").trim();
     liveTranscriptRef.current = merged;
-    setLiveTranscript(merged);
     return merged;
   }, []);
 
@@ -1380,10 +1337,6 @@ export function SoftwareOverlay({
     interimTextRef.current = "";
     speechSessionStartedAtRef.current = 0;
     speechActiveRef.current = false;
-    setLiveTranscript("");
-    setInterimText("");
-    setLiveSpeechSeconds(0);
-    setIsSpeechDetected(false);
 
     if (combined.length > 2) {
       // Zero artificial delay: fire streaming SSE answer immediately
@@ -1419,9 +1372,7 @@ export function SoftwareOverlay({
       }
 
       if (!hasConfiguredBackend()) {
-        setStatusNotice(
-          "Configure a Crackpilot Server URL in ••• Settings to transcribe captured audio."
-        );
+        setLiveApiError("Configure Server URL in Settings");
         return;
       }
 
@@ -1430,7 +1381,6 @@ export function SoftwareOverlay({
       }
 
       inFlightChunksRef.current += 1;
-      setIsTranscribing(true);
 
       const curProfile = profileRef.current;
       const qs = new URLSearchParams({
@@ -1440,7 +1390,7 @@ export function SoftwareOverlay({
       const transcribeUrl = `${apiUrl("/api/transcribe")}?${qs}`;
 
       try {
-        // Send complete self-contained binary .wav Blob (~94KB per 3s micro-chunk, well below Vercel 4.5MB limit)
+        // Send complete self-contained binary .wav Blob (~94KB per 3.5s micro-chunk, well below Vercel 4.5MB limit)
         const resp = await fetch(transcribeUrl, {
           method: "POST",
           headers: {
@@ -1489,12 +1439,8 @@ export function SoftwareOverlay({
         const errMsg =
           err instanceof Error ? err.message : "Audio transcription error.";
         setLiveApiError(errMsg);
-        setStatusNotice(errMsg);
       } finally {
         inFlightChunksRef.current = Math.max(0, inFlightChunksRef.current - 1);
-        if (inFlightChunksRef.current === 0) {
-          setIsTranscribing(false);
-        }
         if (opts.epoch === activeQuestionEpochRef.current && pendingFinalizeRef.current) {
           commitPendingAnswerIfReady();
         }
@@ -1503,7 +1449,7 @@ export function SoftwareOverlay({
     [commitPendingAnswerIfReady, rebuildLiveTranscript]
   );
 
-  // Instant manual trigger ("Answer Now") — works anytime during a short or 4-10 minute explanation
+  // Instant flush trigger (Alt+X) — works anytime during a short or 4-10 minute explanation
   const handleAnswerNow = useCallback(
     (fastMode = false) => {
       if (pauseTriggerTimerRef.current !== null) {
@@ -1598,7 +1544,6 @@ export function SoftwareOverlay({
 
           if (isFinalFlush) {
             speechActiveRef.current = false;
-            setIsSpeechDetected(false);
           }
 
           // Strictly non-overlapping slice: splice out all buffered frames so nothing is re-sent
@@ -1641,22 +1586,6 @@ export function SoftwareOverlay({
         };
 
         flushPcmUtteranceRef.current = flushSpeechToWav;
-
-        if (liveSpeechTickRef.current !== null) {
-          window.clearInterval(liveSpeechTickRef.current);
-        }
-        liveSpeechTickRef.current = window.setInterval(() => {
-          if (speechSessionStartedAtRef.current > 0) {
-            setLiveSpeechSeconds(
-              Math.max(
-                1,
-                Math.floor((Date.now() - speechSessionStartedAtRef.current) / 1000)
-              )
-            );
-          } else {
-            setLiveSpeechSeconds(0);
-          }
-        }, 500);
 
         processor.onaudioprocess = (ev) => {
           if (!isListeningRef.current) return;
@@ -1710,7 +1639,6 @@ export function SoftwareOverlay({
             }
             if (!speechActiveRef.current) {
               speechActiveRef.current = true;
-              setIsSpeechDetected(true);
               chunkStartedAtRef.current = now;
               if (speechSessionStartedAtRef.current === 0) {
                 speechSessionStartedAtRef.current = now;
@@ -1762,17 +1690,9 @@ export function SoftwareOverlay({
   // Capture Microphone audio (captures nearby speaker / interviewer laptop voice & works out of the box in Electron + Browser)
   const startMicrophoneAudio = useCallback(
     async (deviceId?: string) => {
-      if (!isEngineRunningRef.current) {
-        setStatusNotice(
-          "Click Start first to begin your session and capture audio."
-        );
+      if (!isEngineRunningRef.current || !isConnectedRef.current) {
         return;
       }
-      if (!isConnectedRef.current) {
-        setStatusNotice("Session is Disconnected. Press Reconnect (Alt+R) first.");
-        return;
-      }
-      setStatusNotice(null);
       stopAudioListening();
       recognitionWorkingRef.current = false;
 
@@ -1853,7 +1773,6 @@ export function SoftwareOverlay({
               }
               const trimmedInterim = interim.trim();
               interimTextRef.current = trimmedInterim;
-              setInterimText(trimmedInterim);
 
               if (speechSessionStartedAtRef.current === 0 && (trimmedInterim || finalChunk.trim())) {
                 speechSessionStartedAtRef.current = Date.now();
@@ -1865,7 +1784,6 @@ export function SoftwareOverlay({
                 orderedChunkTextsRef.current.set(seq, cleanedFinal);
                 rebuildLiveTranscript();
                 interimTextRef.current = "";
-                setInterimText("");
               }
 
               // Reset 750ms silence trigger on every live word for fast response after speech ends
@@ -1914,9 +1832,6 @@ export function SoftwareOverlay({
         }
 
         setMicDiagError(null);
-        setStatusNotice(
-          "Mic Live — listening for spoken questions. Answers will stream automatically."
-        );
       } catch (err) {
         console.error("[Crackpilot Audio] Microphone capture error:", err);
         const errName = err instanceof Error ? err.name : "";
@@ -1932,11 +1847,6 @@ export function SoftwareOverlay({
         } else {
           setMicDiagError(errMsg || "Mic Capture Error");
         }
-        setStatusNotice(
-          err instanceof Error
-            ? `Microphone access failed (${err.message}). Select another Audio Input or check OS microphone permissions.`
-            : "Could not access microphone. Check OS microphone permissions."
-        );
       }
     },
     [
@@ -1950,17 +1860,9 @@ export function SoftwareOverlay({
 
   // Capture System / Loopback / Meeting Tab Audio (interviewer audio via display media loopback)
   const startTabSystemAudio = useCallback(async () => {
-    if (!isEngineRunningRef.current) {
-      setStatusNotice(
-        "Click Start first to begin your session and capture system audio."
-      );
+    if (!isEngineRunningRef.current || !isConnectedRef.current) {
       return;
     }
-    if (!isConnectedRef.current) {
-      setStatusNotice("Session is Disconnected. Press Reconnect (Alt+R) first.");
-      return;
-    }
-    setStatusNotice(null);
     stopAudioListening();
     recognitionWorkingRef.current = false;
 
@@ -2002,9 +1904,6 @@ export function SoftwareOverlay({
 
       const audioTracks = displayStream.getAudioTracks();
       if (audioTracks.length === 0) {
-        setStatusNotice(
-          'Screen linked, but no system/tab audio was shared. Enable "Share system audio" or switch the Audio Input selector to Microphone.'
-        );
         return;
       }
 
@@ -2016,30 +1915,17 @@ export function SoftwareOverlay({
       setMonitorAudio(true);
       setMicDiagError(null);
       attachAudioMeter(audioOnly, false);
-      setStatusNotice(
-        "Monitor ON — System / Zoom / Meet Call Audio Live. Listening for interviewer questions."
-      );
     } catch (err) {
-      setStatusNotice(
-        err instanceof Error
-          ? `${err.message} — switching to Microphone or retry System Audio.`
-          : "System / Loopback audio capture cancelled."
-      );
+      console.warn("[Crackpilot Audio] System / Loopback audio capture cancelled:", err);
     }
   }, [attachAudioMeter, stopAudioListening, stopScreenStream]);
 
   // Dual Two-Laptop / Mobile Call Capture: mixes System Loopback (Zoom/Meet/Teams on Laptop A)
   // + Physical Microphone (Laptop B / Mobile B external speaker audio) with zero feedback echo.
   const startCallAndMicAudio = useCallback(async () => {
-    if (!isEngineRunningRef.current) {
-      setStatusNotice("Click Start first to begin your session and capture audio.");
+    if (!isEngineRunningRef.current || !isConnectedRef.current) {
       return;
     }
-    if (!isConnectedRef.current) {
-      setStatusNotice("Session is Disconnected. Press Reconnect (Alt+R) first.");
-      return;
-    }
-    setStatusNotice(null);
     stopAudioListening();
     recognitionWorkingRef.current = false;
 
@@ -2105,9 +1991,6 @@ export function SoftwareOverlay({
     }
 
     if (acquiredStreams.length === 0) {
-      setStatusNotice(
-        "Could not capture System Loopback or Microphone audio. Check Windows audio permissions and try again."
-      );
       return;
     }
 
@@ -2144,13 +2027,6 @@ export function SoftwareOverlay({
     setMonitorAudio(true);
 
     attachAudioMeter(finalStream, false);
-    setStatusNotice(
-      hasLoopback && hasMic
-        ? "Monitor ON — Zoom/Meet Loopback + Mic Live. Answers stream in 1–2s."
-        : hasLoopback
-          ? "Monitor ON — System / Zoom / Meet Loopback Audio Live."
-          : "Monitor ON — Microphone Live (capturing external speaker / call voice)."
-    );
   }, [
     attachAudioMeter,
     refreshAudioInputDevices,
@@ -2231,25 +2107,14 @@ export function SoftwareOverlay({
   // Capture (Alt+S) or Mobile Companion Screen Tap
   const handleCaptureScreen = useCallback(
     async (captureSource: "alt_s" | "mobile_companion" = "alt_s") => {
-      if (quotaBlockedReasonRef.current) {
-        setStatusNotice(quotaBlockedReasonRef.current);
+      if (
+        quotaBlockedReasonRef.current ||
+        capturesUsed >= captureLimit ||
+        !isConnectedRef.current ||
+        glitchActiveRef.current
+      ) {
         return;
       }
-      if (capturesUsed >= captureLimit) {
-        setStatusNotice(
-          `Screenshot capture limit exhausted (${capturesUsed}/${captureLimit}). Ask admin to add extra captures, then click Reconnect.`
-        );
-        return;
-      }
-      if (!isConnectedRef.current) {
-        setStatusNotice("Session is Disconnected. Press Reconnect (Alt+R) first.");
-        return;
-      }
-      if (glitchActiveRef.current) {
-        setStatusNotice("Glitch pause active — wait until connection resumes.");
-        return;
-      }
-      setStatusNotice(null);
 
       try {
         const videoEl = await ensureScreenStream();
@@ -2295,9 +2160,7 @@ export function SoftwareOverlay({
           source: captureSource,
         });
       } catch (err) {
-        setStatusNotice(
-          err instanceof Error ? err.message : "Screen capture cancelled."
-        );
+        console.warn("[Crackpilot Overlay] Screen capture cancelled:", err);
       }
     },
     [captureLimit, capturesUsed, ensureScreenStream, maxPrompts, streamAnswerFromEndpoint]
@@ -2305,29 +2168,21 @@ export function SoftwareOverlay({
 
   // Video (Alt+V): 4s / 6s / 8s / 10s multi-frame page question scan
   const handleVideoPageScan = useCallback(async () => {
-    if (!isConnectedRef.current) {
-      setStatusNotice("Session is Disconnected. Press Reconnect (Alt+R) first.");
-      return;
-    }
-    if (glitchActiveRef.current) {
-      setStatusNotice("Glitch pause active — wait until connection resumes.");
+    if (!isConnectedRef.current || glitchActiveRef.current) {
       return;
     }
     if (videoScanTimerRef.current !== null) return;
 
-    setStatusNotice(null);
     const duration = videoDurationRef.current;
 
     try {
       const videoEl = await ensureScreenStream();
       capturedVideoFramesRef.current = [];
       setVideoScanCountdown(duration);
-      setVideoFramesCount(0);
 
       const firstFrame = snapshotVideoFrame(videoEl);
       if (firstFrame) {
         capturedVideoFramesRef.current.push(firstFrame);
-        setVideoFramesCount(1);
       }
 
       const frameGapMs = duration <= 4 ? 1000 : duration <= 6 ? 1100 : 1350;
@@ -2336,7 +2191,6 @@ export function SoftwareOverlay({
         const frame = snapshotVideoFrame(videoEl);
         if (frame) {
           capturedVideoFramesRef.current.push(frame);
-          setVideoFramesCount(capturedVideoFramesRef.current.length);
         }
       }, frameGapMs);
 
@@ -2361,10 +2215,8 @@ export function SoftwareOverlay({
           }
 
           const framesToSend = capturedVideoFramesRef.current.splice(0);
-          setVideoFramesCount(0);
 
           if (framesToSend.length === 0) {
-            setStatusNotice("No frames captured during video scan.");
             return;
           }
 
@@ -2404,20 +2256,13 @@ export function SoftwareOverlay({
       }, 1000);
     } catch (err) {
       setVideoScanCountdown(0);
-      setStatusNotice(
-        err instanceof Error ? err.message : "Video page scan cancelled."
-      );
+      console.warn("[Crackpilot Overlay] Video page scan cancelled:", err);
     }
   }, [captureLimit, ensureScreenStream, maxPrompts, streamAnswerFromEndpoint]);
 
   // Fast (Alt+X)
   const handleFastTrigger = useCallback(async () => {
-    if (!isConnectedRef.current) {
-      setStatusNotice("Session is Disconnected. Press Reconnect (Alt+R) first.");
-      return;
-    }
-    if (glitchActiveRef.current) {
-      setStatusNotice("Glitch pause active — internet paused.");
+    if (!isConnectedRef.current || glitchActiveRef.current) {
       return;
     }
 
@@ -2457,7 +2302,6 @@ export function SoftwareOverlay({
     }
     setGlitchCountdown(0);
     setIsReconnecting(true);
-    setStatusNotice("Syncing & reloading latest live Crackpilot build...");
 
     try {
       // Flush any unsynced elapsed seconds before reloading so zero time is lost
@@ -2500,9 +2344,6 @@ export function SoftwareOverlay({
     }
 
     setGlitchCountdown(secs);
-    setStatusNotice(
-      `Glitch active: connection paused for ${secs}s — auto-reconnecting afterwards.`
-    );
 
     let left = secs;
     glitchTimerRef.current = window.setInterval(() => {
@@ -2516,15 +2357,13 @@ export function SoftwareOverlay({
         }
         setIsConnected(true);
         void connectEventStream();
-        setStatusNotice("Glitch ended — connection restored automatically.");
-        setTimeout(() => setStatusNotice(null), 2200);
       }
     }, 1000);
   }, [connectEventStream]);
 
   // Cleanly pause/stop active session & freeze timer (used by Stop button, Minimize, Hide, and OS minimize)
   const pauseEngineSession = useCallback(
-    (notice?: string) => {
+    (_notice?: string) => {
       isEngineRunningRef.current = false;
       setIsEngineRunning(false);
       flushElapsedSeconds();
@@ -2569,9 +2408,6 @@ export function SoftwareOverlay({
           return q.isStreaming ? { ...q, isStreaming: false } : q;
         })
       );
-      if (notice) {
-        setStatusNotice(notice);
-      }
     },
     [flushElapsedSeconds, stopAudioListening]
   );
@@ -2581,14 +2417,11 @@ export function SoftwareOverlay({
   // Master Start / Stop Toggle: starts or cleanly pauses timer, audio capture, live stream, shortcuts, and AI processing
   const handleToggleEngineStartStop = useCallback(async () => {
     if (isEngineRunningRef.current) {
-      pauseEngineSession(
-        "Stopped — timer frozen, audio listening stopped, and remaining time synced."
-      );
+      pauseEngineSession();
       return;
     }
 
     if (quotaBlockedReasonRef.current) {
-      setStatusNotice(quotaBlockedReasonRef.current);
       return;
     }
 
@@ -2608,9 +2441,6 @@ export function SoftwareOverlay({
             }
           : q
       )
-    );
-    setStatusNotice(
-      "Started — timer active & listening for audio questions."
     );
 
     try {
@@ -2695,13 +2525,7 @@ export function SoftwareOverlay({
       void bridge
         .toggleBehindMode()
         .then((nextState) => {
-          const enabled = Boolean(nextState);
-          setIsBehindMode(enabled);
-          setStatusNotice(
-            enabled
-              ? "Behind Mode ON — clicks & typing pass through to the app behind Crackpilot. Press Alt+M anytime to return."
-              : "Behind Mode OFF — Crackpilot window is interactive again."
-          );
+          setIsBehindMode(Boolean(nextState));
         })
         .catch((err) => {
           console.error("[Crackpilot Overlay] toggleBehindMode IPC failed:", err);
@@ -2710,15 +2534,7 @@ export function SoftwareOverlay({
     }
 
     // Graceful web preview fallback outside Electron
-    setIsBehindMode((prev) => {
-      const next = !prev;
-      setStatusNotice(
-        next
-          ? "Behind Mode ON (Web Preview) — in the Windows/macOS Desktop app, clicks and typing pass directly to the app behind Crackpilot. Press Alt+M to toggle OFF."
-          : "Behind Mode OFF — Crackpilot window is interactive."
-      );
-      return next;
-    });
+    setIsBehindMode((prev) => !prev);
   }, []);
 
   // Sync Behind (Alt+M) state from Electron globalShortcut IPC events
@@ -2732,13 +2548,7 @@ export function SoftwareOverlay({
         .catch(() => {});
     }
     const unsubBehind = bridge.onBehindModeChanged?.((enabled) => {
-      const next = Boolean(enabled);
-      setIsBehindMode(next);
-      setStatusNotice(
-        next
-          ? "Behind Mode ON — clicks & typing pass through to the app behind Crackpilot. Press Alt+M anytime to return."
-          : "Behind Mode OFF — Crackpilot window is interactive again."
-      );
+      setIsBehindMode(Boolean(enabled));
     });
     return () => {
       unsubBehind?.();
@@ -2812,7 +2622,6 @@ export function SoftwareOverlay({
       if (!isEngineRunningRef.current) {
         if (key === "x" || key === "s" || key === "v" || key === "r" || key === "t") {
           e.preventDefault();
-          setStatusNotice("Software is stopped — click Start to activate shortcuts and AI.");
         }
         return;
       }
@@ -3345,55 +3154,8 @@ export function SoftwareOverlay({
         ) : (
           /* ACTIVE LIVE HUD OVERLAY — Opens directly after token auth (Timer PAUSED, Monitor OFF until Start) */
           <>
-            {/* Isolated Middle Q&A Scroll Container (Zero Layout Shift + Free Scrolling) */}
+            {/* Isolated Middle Q&A Scroll Container (Zero Notification Banners + Zero Intermediate Listening Cards) */}
             <div className="relative flex-1 min-h-0 flex flex-col overflow-hidden">
-              {/* Floating Notification Pill — NEVER shifts or pushes the Q&A feed */}
-              {(glitchCountdown > 0 || videoScanCountdown > 0 || statusNotice) && (
-                <div className="pointer-events-none absolute top-2.5 left-1/2 z-30 -translate-x-1/2 max-w-[92%]">
-                  {glitchCountdown > 0 ? (
-                    <div className="pointer-events-auto inline-flex items-center gap-2.5 rounded-full border border-amber-500/50 bg-amber-950/92 px-3.5 py-1.5 text-xs text-amber-200 shadow-xl backdrop-blur-md">
-                      <WifiOff className="h-3.5 w-3.5 shrink-0 text-amber-400" />
-                      <span className="truncate">
-                        Glitch Active: auto-restoring in{" "}
-                        <strong className="font-mono text-white tabular-nums">
-                          {glitchCountdown}s
-                        </strong>
-                      </span>
-                      <button
-                        type="button"
-                        onClick={() => void handleReconnect()}
-                        className="rounded-full bg-amber-500/25 px-2 py-0.5 text-[11px] font-semibold text-amber-100 hover:bg-amber-500/40 cursor-pointer shrink-0"
-                      >
-                        Restore
-                      </button>
-                    </div>
-                  ) : videoScanCountdown > 0 ? (
-                    <div className="pointer-events-auto inline-flex items-center gap-2 rounded-full border border-sky-500/50 bg-sky-950/92 px-3.5 py-1.5 text-xs text-sky-200 shadow-xl backdrop-blur-md">
-                      <Video className="h-3.5 w-3.5 shrink-0 text-sky-400" />
-                      <span className="truncate">
-                        Video Scan:{" "}
-                        <strong className="font-mono text-white tabular-nums">
-                          {videoScanCountdown}s
-                        </strong>{" "}
-                        ({videoFramesCount} frames)
-                      </span>
-                    </div>
-                  ) : statusNotice ? (
-                    <div className="pointer-events-auto inline-flex items-center gap-2 rounded-full border border-slate-600/70 bg-[#0d1424]/95 px-3.5 py-1.5 text-xs text-slate-200 shadow-xl backdrop-blur-md">
-                      <span className="truncate max-w-[520px]">{statusNotice}</span>
-                      <button
-                        type="button"
-                        onClick={() => setStatusNotice(null)}
-                        aria-label="Dismiss notice"
-                        className="text-slate-400 hover:text-white cursor-pointer shrink-0"
-                      >
-                        <X className="h-3.5 w-3.5" />
-                      </button>
-                    </div>
-                  ) : null}
-                </div>
-              )}
-
               {showJumpToTop && (
                 <button
                   type="button"
@@ -3415,52 +3177,6 @@ export function SoftwareOverlay({
                 style={{ overflowAnchor: "none" }}
                 className="hud-scroll flex-1 min-h-0 overflow-y-auto overscroll-contain px-4 py-3 pb-8 space-y-3"
               >
-                {/* Pinned Real-Time Live Transcribed Q Card — never flickers on raw volume spikes */}
-                {(liveTranscript ||
-                  interimText ||
-                  isTranscribing ||
-                  isSpeechDetected) && (
-                  <div className="rounded-xl border border-sky-400/50 bg-[#0f192d]/95 px-4 py-3 text-xs text-sky-100 flex items-start justify-between gap-3 shadow-lg">
-                    <div className="flex items-start gap-2.5 min-w-0 flex-1">
-                      <span className="mt-0.5 font-mono text-sm font-bold text-sky-400 shrink-0">
-                        Q
-                      </span>
-                      <div className="min-w-0 flex-1">
-                        <div className="flex flex-wrap items-center gap-2 mb-1">
-                          <span className="inline-flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-wider text-sky-300">
-                            <span className="h-1.5 w-1.5 rounded-full bg-[#b4f416]" />
-                            {isTranscribing
-                              ? "Transcribing live chunk..."
-                              : "LIVE LISTENING (3.5s micro-chunks)"}
-                          </span>
-                          {liveSpeechSeconds > 0 && (
-                            <span className="rounded bg-slate-800/90 px-1.5 py-0.5 font-mono text-[10px] text-[#b4f416] tabular-nums">
-                              {Math.floor(liveSpeechSeconds / 60)}:
-                              {String(liveSpeechSeconds % 60).padStart(2, "0")}
-                            </span>
-                          )}
-                        </div>
-                        <p className="max-h-36 overflow-y-auto hud-scroll font-medium text-sky-100 leading-relaxed break-words">
-                          {[liveTranscript, interimText].filter(Boolean).join(" ") ||
-                            (isTranscribing
-                              ? "Transcribing spoken question..."
-                              : "Speech detected — capturing interviewer question...")}
-                        </p>
-                        <p className="mt-1 text-[10px] font-mono text-sky-300/75">
-                          Auto-answers after 0.75s pause, or click Answer Now anytime
-                        </p>
-                      </div>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => handleAnswerNow(false)}
-                      className="shrink-0 rounded-md border border-[#b4f416]/60 bg-[#b4f416]/20 px-3 py-1.5 text-[11px] font-semibold text-[#d9ff66] hover:bg-[#b4f416]/30 transition-colors cursor-pointer"
-                    >
-                      Answer Now
-                    </button>
-                  </div>
-                )}
-
                 {/* Memoized Q&A Cards in Newest-First (Reverse Chronological) Order */}
                 {qaList.map((item) => (
                   <QACardItem
