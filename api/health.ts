@@ -33,7 +33,7 @@ export default function handler(req: IncomingMessage, res: ServerResponse) {
         deepgram,
         openai,
         gemini,
-        sttReady: deepgram || openai || gemini,
+        sttReady: deepgram || groq || openai || gemini,
         llmReady: groq || openai || gemini,
       },
     })

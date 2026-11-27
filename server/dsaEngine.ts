@@ -239,11 +239,22 @@ const GEMINI_FALLBACK_MODELS = [
   "gemini-4-hydrogen",
   "gemini-4-neon",
   "gemini-3.1-flash-lite",
+  "gemini-2.5-flash",
 ] as const;
 
 function isFallbackEligibleError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
-  return /503|429|404|UNAVAILABLE|NOT_FOUND|RESOURCE_EXHAUSTED|high demand|overloaded|temporarily/i.test(
+  if (/API_KEY_INVALID|API key not valid/i.test(msg)) {
+    return false;
+  }
+  return /503|429|404|403|400|UNAVAILABLE|NOT_FOUND|PERMISSION_DENIED|INVALID_ARGUMENT|RESOURCE_EXHAUSTED|high demand|overloaded|temporarily|not supported|not found/i.test(
+    msg
+  );
+}
+
+function shouldSkipModelImmediately(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return /404|403|400|NOT_FOUND|PERMISSION_DENIED|INVALID_ARGUMENT|not supported|not found/i.test(
     msg
   );
 }
@@ -276,8 +287,7 @@ export async function generateContentResilient(
       } catch (err) {
         lastErr = err;
         if (!isFallbackEligibleError(err)) throw err;
-        const msg = err instanceof Error ? err.message : String(err);
-        if (/404|NOT_FOUND/i.test(msg)) break;
+        if (shouldSkipModelImmediately(err)) break;
         await new Promise((r) => setTimeout(r, 800 * (attempt + 1)));
       }
     }
@@ -308,8 +318,7 @@ export async function generateContentStreamResilient(
       } catch (err) {
         lastErr = err;
         if (!isFallbackEligibleError(err)) throw err;
-        const msg = err instanceof Error ? err.message : String(err);
-        if (/404|NOT_FOUND/i.test(msg)) break;
+        if (shouldSkipModelImmediately(err)) break;
         await new Promise((r) => setTimeout(r, 800 * (attempt + 1)));
       }
     }

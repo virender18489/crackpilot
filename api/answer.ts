@@ -7,6 +7,7 @@ import {
   isCodeCreationRequest,
   normalizeProgrammingLanguage,
 } from "../server/dsaEngine.ts";
+import { streamGroqChatCompletion } from "../server/groqHelper.ts";
 import type { ActiveProblemContext } from "../src/types.ts";
 
 interface AnswerBody {
@@ -52,7 +53,7 @@ async function streamOpenAICompatible(params: {
   systemPrompt: string;
   userPrompt: string;
   sendEvent: (payload: Record<string, unknown>) => void;
-}): Promise<void> {
+}): Promise<number> {
   const upstream = await fetch(params.url, {
     method: "POST",
     headers: {
@@ -74,15 +75,15 @@ async function streamOpenAICompatible(params: {
   if (!upstream.ok || !upstream.body) {
     const errText = await upstream.text().catch(() => "");
     throw new Error(
-      `${params.engineLabel} API error (${upstream.status}): ${errText.slice(0, 180) || "Check API key"}`
+      `${params.engineLabel} upstream status ${upstream.status}: ${errText.slice(0, 140)}`
     );
   }
-
-  params.sendEvent({ meta: { engine: params.engineLabel.toLowerCase(), model: params.model } });
 
   const reader = upstream.body.getReader();
   const decoder = new TextDecoder();
   let buf = "";
+  let metaSent = false;
+  let emittedChars = 0;
 
   while (true) {
     const { done, value } = await reader.read();
@@ -102,6 +103,13 @@ async function streamOpenAICompatible(params: {
         };
         const text = parsed.choices?.[0]?.delta?.content;
         if (text) {
+          if (!metaSent) {
+            metaSent = true;
+            params.sendEvent({
+              meta: { engine: params.engineLabel.toLowerCase(), model: params.model },
+            });
+          }
+          emittedChars += text.length;
           params.sendEvent({ chunk: text, text });
         }
       } catch {
@@ -109,6 +117,8 @@ async function streamOpenAICompatible(params: {
       }
     }
   }
+
+  return emittedChars;
 }
 
 export default async function handler(
@@ -209,41 +219,82 @@ export default async function handler(
   const openaiKey = readCleanKey("OPENAI_API_KEY");
   const geminiKey = readCleanKey("GEMINI_API_KEY");
 
-  try {
-    // Priority 1: Groq Llama 3.3 70B Versatile (ultra-low-latency streaming)
-    if (groqKey) {
-      await streamOpenAICompatible({
-        url: "https://api.groq.com/openai/v1/chat/completions",
-        apiKey: groqKey,
-        model: "llama-3.3-70b-versatile",
-        engineLabel: "Groq",
-        systemPrompt,
-        userPrompt,
-        sendEvent,
-      });
-      sendEvent({ done: true });
-      res.end();
-      return;
-    }
+  let streamedAnyChunk = false;
 
-    // Priority 2: OpenAI
-    if (openaiKey && openaiKey.startsWith("sk-")) {
-      await streamOpenAICompatible({
+  // Pipeline A (Priority 1): Groq with dynamic active chat model lookup
+  if (groqKey) {
+    try {
+      const { emittedChars } = await streamGroqChatCompletion({
+        apiKey: groqKey,
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userPrompt },
+        ],
+        temperature: 0.35,
+        maxTokens: 1400,
+        onMeta: (model) => {
+          sendEvent({ meta: { engine: "groq", model } });
+        },
+        onDelta: (delta) => {
+          streamedAnyChunk = true;
+          sendEvent({ chunk: delta, text: delta });
+        },
+      });
+
+      if (emittedChars > 0) {
+        sendEvent({ done: true });
+        res.end();
+        return;
+      }
+    } catch (groqErr) {
+      console.warn(
+        "[/api/answer] Groq failed, silently falling back to next provider:",
+        groqErr instanceof Error ? groqErr.message : String(groqErr)
+      );
+      if (streamedAnyChunk) {
+        sendEvent({ done: true });
+        res.end();
+        return;
+      }
+    }
+  }
+
+  // Priority 2: OpenAI (if configured)
+  if (openaiKey && openaiKey.startsWith("sk-")) {
+    try {
+      const emittedChars = await streamOpenAICompatible({
         url: "https://api.openai.com/v1/chat/completions",
         apiKey: openaiKey,
         model: "gpt-4o-mini",
         engineLabel: "OpenAI",
         systemPrompt,
         userPrompt,
-        sendEvent,
+        sendEvent: (payload) => {
+          if (payload.chunk) streamedAnyChunk = true;
+          sendEvent(payload);
+        },
       });
-      sendEvent({ done: true });
-      res.end();
-      return;
+      if (emittedChars > 0) {
+        sendEvent({ done: true });
+        res.end();
+        return;
+      }
+    } catch (openaiErr) {
+      console.warn(
+        "[/api/answer] OpenAI failed, silently falling back to Gemini:",
+        openaiErr instanceof Error ? openaiErr.message : String(openaiErr)
+      );
+      if (streamedAnyChunk) {
+        sendEvent({ done: true });
+        res.end();
+        return;
+      }
     }
+  }
 
-    // Priority 3: Gemini fallback
-    if (geminiKey) {
+  // Pipeline B (Mandatory Silent Fallback): Gemini
+  if (geminiKey) {
+    try {
       const { model, stream } = await generateContentStreamResilient({
         contents: userPrompt,
         config: {
@@ -253,22 +304,32 @@ export default async function handler(
       });
       sendEvent({ meta: { engine: "gemini", model } });
       for await (const chunk of stream) {
-        if (chunk.text) sendEvent({ chunk: chunk.text, text: chunk.text });
+        if (chunk.text) {
+          streamedAnyChunk = true;
+          sendEvent({ chunk: chunk.text, text: chunk.text });
+        }
       }
       sendEvent({ done: true });
       res.end();
       return;
+    } catch (geminiErr) {
+      console.error(
+        "[/api/answer] Gemini fallback failed:",
+        geminiErr instanceof Error ? geminiErr.message : String(geminiErr)
+      );
     }
-
-    sendEvent({
-      error:
-        "Missing GROQ_API_KEY on server. Add GROQ_API_KEY in Vercel Environment Variables and redeploy.",
-    });
-    res.end();
-  } catch (err) {
-    sendEvent({
-      error: err instanceof Error ? err.message : "Failed to generate answer.",
-    });
-    res.end();
   }
+
+  if (streamedAnyChunk) {
+    sendEvent({ done: true });
+    res.end();
+    return;
+  }
+
+  sendEvent({
+    error: !groqKey && !openaiKey && !geminiKey
+      ? "No AI provider key is configured on the server. Add GROQ_API_KEY or GEMINI_API_KEY and try again."
+      : "AI answer service is temporarily busy. Please resend your question.",
+  });
+  res.end();
 }

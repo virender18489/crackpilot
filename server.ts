@@ -22,6 +22,7 @@ import {
   normalizeAnswerStyle,
   normalizeProgrammingLanguage,
 } from "./server/dsaEngine.ts";
+import { streamGroqChatCompletion } from "./server/groqHelper.ts";
 import type {
   ActiveProblemContext,
   AnswerStyle,
@@ -241,17 +242,26 @@ async function transcribeWithGemini(
     .filter(Boolean)
     .join("\n\n");
 
-  const response = await ai.models.generateContent({
-    model: "gemini-3.5-transcribe",
-    contents: {
-      parts: [
-        { inlineData: { mimeType: cleanMime, data: audioBase64 } },
-        { text: hint },
-      ],
-    },
-  });
+  const models = ["gemini-3.5-transcribe", "gemini-2.5-flash"] as const;
+  let lastErr: unknown;
+  for (const model of models) {
+    try {
+      const response = await ai.models.generateContent({
+        model,
+        contents: {
+          parts: [
+            { inlineData: { mimeType: cleanMime, data: audioBase64 } },
+            { text: hint },
+          ],
+        },
+      });
+      return (response.text || "").trim();
+    } catch (err) {
+      lastErr = err;
+    }
+  }
 
-  return (response.text || "").trim();
+  throw lastErr instanceof Error ? lastErr : new Error("Gemini transcription unavailable.");
 }
 
 async function startServer() {
@@ -350,7 +360,7 @@ async function startServer() {
         deepgram,
         openai,
         gemini,
-        sttReady: deepgram || openai || gemini,
+        sttReady: deepgram || groq || openai || gemini,
         llmReady: groq || openai || gemini,
       },
     });
@@ -1061,99 +1071,233 @@ async function startServer() {
     res.json({ ok: true, deliveredTo: sseClients.size });
   });
 
-  // Audio Transcription (Target-Profile-aware pronunciation auto-adjustment)
-  app.post("/api/transcribe", async (req, res) => {
-    try {
-      const { audioBase64, mimeType, language, role, experience, skills, jdText } =
-        req.body as {
-          audioBase64?: string;
-          mimeType?: string;
-          language?: string;
-          role?: string;
-          experience?: string;
-          skills?: string;
-          jdText?: string;
+  // Audio Transcription (raw binary audio/wav or base64 JSON; Deepgram Nova-3 -> Groq Whisper -> OpenAI -> Gemini fallback)
+  app.post(
+    "/api/transcribe",
+    express.raw({ type: "audio/*", limit: "15mb" }),
+    async (req, res) => {
+      try {
+        const cleanEnv = (k: string) => {
+          const v = (process.env[k] || "").trim().replace(/^['"]|['"]$/g, "");
+          return v && !/your_|placeholder/i.test(v) ? v : "";
         };
 
-      if (!audioBase64) {
-        res.status(400).json({ error: "Missing audioBase64 payload." });
-        return;
-      }
+        let audioBuffer: Buffer;
+        let cleanMime = "audio/wav";
+        let language: string | undefined;
+        let profileCtx: TranscribeProfileContext = {
+          role: activeProfile.role,
+          experience: activeProfile.experience,
+          skills: activeProfile.skills,
+          jdText: activeProfile.jdText,
+        };
 
-      const profileCtx: TranscribeProfileContext = {
-        role: role || activeProfile.role,
-        experience: experience || activeProfile.experience,
-        skills: skills || activeProfile.skills,
-        jdText: jdText || activeProfile.jdText,
-      };
-
-      const dgKey = (process.env.DEEPGRAM_API_KEY || "")
-        .trim()
-        .replace(/^['"]|['"]$/g, "");
-      const hasDeepgram = Boolean(dgKey && !/your_|placeholder/i.test(dgKey));
-
-      if (hasDeepgram) {
-        const cleanMime =
-          (mimeType || "audio/webm").split(";")[0].trim() || "audio/webm";
-        const audioBuffer = Buffer.from(audioBase64, "base64");
-        const langParam =
-          language === "hi" ? "language=hi" : "detect_language=true";
-        const dgRes = await fetch(
-          `https://api.deepgram.com/v1/listen?model=nova-3&smart_format=true&punctuate=true&${langParam}`,
-          {
-            method: "POST",
-            headers: {
-              Authorization: `Token ${dgKey}`,
-              "Content-Type": cleanMime,
-            },
-            body: audioBuffer,
+        const reqContentType = String(req.headers["content-type"] || "").toLowerCase();
+        if (Buffer.isBuffer(req.body)) {
+          audioBuffer = req.body;
+          cleanMime = reqContentType.split(";")[0].trim() || "audio/wav";
+          language =
+            typeof req.query.language === "string"
+              ? req.query.language
+              : undefined;
+          if (typeof req.query.role === "string" && req.query.role.trim()) {
+            profileCtx.role = req.query.role.trim();
           }
-        );
-        if (!dgRes.ok) {
-          const errText = await dgRes.text().catch(() => "");
-          throw new Error(
-            `Deepgram Nova-3 error (${dgRes.status}): ${errText.slice(0, 180)}`
-          );
-        }
-        const dgJson = (await dgRes.json()) as {
-          results?: {
-            channels?: Array<{
-              alternatives?: Array<{ transcript?: string }>;
-            }>;
+        } else {
+          const {
+            audioBase64,
+            mimeType,
+            language: bodyLang,
+            role,
+            experience,
+            skills,
+            jdText,
+          } = (req.body || {}) as {
+            audioBase64?: string;
+            mimeType?: string;
+            language?: string;
+            role?: string;
+            experience?: string;
+            skills?: string;
+            jdText?: string;
           };
-        };
-        const text = (
-          dgJson.results?.channels?.[0]?.alternatives?.[0]?.transcript || ""
-        ).trim();
-        res.json({ text, engine: "deepgram", model: "nova-3" });
-        return;
-      }
 
-      const text = hasOpenAIKey()
-        ? await transcribeWithOpenAI(
-            audioBase64,
-            mimeType || "audio/webm",
-            language,
-            profileCtx
-          )
-        : await transcribeWithGemini(
-            audioBase64,
-            mimeType || "audio/webm",
+          if (!audioBase64) {
+            res.status(400).json({ error: "Missing audio payload." });
+            return;
+          }
+          audioBuffer = Buffer.from(audioBase64, "base64");
+          cleanMime =
+            (mimeType || "audio/wav").split(";")[0].trim() || "audio/wav";
+          language = bodyLang;
+          profileCtx = {
+            role: role || activeProfile.role,
+            experience: experience || activeProfile.experience,
+            skills: skills || activeProfile.skills,
+            jdText: jdText || activeProfile.jdText,
+          };
+        }
+
+        const isValidWav =
+          audioBuffer.length >= 44 &&
+          audioBuffer.subarray(0, 4).toString("ascii") === "RIFF" &&
+          audioBuffer.subarray(8, 12).toString("ascii") === "WAVE";
+
+        // Skip tiny/empty buffers (< 0.4s) cleanly
+        if (
+          audioBuffer.length < 3200 ||
+          (cleanMime === "audio/wav" &&
+            (!isValidWav || audioBuffer.length < 44 + 12800))
+        ) {
+          res.json({ text: "", skipped: true });
+          return;
+        }
+
+        const dgKey = cleanEnv("DEEPGRAM_API_KEY");
+        const groqKey = cleanEnv("GROQ_API_KEY");
+        const geminiKey = cleanEnv("GEMINI_API_KEY");
+        const errors: string[] = [];
+
+        // Tier 1: Deepgram Nova-3 (raw binary forwarding with matching Content-Type)
+        if (dgKey) {
+          try {
+            const langParam =
+              language === "hi" ? "language=hi" : "detect_language=true";
+            const dgRes = await fetch(
+              `https://api.deepgram.com/v1/listen?model=nova-3&smart_format=true&punctuate=true&${langParam}`,
+              {
+                method: "POST",
+                headers: {
+                  Authorization: `Token ${dgKey}`,
+                  "Content-Type": cleanMime,
+                },
+                body: new Uint8Array(audioBuffer),
+              }
+            );
+            if (!dgRes.ok) {
+              const errText = await dgRes.text().catch(() => "");
+              throw new Error(
+                `Deepgram Nova-3 error (${dgRes.status}): ${errText.slice(0, 180)}`
+              );
+            }
+            const dgJson = (await dgRes.json()) as {
+              results?: {
+                channels?: Array<{
+                  alternatives?: Array<{ transcript?: string }>;
+                }>;
+              };
+            };
+            const text = (
+              dgJson.results?.channels?.[0]?.alternatives?.[0]?.transcript || ""
+            ).trim();
+            res.json({ text, engine: "deepgram", model: "nova-3" });
+            return;
+          } catch (dgErr) {
+            const msg = dgErr instanceof Error ? dgErr.message : String(dgErr);
+            console.warn("[/api/transcribe] Deepgram failed, falling back:", msg);
+            errors.push(msg);
+          }
+        }
+
+        // Tier 2: Groq Whisper fallback (whisper-large-v3-turbo)
+        if (groqKey) {
+          try {
+            const ext = cleanMime.includes("wav")
+              ? "wav"
+              : cleanMime.includes("mp4")
+                ? "mp4"
+                : "webm";
+            const form = new FormData();
+            form.append(
+              "file",
+              new Blob([new Uint8Array(audioBuffer)], { type: cleanMime }),
+              `utterance.${ext}`
+            );
+            form.append("model", "whisper-large-v3-turbo");
+            form.append("response_format", "json");
+            if (language === "hi") {
+              form.append("language", "hi");
+            }
+            const groqRes = await fetch(
+              "https://api.groq.com/openai/v1/audio/transcriptions",
+              {
+                method: "POST",
+                headers: { Authorization: `Bearer ${groqKey}` },
+                body: form,
+              }
+            );
+            if (!groqRes.ok) {
+              const errText = await groqRes.text().catch(() => "");
+              throw new Error(
+                `Groq Whisper error (${groqRes.status}): ${errText.slice(0, 180)}`
+              );
+            }
+            const groqJson = (await groqRes.json()) as { text?: string };
+            res.json({
+              text: (groqJson.text || "").trim(),
+              engine: "groq-whisper",
+              model: "whisper-large-v3-turbo",
+            });
+            return;
+          } catch (groqErr) {
+            const msg =
+              groqErr instanceof Error ? groqErr.message : String(groqErr);
+            console.warn(
+              "[/api/transcribe] Groq Whisper failed, falling back:",
+              msg
+            );
+            errors.push(msg);
+          }
+        }
+
+        // Tier 3: OpenAI Whisper fallback
+        const audioBase64Fallback = audioBuffer.toString("base64");
+        if (hasOpenAIKey()) {
+          try {
+            const text = await transcribeWithOpenAI(
+              audioBase64Fallback,
+              cleanMime,
+              language,
+              profileCtx
+            );
+            res.json({ text, engine: "openai", model: "whisper-1" });
+            return;
+          } catch (oaiErr) {
+            const msg =
+              oaiErr instanceof Error ? oaiErr.message : String(oaiErr);
+            console.warn(
+              "[/api/transcribe] OpenAI Whisper failed, falling back:",
+              msg
+            );
+            errors.push(msg);
+          }
+        }
+
+        // Tier 4: Gemini fallback
+        if (geminiKey) {
+          const text = await transcribeWithGemini(
+            audioBase64Fallback,
+            cleanMime,
             language,
             profileCtx
           );
+          res.json({ text, engine: "gemini", model: "gemini-3.5-transcribe" });
+          return;
+        }
 
-      res.json({
-        text,
-        engine: hasOpenAIKey() ? "openai" : "gemini",
-      });
-    } catch (error) {
-      const message =
-        error instanceof Error ? error.message : "Audio transcription failed.";
-      console.error("[/api/transcribe]", message);
-      res.status(500).json({ error: message });
+        res.status(502).json({
+          error:
+            errors[errors.length - 1] ||
+            "No transcription provider configured (add DEEPGRAM_API_KEY, GROQ_API_KEY, or GEMINI_API_KEY).",
+        });
+      } catch (error) {
+        const message =
+          error instanceof Error ? error.message : "Audio transcription failed.";
+        console.error("[/api/transcribe]", message);
+        res.status(500).json({ error: message });
+      }
     }
-  });
+  );
 
   // Live Streaming Interview Answer (tailored to Target Profile + Resume + JD, or Active DSA Problem Context)
   app.post("/api/answer", async (req, res) => {
@@ -1278,72 +1422,53 @@ async function startServer() {
           ? `Recent interview context:\n${recentContext}\n\nInterviewer just asked:\n"${question.trim()}"\n\nAnswer directly in natural human spoken language matching the exact Answer Style rules.`
           : `Interviewer just asked:\n"${question.trim()}"\n\nAnswer directly in natural human spoken language matching the exact Answer Style rules.`;
 
-    try {
-      const groqKey = (process.env.GROQ_API_KEY || "")
-        .trim()
-        .replace(/^['"]|['"]$/g, "");
-      if (groqKey && !/your_|placeholder/i.test(groqKey)) {
-        sendEvent({ meta: { engine: "groq", model: "llama-3.3-70b-versatile" } });
-        const groqRes = await fetch(
-          "https://api.groq.com/openai/v1/chat/completions",
-          {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              Authorization: `Bearer ${groqKey}`,
-            },
-            body: JSON.stringify({
-              model: "llama-3.3-70b-versatile",
-              stream: true,
-              temperature: 0.35,
-              max_tokens: 1400,
-              messages: [
-                { role: "system", content: systemPrompt },
-                { role: "user", content: userPrompt },
-              ],
-            }),
-          }
+    let streamedAnyChunk = false;
+    const groqKey = (process.env.GROQ_API_KEY || "")
+      .trim()
+      .replace(/^['"]|['"]$/g, "");
+    const validGroqKey =
+      groqKey && !/your_|placeholder/i.test(groqKey) ? groqKey : "";
+
+    // Pipeline A: Groq with dynamic active chat model lookup
+    if (validGroqKey) {
+      try {
+        const { emittedChars } = await streamGroqChatCompletion({
+          apiKey: validGroqKey,
+          messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: userPrompt },
+          ],
+          temperature: 0.35,
+          maxTokens: 1400,
+          onMeta: (model) => {
+            sendEvent({ meta: { engine: "groq", model } });
+          },
+          onDelta: (delta) => {
+            streamedAnyChunk = true;
+            sendEvent({ chunk: delta, text: delta });
+          },
+        });
+        if (emittedChars > 0) {
+          sendEvent({ done: true });
+          res.end();
+          return;
+        }
+      } catch (groqErr) {
+        console.warn(
+          "[/api/answer] Groq failed, silently falling back to next provider:",
+          groqErr instanceof Error ? groqErr.message : String(groqErr)
         );
-
-        if (!groqRes.ok || !groqRes.body) {
-          const errText = await groqRes.text().catch(() => "");
-          throw new Error(
-            `Groq API error (${groqRes.status}): ${errText.slice(0, 180)}`
-          );
+        if (streamedAnyChunk) {
+          sendEvent({ done: true });
+          res.end();
+          return;
         }
-
-        const reader = groqRes.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = "";
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split("\n");
-          buffer = lines.pop() || "";
-          for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed.startsWith("data:")) continue;
-            const dataStr = trimmed.slice(5).trim();
-            if (!dataStr || dataStr === "[DONE]") continue;
-            try {
-              const parsed = JSON.parse(dataStr) as {
-                choices?: Array<{ delta?: { content?: string } }>;
-              };
-              const delta = parsed.choices?.[0]?.delta?.content;
-              if (delta) sendEvent({ chunk: delta, text: delta });
-            } catch {
-              // Ignore incomplete fragments
-            }
-          }
-        }
-        sendEvent({ done: true });
-        res.end();
-        return;
       }
+    }
 
-      if (hasOpenAIKey()) {
-        sendEvent({ meta: { engine: "openai", model: "gpt-4o-mini" } });
+    // Priority 2: OpenAI (if configured)
+    if (hasOpenAIKey()) {
+      try {
         const openaiRes = await fetch(
           "https://api.openai.com/v1/chat/completions",
           {
@@ -1364,13 +1489,18 @@ async function startServer() {
         );
 
         if (!openaiRes.ok || !openaiRes.body) {
-          const errText = await openaiRes.text();
-          throw new Error(`OpenAI Chat error (${openaiRes.status}): ${errText}`);
+          const errText = await openaiRes.text().catch(() => "");
+          throw new Error(
+            `OpenAI Chat error (${openaiRes.status}): ${errText.slice(0, 140)}`
+          );
         }
 
         const reader = openaiRes.body.getReader();
         const decoder = new TextDecoder();
         let buffer = "";
+        let metaSent = false;
+        let emittedChars = 0;
+
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
@@ -1387,17 +1517,41 @@ async function startServer() {
                 choices?: Array<{ delta?: { content?: string } }>;
               };
               const delta = parsed.choices?.[0]?.delta?.content;
-              if (delta) sendEvent({ chunk: delta });
+              if (delta) {
+                if (!metaSent) {
+                  metaSent = true;
+                  sendEvent({ meta: { engine: "openai", model: "gpt-4o-mini" } });
+                }
+                emittedChars += delta.length;
+                streamedAnyChunk = true;
+                sendEvent({ chunk: delta, text: delta });
+              }
             } catch {
               // Ignore incomplete fragments
             }
           }
         }
-        sendEvent({ done: true });
-        res.end();
-        return;
-      }
 
+        if (emittedChars > 0) {
+          sendEvent({ done: true });
+          res.end();
+          return;
+        }
+      } catch (openaiErr) {
+        console.warn(
+          "[/api/answer] OpenAI failed, silently falling back to Gemini:",
+          openaiErr instanceof Error ? openaiErr.message : String(openaiErr)
+        );
+        if (streamedAnyChunk) {
+          sendEvent({ done: true });
+          res.end();
+          return;
+        }
+      }
+    }
+
+    // Pipeline B (Mandatory Silent Fallback): Gemini
+    try {
       const { model, stream } = await generateContentStreamResilient({
         contents: userPrompt,
         config: {
@@ -1408,15 +1562,26 @@ async function startServer() {
       sendEvent({ meta: { engine: "gemini", model } });
 
       for await (const chunk of stream) {
-        if (chunk.text) sendEvent({ chunk: chunk.text });
+        if (chunk.text) {
+          streamedAnyChunk = true;
+          sendEvent({ chunk: chunk.text, text: chunk.text });
+        }
       }
       sendEvent({ done: true });
       res.end();
     } catch (error) {
       const message =
         error instanceof Error ? error.message : "Failed to generate answer.";
-      console.error("[/api/answer]", message);
-      sendEvent({ error: message });
+      console.error("[/api/answer] All answer providers failed:", message);
+      if (streamedAnyChunk) {
+        sendEvent({ done: true });
+        res.end();
+        return;
+      }
+      sendEvent({
+        error:
+          "AI answer service is temporarily unavailable. Please verify your GROQ_API_KEY or GEMINI_API_KEY and try again.",
+      });
       res.end();
     }
   });

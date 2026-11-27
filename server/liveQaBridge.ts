@@ -1,7 +1,12 @@
 import type http from "http";
 import crypto from "crypto";
 import { WebSocket, WebSocketServer } from "ws";
-import { GoogleGenAI, Modality, type LiveServerMessage } from "@google/genai";
+import {
+  GoogleGenAI,
+  Modality,
+  ThinkingLevel,
+  type LiveServerMessage,
+} from "@google/genai";
 import {
   HUMAN_LIVE_QA_SYSTEM_PROMPT,
   type LiveQaPipeline,
@@ -15,8 +20,14 @@ import type {
 import {
   buildDsaFollowUpSystemPrompt,
   buildHumanInterviewSystemPrompt,
+  generateContentStreamResilient,
   normalizeProgrammingLanguage,
 } from "./dsaEngine.ts";
+import {
+  DEFAULT_GROQ_CHAT_MODEL,
+  resolveActiveGroqChatModel,
+  streamGroqChatCompletion,
+} from "./groqHelper.ts";
 
 export interface LiveQaContextProvider {
   getProfile: () => TargetProfile;
@@ -25,8 +36,6 @@ export interface LiveQaContextProvider {
 
 const DEEPGRAM_WS_URL =
   "wss://api.deepgram.com/v1/listen?model=nova-3&encoding=linear16&sample_rate=16000&channels=1&smart_format=true&interim_results=true&endpointing=900&utterance_end_ms=1200";
-const GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions";
-const GROQ_MODEL = "llama-3.3-70b-versatile";
 const GEMINI_LIVE_MODEL = "gemini-3.8-live";
 
 function readCleanKey(name: string, placeholder?: string): string {
@@ -45,11 +54,11 @@ export function getLiveQaServerStatus(): LiveQaServerStatus {
     deepgramConfigured,
     groqConfigured,
     geminiConfigured,
-    pipelineAReady: deepgramConfigured && groqConfigured,
+    pipelineAReady: deepgramConfigured && (groqConfigured || geminiConfigured),
     pipelineBReady: geminiConfigured,
     pipelineAModels: {
       stt: "deepgram/nova-3",
-      llm: `groq/${GROQ_MODEL}`,
+      llm: groqConfigured ? `groq/${DEFAULT_GROQ_CHAT_MODEL}` : "gemini-2.5-flash",
     },
     pipelineBModel: GEMINI_LIVE_MODEL,
   };
@@ -151,9 +160,13 @@ export function attachLiveQaWebSocketServer(
 
       const dgKey = readCleanKey("DEEPGRAM_API_KEY");
       const groqKey = readCleanKey("GROQ_API_KEY");
+      const geminiKey = readCleanKey("GEMINI_API_KEY", "MY_GEMINI_API_KEY");
 
-      if (!dgKey || !groqKey) {
-        const missing = [!dgKey && "DEEPGRAM_API_KEY", !groqKey && "GROQ_API_KEY"]
+      if (!dgKey || (!groqKey && !geminiKey)) {
+        const missing = [
+          !dgKey && "DEEPGRAM_API_KEY",
+          !groqKey && !geminiKey && "GROQ_API_KEY or GEMINI_API_KEY",
+        ]
           .filter(Boolean)
           .join(" and ");
         sendJson(clientWs, {
@@ -189,92 +202,103 @@ export function attachLiveQaWebSocketServer(
 
         let firstTokenSent = false;
         let fullAnswer = "";
+        const systemPrompt = buildDynamicLiveSystemPrompt();
 
-        try {
-          const resp = await fetch(GROQ_CHAT_URL, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              Authorization: `Bearer ${groqKey}`,
-            },
-            signal: abortController.signal,
-            body: JSON.stringify({
-              model: GROQ_MODEL,
-              stream: true,
+        const emitDelta = (delta: string) => {
+          if (closed || abortController.signal.aborted) return;
+          fullAnswer += delta;
+          const serverTtfwMs = !firstTokenSent
+            ? Math.max(1, Date.now() - speechEndedAt)
+            : undefined;
+          firstTokenSent = true;
+          sendJson(clientWs, {
+            type: "answer_delta",
+            turnId,
+            delta,
+            serverTtfwMs,
+          });
+        };
+
+        // Try Pipeline A (Groq dynamic active chat model) first
+        let answered = false;
+        if (groqKey) {
+          try {
+            const { emittedChars } = await streamGroqChatCompletion({
+              apiKey: groqKey,
+              signal: abortController.signal,
               temperature: 0.72,
-              max_tokens: 340,
+              maxTokens: 340,
               messages: [
-                { role: "system", content: buildDynamicLiveSystemPrompt() },
+                { role: "system", content: systemPrompt },
                 ...conversationHistory.slice(-4),
                 { role: "user", content: trimmed },
               ],
-            }),
-          });
-
-          if (!resp.ok || !resp.body) {
-            const errBody = await resp.text();
-            throw new Error(`Groq API error (${resp.status}): ${errBody.slice(0, 180)}`);
+              onDelta: emitDelta,
+            });
+            answered = emittedChars > 0;
+          } catch (err) {
+            if ((err as Error).name === "AbortError") {
+              return;
+            }
+            console.warn(
+              "[LiveQA Pipeline A - Groq] Falling back silently to Gemini:",
+              err instanceof Error ? err.message : String(err)
+            );
           }
+        }
 
-          const reader = resp.body.getReader();
-          const decoder = new TextDecoder();
-          let sseBuffer = "";
+        // Silent Mandatory Fallback to Gemini if Groq failed or wasn't configured
+        if (!answered && !firstTokenSent && !closed && !abortController.signal.aborted && geminiKey) {
+          try {
+            const historyContext = conversationHistory
+              .slice(-4)
+              .map((m) => `${m.role === "user" ? "Interviewer" : "Candidate"}: ${m.content}`)
+              .join("\n");
+            const geminiPrompt = historyContext
+              ? `${historyContext}\nInterviewer: ${trimmed}`
+              : trimmed;
 
-          while (!closed) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            sseBuffer += decoder.decode(value, { stream: true });
-            const lines = sseBuffer.split("\n");
-            sseBuffer = lines.pop() || "";
+            const { stream } = await generateContentStreamResilient({
+              contents: geminiPrompt,
+              config: {
+                systemInstruction: systemPrompt,
+                thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+              },
+            });
 
-            for (const line of lines) {
-              const cleaned = line.trim();
-              if (!cleaned.startsWith("data:")) continue;
-              const payloadStr = cleaned.slice(5).trim();
-              if (payloadStr === "[DONE]") continue;
-              try {
-                const parsed = JSON.parse(payloadStr) as {
-                  choices?: Array<{ delta?: { content?: string } }>;
-                };
-                const delta = parsed.choices?.[0]?.delta?.content;
-                if (delta) {
-                  fullAnswer += delta;
-                  const serverTtfwMs = !firstTokenSent
-                    ? Math.max(1, Date.now() - speechEndedAt)
-                    : undefined;
-                  firstTokenSent = true;
-                  sendJson(clientWs, {
-                    type: "answer_delta",
-                    turnId,
-                    delta,
-                    serverTtfwMs,
-                  });
-                }
-              } catch {
-                // Ignore partial SSE JSON chunks
+            for await (const chunk of stream) {
+              if (closed || abortController.signal.aborted) return;
+              if (chunk.text) {
+                emitDelta(chunk.text);
+                answered = true;
               }
             }
-          }
-
-          if (fullAnswer.trim()) {
-            conversationHistory.push(
-              { role: "user", content: trimmed },
-              { role: "assistant", content: fullAnswer.trim() }
+          } catch (geminiErr) {
+            console.error(
+              "[LiveQA Pipeline A - Gemini fallback error]:",
+              geminiErr instanceof Error ? geminiErr.message : String(geminiErr)
             );
-            if (conversationHistory.length > 8) {
-              conversationHistory.splice(0, conversationHistory.length - 8);
-            }
           }
-
-          sendJson(clientWs, { type: "answer_done", turnId });
-        } catch (err) {
-          if ((err as Error).name === "AbortError") {
-            return;
-          }
-          const msg = err instanceof Error ? err.message : "Groq streaming error.";
-          console.error("[LiveQA Pipeline A - Groq]", msg);
-          sendJson(clientWs, { type: "error", message: msg });
         }
+
+        if (closed || abortController.signal.aborted) return;
+
+        if (fullAnswer.trim()) {
+          conversationHistory.push(
+            { role: "user", content: trimmed },
+            { role: "assistant", content: fullAnswer.trim() }
+          );
+          if (conversationHistory.length > 8) {
+            conversationHistory.splice(0, conversationHistory.length - 8);
+          }
+          sendJson(clientWs, { type: "answer_done", turnId });
+          return;
+        }
+
+        sendJson(clientWs, {
+          type: "error",
+          message: "Answer engine is temporarily busy. Please try again.",
+        });
       };
 
       const dgWs = new WebSocket(DEEPGRAM_WS_URL, {
@@ -295,11 +319,17 @@ export function attachLiveQaWebSocketServer(
           dgWs.close();
           return;
         }
-        sendJson(clientWs, {
-          type: "ready",
-          pipeline: "deepgram-groq",
-          modelInfo: `Deepgram Nova-3 (endpointing=900ms, utterance_end=1200ms) → Groq ${GROQ_MODEL}`,
-        });
+        void (async () => {
+          const activeModel = groqKey
+            ? await resolveActiveGroqChatModel(groqKey).catch(() => DEFAULT_GROQ_CHAT_MODEL)
+            : "gemini-2.5-flash";
+          if (closed) return;
+          sendJson(clientWs, {
+            type: "ready",
+            pipeline: "deepgram-groq",
+            modelInfo: `Deepgram Nova-3 (endpointing=900ms, utterance_end=1200ms) → ${groqKey ? `Groq ${activeModel}` : activeModel}`,
+          });
+        })();
       });
 
       dgWs.on("message", (raw) => {

@@ -60,6 +60,7 @@ import {
   syncTokenElapsedSeconds,
   verifySessionToken,
 } from "../lib/clientStore";
+import { encodePcm16WavBlob } from "../lib/wavEncoder";
 import type {
   AccountQuotaSnapshot,
   ActiveProblemContext,
@@ -117,19 +118,6 @@ function formatTimer(totalSeconds: number): string {
   const mins = Math.floor(totalSeconds / 60);
   const secs = totalSeconds % 60;
   return `${String(mins).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
-}
-
-function blobToBase64(blob: Blob): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onloadend = () => {
-      const result = typeof reader.result === "string" ? reader.result : "";
-      const commaIdx = result.indexOf(",");
-      resolve(commaIdx >= 0 ? result.slice(commaIdx + 1) : result);
-    };
-    reader.onerror = () => reject(new Error("Failed to read audio chunk."));
-    reader.readAsDataURL(blob);
-  });
 }
 
 export function SoftwareOverlay({
@@ -256,8 +244,10 @@ export function SoftwareOverlay({
   const screenStreamRef = useRef<MediaStream | null>(null);
   const audioStreamRef = useRef<MediaStream | null>(null);
   const extraAudioStreamsRef = useRef<MediaStream[]>([]);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const recordedChunksRef = useRef<Blob[]>([]);
+  const pcmProcessorRef = useRef<ScriptProcessorNode | null>(null);
+  const preRollPcmRef = useRef<Float32Array[]>([]);
+  const speechPcmRef = useRef<Float32Array[]>([]);
+  const flushPcmUtteranceRef = useRef<((fastMode?: boolean) => void) | null>(null);
   const chunkTimerRef = useRef<number | null>(null);
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
@@ -1219,17 +1209,18 @@ export function SoftwareOverlay({
       }
       recognitionRef.current = null;
     }
-    if (
-      mediaRecorderRef.current &&
-      mediaRecorderRef.current.state !== "inactive"
-    ) {
+    if (pcmProcessorRef.current) {
       try {
-        mediaRecorderRef.current.stop();
+        pcmProcessorRef.current.onaudioprocess = null;
+        pcmProcessorRef.current.disconnect();
       } catch {
         // Ignore
       }
+      pcmProcessorRef.current = null;
     }
-    mediaRecorderRef.current = null;
+    preRollPcmRef.current = [];
+    speechPcmRef.current = [];
+    flushPcmUtteranceRef.current = null;
 
     if (audioCtxRef.current) {
       void audioCtxRef.current.close();
@@ -1274,25 +1265,121 @@ export function SoftwareOverlay({
     setHasSharedScreen(false);
   }, []);
 
+  const transcribeWavBlob = useCallback(
+    async (wavBlob: Blob, fastMode = false) => {
+      if (
+        !isConnectedRef.current ||
+        !isEngineRunningRef.current ||
+        glitchActiveRef.current
+      ) {
+        return;
+      }
+
+      // Skip tiny/empty WAV buffers (< 0.4s @ 16kHz 16-bit mono = 44 + 12800 bytes)
+      if (wavBlob.size < 44 + 12800) {
+        return;
+      }
+
+      if (!hasConfiguredBackend()) {
+        setStatusNotice(
+          "Configure a Crackpilot Server URL in ••• Settings to transcribe captured audio."
+        );
+        return;
+      }
+
+      setIsTranscribing(true);
+      const curProfile = profileRef.current;
+      const lang = curProfile.answerLanguage === "Hindi" ? "hi" : "auto";
+      const qs = new URLSearchParams({
+        language: lang,
+        role: curProfile.role || "",
+      }).toString();
+      const transcribeUrl = `${apiUrl("/api/transcribe")}?${qs}`;
+
+      try {
+        // Send complete self-contained binary .wav Blob directly with matching audio/wav Content-Type
+        const resp = await fetch(transcribeUrl, {
+          method: "POST",
+          headers: {
+            "Content-Type": "audio/wav",
+          },
+          body: wavBlob,
+        });
+        const contentType = (resp.headers.get("content-type") || "").toLowerCase();
+        const rawText = await resp.text();
+        if (
+          !contentType.includes("application/json") ||
+          !rawText.trim() ||
+          rawText.trim().startsWith("<")
+        ) {
+          console.error(
+            `[Crackpilot Transcribe] Non-JSON response from ${transcribeUrl} (status=${resp.status}, content-type="${contentType || "none"}", preview="${rawText.trim().slice(0, 120)}")`
+          );
+          throw new Error(
+            "Transcription server returned a non-JSON response. Check your Server URL in ••• Settings."
+          );
+        }
+        let data: { text?: string; skipped?: boolean; error?: string };
+        try {
+          data = JSON.parse(rawText) as {
+            text?: string;
+            skipped?: boolean;
+            error?: string;
+          };
+        } catch (parseErr) {
+          console.error("[Crackpilot Transcribe] JSON parse failed:", parseErr);
+          throw new Error("Transcription server returned invalid JSON.");
+        }
+        if (!resp.ok) {
+          throw new Error(data.error || "Transcription failed.");
+        }
+        if (data.skipped) {
+          return;
+        }
+        const cleanedTranscript = (data.text || "").trim();
+        setLiveApiError(null);
+        if (cleanedTranscript.length > 2) {
+          setInterimText("");
+          void askQuestion(cleanedTranscript, fastMode);
+        }
+      } catch (err) {
+        console.error("[Crackpilot Transcribe] Error:", err);
+        const errMsg =
+          err instanceof Error ? err.message : "Audio transcription error.";
+        setLiveApiError(errMsg);
+        setStatusNotice(errMsg);
+      } finally {
+        setIsTranscribing(false);
+      }
+    },
+    [askQuestion]
+  );
+
+  // Unified Web Audio API 16kHz Mono PCM Utterance Capture + 60fps AnalyserNode Level Meter
+  // Encodes every detected spoken question into a complete, valid 44-byte RIFF/WAV Blob (skipping < 0.4s clicks)
   const attachAudioMeter = useCallback(
-    (
-      audioStream: MediaStream,
-      monitor: boolean,
-      onVadFlush?: () => void
-    ) => {
+    (audioStream: MediaStream, monitor: boolean) => {
       try {
         const AudioCtx =
           window.AudioContext ||
           (window as unknown as { webkitAudioContext: typeof AudioContext })
             .webkitAudioContext;
-        const ctx = new AudioCtx();
+
+        let ctx: AudioContext;
+        try {
+          ctx = new AudioCtx({ sampleRate: 16000 });
+        } catch {
+          ctx = new AudioCtx();
+        }
         if (ctx.state === "suspended") {
           void ctx.resume().catch(() => {});
         }
+
         const source = ctx.createMediaStreamSource(audioStream);
         const analyser = ctx.createAnalyser();
         analyser.fftSize = 512;
         analyser.smoothingTimeConstant = 0.65;
+
         const gain = ctx.createGain();
         gain.gain.value = monitor ? 1.0 : 0.0;
 
@@ -1300,12 +1387,86 @@ export function SoftwareOverlay({
         analyser.connect(gain);
         gain.connect(ctx.destination);
 
+        // Capture raw mono Float32 PCM frames for self-contained 16kHz WAV encoding
+        const processor = ctx.createScriptProcessor(4096, 1, 1);
+        const silentSink = ctx.createGain();
+        silentSink.gain.value = 0.0;
+        source.connect(processor);
+        processor.connect(silentSink);
+        silentSink.connect(ctx.destination);
+
         audioCtxRef.current = ctx;
         monitorGainRef.current = gain;
+        pcmProcessorRef.current = processor;
 
         speechActiveRef.current = false;
         lastSpeechAtRef.current = 0;
         chunkStartedAtRef.current = Date.now();
+        preRollPcmRef.current = [];
+        speechPcmRef.current = [];
+
+        // Keep ~0.35s pre-roll so the first syllable of each question is never clipped
+        const maxPreRollFrames = Math.max(
+          2,
+          Math.ceil((ctx.sampleRate * 0.35) / 4096)
+        );
+
+        const flushSpeechToWav = (fastMode = false) => {
+          speechActiveRef.current = false;
+          const frames = speechPcmRef.current.splice(0);
+          if (frames.length === 0 || recognitionWorkingRef.current) {
+            return;
+          }
+          const encoded = encodePcm16WavBlob(frames, ctx.sampleRate, {
+            targetSampleRate: 16000,
+            minDurationSec: 0.4,
+          });
+          if (!encoded) {
+            return;
+          }
+          void transcribeWavBlob(encoded.blob, fastMode);
+        };
+
+        flushPcmUtteranceRef.current = flushSpeechToWav;
+
+        processor.onaudioprocess = (ev) => {
+          if (!isListeningRef.current) return;
+          const input = ev.inputBuffer.getChannelData(0);
+          if (!input || input.length === 0) return;
+
+          const frameCopy = new Float32Array(input.length);
+          frameCopy.set(input);
+
+          let sumSq = 0;
+          for (let i = 0; i < frameCopy.length; i++) {
+            sumSq += frameCopy[i] * frameCopy[i];
+          }
+          const rms = Math.sqrt(sumSq / frameCopy.length);
+          const now = Date.now();
+
+          if (rms > 0.012) {
+            if (!speechActiveRef.current) {
+              speechActiveRef.current = true;
+              chunkStartedAtRef.current = now;
+              speechPcmRef.current = [...preRollPcmRef.current, frameCopy];
+            } else {
+              speechPcmRef.current.push(frameCopy);
+            }
+            lastSpeechAtRef.current = now;
+          } else if (speechActiveRef.current) {
+            speechPcmRef.current.push(frameCopy);
+            const silenceMs = now - lastSpeechAtRef.current;
+            const utteranceMs = now - chunkStartedAtRef.current;
+            if (silenceMs >= 850 || utteranceMs >= 10000) {
+              flushSpeechToWav(false);
+            }
+          } else {
+            preRollPcmRef.current.push(frameCopy);
+            if (preRollPcmRef.current.length > maxPreRollFrames) {
+              preRollPcmRef.current.shift();
+            }
+          }
+        };
 
         const data = new Uint8Array(analyser.fftSize);
         let smoothedLevel = 0;
@@ -1328,201 +1489,14 @@ export function SoftwareOverlay({
               ? targetLevel
               : Math.max(0, Math.round(smoothedLevel * 0.82 + targetLevel * 0.18));
           setAudioLevel(smoothedLevel);
-
-          // Real-time VAD endpointing: flush completed speech immediately after ~0.85s pause for 1-2s AI replies
-          const now = Date.now();
-          if (rms > 0.014) {
-            if (!speechActiveRef.current) {
-              speechActiveRef.current = true;
-              chunkStartedAtRef.current = now;
-            }
-            lastSpeechAtRef.current = now;
-          } else if (speechActiveRef.current) {
-            const silenceMs = now - lastSpeechAtRef.current;
-            const utteranceMs = now - chunkStartedAtRef.current;
-            if (silenceMs >= 850 || utteranceMs >= 5500) {
-              speechActiveRef.current = false;
-              chunkStartedAtRef.current = now;
-              onVadFlush?.();
-            }
-          } else if (now - chunkStartedAtRef.current >= 6500) {
-            // Reset idle buffer periodically so chunks stay compact and fresh
-            chunkStartedAtRef.current = now;
-            if (
-              mediaRecorderRef.current &&
-              mediaRecorderRef.current.state === "recording" &&
-              !speechActiveRef.current
-            ) {
-              recordedChunksRef.current = [];
-            }
-          }
-
           rafLevelRef.current = requestAnimationFrame(tick);
         };
         rafLevelRef.current = requestAnimationFrame(tick);
       } catch (err) {
-        console.warn("[Crackpilot Audio] Web Audio AnalyserNode init warning:", err);
+        console.warn("[Crackpilot Audio] Web Audio PCM WAV init warning:", err);
       }
     },
-    []
-  );
-
-  const transcribeRecordedChunks = useCallback(
-    async (fastMode = false) => {
-      if (
-        !isConnectedRef.current ||
-        !isEngineRunningRef.current ||
-        glitchActiveRef.current
-      ) {
-        recordedChunksRef.current = [];
-        return;
-      }
-      const chunks = recordedChunksRef.current.splice(0);
-      if (chunks.length === 0) return;
-
-      const mimeType = chunks[0].type || "audio/webm";
-      const blob = new Blob(chunks, { type: mimeType });
-      if (blob.size < 2200) return;
-
-      if (!hasConfiguredBackend()) {
-        setStatusNotice(
-          "Configure a Crackpilot Server URL in ••• Settings to transcribe captured audio."
-        );
-        return;
-      }
-
-      setIsTranscribing(true);
-      const transcribeUrl = apiUrl("/api/transcribe");
-      try {
-        const audioBase64 = await blobToBase64(blob);
-        const curProfile = profileRef.current;
-        const resp = await fetch(transcribeUrl, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            audioBase64,
-            mimeType,
-            language:
-              curProfile.answerLanguage === "Hindi" ? "hi" : "auto",
-            role: curProfile.role,
-            experience: curProfile.experience,
-            skills: curProfile.skills,
-            jdText: curProfile.jdText,
-          }),
-        });
-        const contentType = (resp.headers.get("content-type") || "").toLowerCase();
-        const rawText = await resp.text();
-        if (
-          !contentType.includes("application/json") ||
-          !rawText.trim() ||
-          rawText.trim().startsWith("<")
-        ) {
-          console.error(
-            `[Crackpilot Transcribe] Non-JSON response from ${transcribeUrl} (status=${resp.status}, content-type="${contentType || "none"}", preview="${rawText.trim().slice(0, 120)}")`
-          );
-          throw new Error(
-            "Transcription server returned a non-JSON response. Check your Server URL in ••• Settings."
-          );
-        }
-        let data: { text?: string; error?: string };
-        try {
-          data = JSON.parse(rawText) as { text?: string; error?: string };
-        } catch (parseErr) {
-          console.error("[Crackpilot Transcribe] JSON parse failed:", parseErr);
-          throw new Error("Transcription server returned invalid JSON.");
-        }
-        if (!resp.ok) {
-          throw new Error(data.error || "Transcription failed.");
-        }
-        const cleanedTranscript = (data.text || "").trim();
-        setLiveApiError(null);
-        if (cleanedTranscript.length > 2) {
-          setInterimText("");
-          void askQuestion(cleanedTranscript, fastMode);
-        }
-      } catch (err) {
-        console.error("[Crackpilot Transcribe] Error:", err);
-        const errMsg =
-          err instanceof Error ? err.message : "Audio transcription error.";
-        setLiveApiError(errMsg);
-        setStatusNotice(errMsg);
-      } finally {
-        setIsTranscribing(false);
-      }
-    },
-    [askQuestion]
-  );
-
-  const startChunkedRecorder = useCallback(
-    (audioStream: MediaStream, intervalSeconds: number) => {
-      const preferredMime = MediaRecorder.isTypeSupported(
-        "audio/webm;codecs=opus"
-      )
-        ? "audio/webm;codecs=opus"
-        : MediaRecorder.isTypeSupported("audio/webm")
-          ? "audio/webm"
-          : "";
-
-      let skipNextStopTranscribe = false;
-
-      const spinRecorder = () => {
-        if (!isListeningRef.current) return;
-        try {
-          const rec = preferredMime
-            ? new MediaRecorder(audioStream, { mimeType: preferredMime })
-            : new MediaRecorder(audioStream);
-          recordedChunksRef.current = [];
-          rec.ondataavailable = (ev) => {
-            if (ev.data && ev.data.size > 0) {
-              recordedChunksRef.current.push(ev.data);
-            }
-          };
-          rec.onstop = () => {
-            if (skipNextStopTranscribe) {
-              skipNextStopTranscribe = false;
-              recordedChunksRef.current = [];
-              return;
-            }
-            if (!recognitionWorkingRef.current) {
-              void transcribeRecordedChunks(false);
-            } else {
-              recordedChunksRef.current = [];
-            }
-          };
-          mediaRecorderRef.current = rec;
-          rec.start(250);
-        } catch (err) {
-          console.warn("[Crackpilot Audio] MediaRecorder start failed:", err);
-        }
-      };
-
-      const flushNow = () => {
-        if (!isListeningRef.current) return;
-        const activeRec = mediaRecorderRef.current;
-        if (activeRec && activeRec.state === "recording") {
-          skipNextStopTranscribe = false;
-          activeRec.stop();
-          spinRecorder();
-        }
-      };
-
-      spinRecorder();
-
-      chunkTimerRef.current = window.setInterval(() => {
-        if (!isListeningRef.current) return;
-        const activeRec = mediaRecorderRef.current;
-        if (activeRec && activeRec.state === "recording") {
-          // Only transcribe on fallback timer if speech was actually detected
-          skipNextStopTranscribe = !speechActiveRef.current;
-          speechActiveRef.current = false;
-          activeRec.stop();
-          spinRecorder();
-        }
-      }, intervalSeconds * 1000);
-
-      return flushNow;
-    },
-    [transcribeRecordedChunks]
+    [transcribeWavBlob]
   );
 
   // Capture Microphone audio (captures nearby speaker / interviewer laptop voice & works out of the box in Electron + Browser)
@@ -1575,8 +1549,7 @@ export function SoftwareOverlay({
         setListenMode("mic");
         setMonitorAudio(true);
 
-        const flushRecorder = startChunkedRecorder(micStream, 4);
-        attachAudioMeter(micStream, false, flushRecorder);
+        attachAudioMeter(micStream, false);
 
         // Start real-time Web Speech Recognition when supported (instant live Q streaming in Chrome/Edge)
         // Automatically falls back to VAD + /api/transcribe in Electron if Web Speech API errors
@@ -1684,7 +1657,6 @@ export function SoftwareOverlay({
       askQuestion,
       attachAudioMeter,
       refreshAudioInputDevices,
-      startChunkedRecorder,
       stopAudioListening,
     ]
   );
@@ -1756,8 +1728,7 @@ export function SoftwareOverlay({
       setListenMode("tab");
       setMonitorAudio(true);
       setMicDiagError(null);
-      const flushRecorder = startChunkedRecorder(audioOnly, 4);
-      attachAudioMeter(audioOnly, false, flushRecorder);
+      attachAudioMeter(audioOnly, false);
       setStatusNotice(
         "Monitor ON — System / Zoom / Meet Call Audio Live. Listening for interviewer questions."
       );
@@ -1768,7 +1739,7 @@ export function SoftwareOverlay({
           : "System / Loopback audio capture cancelled."
       );
     }
-  }, [attachAudioMeter, startChunkedRecorder, stopAudioListening, stopScreenStream]);
+  }, [attachAudioMeter, stopAudioListening, stopScreenStream]);
 
   // Dual Two-Laptop / Mobile Call Capture: mixes System Loopback (Zoom/Meet/Teams on Laptop A)
   // + Physical Microphone (Laptop B / Mobile B external speaker audio) with zero feedback echo.
@@ -1885,8 +1856,7 @@ export function SoftwareOverlay({
     setListenMode(hasLoopback ? "tab" : "mic");
     setMonitorAudio(true);
 
-    const flushRecorder = startChunkedRecorder(finalStream, 4);
-    attachAudioMeter(finalStream, false, flushRecorder);
+    attachAudioMeter(finalStream, false);
     setStatusNotice(
       hasLoopback && hasMic
         ? "Monitor ON — Zoom/Meet Loopback + Mic Live. Answers stream in 1–2s."
@@ -1897,7 +1867,6 @@ export function SoftwareOverlay({
   }, [
     attachAudioMeter,
     refreshAudioInputDevices,
-    startChunkedRecorder,
     stopAudioListening,
     stopScreenStream,
   ]);
@@ -1948,8 +1917,7 @@ export function SoftwareOverlay({
       isListeningRef.current = true;
       setIsListening(true);
       setListenMode("tab");
-      const flushRecorder = startChunkedRecorder(audioOnly, 6);
-      attachAudioMeter(audioOnly, false, flushRecorder);
+      attachAudioMeter(audioOnly, false);
     }
 
     const videoEl = hiddenVideoRef.current;
@@ -1958,7 +1926,7 @@ export function SoftwareOverlay({
     await videoEl.play();
     await new Promise((r) => setTimeout(r, 250));
     return videoEl;
-  }, [attachAudioMeter, startChunkedRecorder, stopScreenStream]);
+  }, [attachAudioMeter, stopScreenStream]);
 
   const snapshotVideoFrame = (videoEl: HTMLVideoElement): string | null => {
     if (!videoEl.videoWidth || !videoEl.videoHeight) return null;
@@ -2174,15 +2142,11 @@ export function SoftwareOverlay({
       return;
     }
 
-    const activeRec = mediaRecorderRef.current;
-    if (activeRec && activeRec.state === "recording") {
-      activeRec.onstop = () => {
-        void transcribeRecordedChunks(true);
-      };
-      activeRec.stop();
-      if (audioStreamRef.current) {
-        startChunkedRecorder(audioStreamRef.current, 5);
-      }
+    if (
+      flushPcmUtteranceRef.current &&
+      speechPcmRef.current.length > 0
+    ) {
+      flushPcmUtteranceRef.current(true);
       return;
     }
 
@@ -2201,9 +2165,7 @@ export function SoftwareOverlay({
     askQuestion,
     interimText,
     questionInput,
-    startChunkedRecorder,
     startSelectedAudioSource,
-    transcribeRecordedChunks,
   ]);
 
   // Reconnect (Alt+R) — sync remaining quota & pull the latest live Vercel deployment cleanly
