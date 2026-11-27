@@ -1931,7 +1931,6 @@ export function SoftwareOverlay({
 
     const acquiredStreams: MediaStream[] = [];
     let hasLoopback = false;
-    let hasMic = false;
 
     // 1) Try Electron/Browser System Loopback Audio (Zoom / Google Meet / Teams incoming call audio)
     try {
@@ -1978,7 +1977,6 @@ export function SoftwareOverlay({
       }
       void refreshAudioInputDevices();
       acquiredStreams.push(micStream);
-      hasMic = true;
       setMicDiagError(null);
     } catch (err) {
       console.warn("[Crackpilot Audio] Mic capture unavailable in dual mode:", err);
@@ -2809,8 +2807,10 @@ export function SoftwareOverlay({
             <span className="text-xs font-semibold tracking-tight text-slate-100 whitespace-nowrap shrink-0">
               Crackpilot
             </span>
-            <span className="rounded bg-slate-800/90 border border-slate-700/70 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-[#b4f416] whitespace-nowrap shrink-0">
-              v1.0.7
+            <span className="inline-flex items-center gap-1 rounded bg-slate-800/90 border border-slate-700/70 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-[#b4f416] whitespace-nowrap shrink-0">
+              <span>v1.0.7</span>
+              <span className="text-slate-500">•</span>
+              <span className="text-emerald-300 font-normal">live</span>
             </span>
             {profile.dsaModeEnabled && (
               <span className="hidden sm:inline-flex items-center gap-1 rounded border border-[#b4f416]/50 bg-[#b4f416]/15 px-1.5 py-0.5 font-mono text-[10px] font-bold text-[#b4f416] whitespace-nowrap">
@@ -3101,8 +3101,10 @@ export function SoftwareOverlay({
                     <h2 className="text-base font-semibold text-white">
                       Authenticate Crackpilot
                     </h2>
-                    <span className="rounded bg-slate-800 px-1.5 py-0.5 font-mono text-[10px] text-[#b4f416]">
-                      v1.0.7
+                    <span className="inline-flex items-center gap-1 rounded bg-slate-800 px-1.5 py-0.5 font-mono text-[10px] text-[#b4f416]">
+                      <span>v1.0.7</span>
+                      <span className="text-slate-500">•</span>
+                      <span className="text-emerald-300">live</span>
                     </span>
                   </div>
                   <p className="text-xs text-slate-400">

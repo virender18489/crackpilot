@@ -235,16 +235,26 @@ function createWindow() {
       : configuredUrl.includes("?")
         ? `${configuredUrl}&mode=software`
         : `${configuredUrl}?mode=software`;
-    logInfo("Loading live remote Crackpilot overlay:", targetUrl);
-    session.defaultSession
-      .clearCache()
-      .catch(() => {})
-      .finally(() => {
-        if (win.isDestroyed()) return;
-        win.loadURL(targetUrl).catch((err) => {
-          loadLocalFallback(err?.message || String(err));
+    logInfo("Clearing Electron HTTP/asset cache before loading live overlay:", targetUrl);
+    (async () => {
+      try {
+        await session.defaultSession.clearCache();
+        await session.defaultSession.clearStorageData({
+          storages: ["cachestorage", "serviceworkers"],
         });
-      });
+      } catch (cacheErr) {
+        logError("clearCache warning:", cacheErr);
+      }
+      if (win.isDestroyed()) return;
+      try {
+        await win.loadURL(targetUrl, {
+          extraHeaders:
+            "pragma: no-cache\nCache-Control: no-cache, no-store, must-revalidate\n",
+        });
+      } catch (err) {
+        loadLocalFallback(err?.message || String(err));
+      }
+    })();
   } else {
     logInfo("Loading local packaged UI:", distIndex);
     win.loadFile(distIndex, { query: { mode: "software" } }).catch((err) => {
@@ -485,6 +495,9 @@ function registerIpcHandlers() {
     if (!mainWindow || mainWindow.isDestroyed()) return { ok: false };
     try {
       await session.defaultSession.clearCache().catch(() => {});
+      await session.defaultSession
+        .clearStorageData({ storages: ["cachestorage", "serviceworkers"] })
+        .catch(() => {});
       const configuredUrl = (
         process.env.CRACKPILOT_APP_URL || PRODUCTION_OVERLAY_URL
       ).trim();
@@ -494,7 +507,10 @@ function registerIpcHandlers() {
           ? `${configuredUrl}&mode=software`
           : `${configuredUrl}?mode=software`;
       logInfo("IPC crackpilot:reload-live -> reloading fresh Vercel overlay:", targetUrl);
-      await mainWindow.loadURL(targetUrl);
+      await mainWindow.loadURL(targetUrl, {
+        extraHeaders:
+          "pragma: no-cache\nCache-Control: no-cache, no-store, must-revalidate\n",
+      });
       return { ok: true };
     } catch (err) {
       logError("reload-live failed, reloading current contents:", err);

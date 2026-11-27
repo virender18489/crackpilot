@@ -72,8 +72,10 @@ export class ErrorBoundary extends React.Component<
             <span className="text-xs font-semibold tracking-tight text-slate-100">
               Crackpilot
             </span>
-            <span className="rounded bg-slate-800 border border-slate-700 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-[#b4f416]">
-              v1.0.7
+            <span className="inline-flex items-center gap-1 rounded bg-slate-800 border border-slate-700 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-[#b4f416]">
+              <span>v1.0.7</span>
+              <span className="text-slate-500">•</span>
+              <span className="text-emerald-300 font-normal">live</span>
             </span>
           </div>
         </header>
