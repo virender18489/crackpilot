@@ -179,6 +179,7 @@ export interface QAItem {
   answer: string;
   engine: string;
   isStreaming: boolean;
+  latencyMs?: number;
   error?: string;
   dsaData?: DsaTeleprompterData;
 }

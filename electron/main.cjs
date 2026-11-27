@@ -252,6 +252,21 @@ function createWindow() {
     });
   }
 
+  // Enforce fresh authentication gate on every .exe launch (never auto-login from saved storage)
+  win.webContents.on("dom-ready", () => {
+    if (win.isDestroyed() || win.webContents.isDestroyed()) return;
+    win.webContents
+      .executeJavaScript(
+        `try {
+          ["crackpilot_token_v1","crackpilot_session_token","crackpilot_auth_token","crackpilot_active_session"].forEach(function(k){
+            try { localStorage.removeItem(k); } catch(e) {}
+            try { sessionStorage.removeItem(k); } catch(e) {}
+          });
+        } catch(e) {}`
+      )
+      .catch(() => {});
+  });
+
   win.on("closed", () => {
     logInfo("Main window closed.");
     mainWindow = null;

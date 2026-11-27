@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
+  ArrowUp,
   Camera,
   Check,
   Code2,
@@ -49,6 +50,7 @@ import {
 } from "../lib/api";
 import {
   clearActiveProblemContextClient,
+  clearOverlayAuthStorage,
   fetchTokenQuota,
   probeBackendHealth,
   resetBackendHealthCache,
@@ -120,13 +122,16 @@ function formatTimer(totalSeconds: number): string {
 }
 
 export function SoftwareOverlay({
-  tokenState,
+  tokenState: _externalTokenState,
   profile,
   onTokenChange,
   onProfileChange,
   onGoDashboard,
 }: SoftwareOverlayProps) {
-  // Token auth gate state
+  // STRICT MANDATORY AUTH GATE: Always boot unauthenticated (no auto-login from localStorage/sessionStorage)
+  const [isAuthenticated, setIsAuthenticated] = useState<boolean>(false);
+  const [activeSessionToken, setActiveSessionToken] =
+    useState<SessionTokenState | null>(null);
   const [tokenInput, setTokenInput] = useState("");
   const [verifyingToken, setVerifyingToken] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
@@ -179,24 +184,14 @@ export function SoftwareOverlay({
   const [statusNotice, setStatusNotice] = useState<string | null>(null);
   const [audioLevel, setAudioLevel] = useState(0);
 
-  // Session counters & live Admin quota state
-  const [secondsLeft, setSecondsLeft] = useState(
-    () => tokenState?.quota?.remainingSeconds ?? 240 * 60
-  );
-  const [promptsUsed, setPromptsUsed] = useState(
-    () => tokenState?.quota?.promptsUsed ?? 0
-  );
-  const [maxPrompts, setMaxPrompts] = useState(
-    () => tokenState?.quota?.promptLimit ?? 80
-  );
-  const [capturesUsed, setCapturesUsed] = useState(
-    () => tokenState?.quota?.capturesUsed ?? 0
-  );
-  const [captureLimit, setCaptureLimit] = useState(
-    () => tokenState?.quota?.captureLimit ?? 80
-  );
+  // Session counters & live Admin quota state (initialized cleanly; populated after token authentication)
+  const [secondsLeft, setSecondsLeft] = useState(240 * 60);
+  const [promptsUsed, setPromptsUsed] = useState(0);
+  const [maxPrompts, setMaxPrompts] = useState(80);
+  const [capturesUsed, setCapturesUsed] = useState(0);
+  const [captureLimit, setCaptureLimit] = useState(80);
   const [quotaBlockedReason, setQuotaBlockedReason] = useState<string | null>(
-    () => tokenState?.quota?.blockedReason ?? null
+    null
   );
 
   const [questionInput, setQuestionInput] = useState("");
@@ -267,6 +262,9 @@ export function SoftwareOverlay({
   const [liveTranscript, setLiveTranscript] = useState("");
   const [liveSpeechSeconds, setLiveSpeechSeconds] = useState(0);
   const [isSpeechDetected, setIsSpeechDetected] = useState(false);
+  const [showJumpToTop, setShowJumpToTop] = useState(false);
+  const [hasUnseenLatest, setHasUnseenLatest] = useState(false);
+  const isAtTopRef = useRef<boolean>(true);
 
   const isEngineRunningRef = useRef(false);
   const isListeningRef = useRef(false);
@@ -276,8 +274,8 @@ export function SoftwareOverlay({
   const qaListRef = useRef(qaList);
   const videoDurationRef = useRef(videoDurationSec);
   const glitchDurationRef = useRef(glitchDurationSec);
-  const sessionActiveRef = useRef(Boolean(tokenState?.sessionActive));
-  const tokenStateRef = useRef<SessionTokenState | null>(tokenState);
+  const sessionActiveRef = useRef(false);
+  const tokenStateRef = useRef<SessionTokenState | null>(null);
   const quotaBlockedReasonRef = useRef<string | null>(quotaBlockedReason);
   const activeProblemContextRef = useRef<ActiveProblemContext | null>(
     activeProblemContext
@@ -305,11 +303,19 @@ export function SoftwareOverlay({
   glitchActiveRef.current = glitchCountdown > 0;
   videoDurationRef.current = videoDurationSec;
   glitchDurationRef.current = glitchDurationSec;
-  sessionActiveRef.current = Boolean(tokenState?.sessionActive);
-  tokenStateRef.current = tokenState;
+  sessionActiveRef.current = Boolean(isAuthenticated && activeSessionToken);
+  tokenStateRef.current = isAuthenticated ? activeSessionToken : null;
   quotaBlockedReasonRef.current = quotaBlockedReason;
   activeProblemContextRef.current = activeProblemContext;
   selectedAudioInputRef.current = selectedAudioInput;
+
+  // Strictly wipe any stale persisted auth tokens on every fresh SoftwareOverlay mount
+  useEffect(() => {
+    clearOverlayAuthStorage();
+    setIsAuthenticated(false);
+    setActiveSessionToken(null);
+    onTokenChange(null);
+  }, [onTokenChange]);
 
   const applyQuotaSnapshot = useCallback(
     (quota: AccountQuotaSnapshot) => {
@@ -331,22 +337,24 @@ export function SoftwareOverlay({
           curTok.quota.promptsUsed !== quota.promptsUsed ||
           curTok.quota.status !== quota.status)
       ) {
-        onTokenChange({ ...curTok, quota });
+        const updatedTok = { ...curTok, quota };
+        setActiveSessionToken(updatedTok);
+        onTokenChange(updatedTok);
       }
     },
     [onTokenChange]
   );
 
   useEffect(() => {
-    if (tokenState?.quota) {
-      setSecondsLeft(tokenState.quota.remainingSeconds);
-      setPromptsUsed(tokenState.quota.promptsUsed);
-      setMaxPrompts(tokenState.quota.promptLimit);
-      setCapturesUsed(tokenState.quota.capturesUsed);
-      setCaptureLimit(tokenState.quota.captureLimit);
-      setQuotaBlockedReason(tokenState.quota.blockedReason);
+    if (isAuthenticated && activeSessionToken?.quota) {
+      setSecondsLeft(activeSessionToken.quota.remainingSeconds);
+      setPromptsUsed(activeSessionToken.quota.promptsUsed);
+      setMaxPrompts(activeSessionToken.quota.promptLimit);
+      setCapturesUsed(activeSessionToken.quota.capturesUsed);
+      setCaptureLimit(activeSessionToken.quota.captureLimit);
+      setQuotaBlockedReason(activeSessionToken.quota.blockedReason);
     }
-  }, [tokenState?.quota]);
+  }, [isAuthenticated, activeSessionToken?.quota]);
 
   // Enumerate available microphone input devices for the Audio Input Selector
   const refreshAudioInputDevices = useCallback(async () => {
@@ -400,21 +408,28 @@ export function SoftwareOverlay({
       ? window.location.origin
       : DEFAULT_PRODUCTION_API_URL);
 
-  const isAuthenticated = Boolean(tokenState?.authenticated);
-  const isSessionLive = isAuthenticated;
+  const isSessionLive = Boolean(isAuthenticated && activeSessionToken);
 
   // Verify token submitted by user and jump directly into the main workspace (timer PAUSED, audio Standby)
   const handleVerifyToken = async (e: React.FormEvent) => {
     e.preventDefault();
     setAuthError(null);
-    if (!tokenInput.trim()) {
-      setAuthError("Please paste the token generated in Dashboard → Overview.");
+    const trimmedToken = tokenInput.trim();
+    if (!trimmedToken) {
+      setAuthError(
+        "Please enter your Session Token Key from Dashboard → Overview."
+      );
       return;
     }
 
     setVerifyingToken(true);
     try {
-      const data = await verifySessionToken(tokenInput.trim());
+      const data = await verifySessionToken(trimmedToken);
+      const verifiedToken: SessionTokenState = {
+        ...data.token,
+        authenticated: true,
+        sessionActive: true,
+      };
 
       // Always land directly on the main workspace with timer PAUSED & audio in Standby (Monitor: OFF)
       if (countdownTimerRef.current !== null) {
@@ -426,12 +441,18 @@ export function SoftwareOverlay({
       setMonitorAudio(false);
       setIsListening(false);
       setIsConnected(true);
+      setQuotaBlockedReason(verifiedToken.quota?.blockedReason ?? null);
+      if (verifiedToken.quota) {
+        setSecondsLeft(verifiedToken.quota.remainingSeconds);
+        setPromptsUsed(verifiedToken.quota.promptsUsed);
+        setMaxPrompts(verifiedToken.quota.promptLimit);
+        setCapturesUsed(verifiedToken.quota.capturesUsed);
+        setCaptureLimit(verifiedToken.quota.captureLimit);
+      }
 
-      onTokenChange({
-        ...data.token,
-        authenticated: true,
-        sessionActive: true,
-      });
+      setActiveSessionToken(verifiedToken);
+      setIsAuthenticated(true);
+      onTokenChange(verifiedToken);
       if (data.profile) {
         onProfileChange(data.profile);
       }
@@ -440,8 +461,12 @@ export function SoftwareOverlay({
       void startLiveSession().catch(() => {});
     } catch (err) {
       console.error("[Crackpilot Overlay] Token authentication failed:", err);
+      setIsAuthenticated(false);
+      setActiveSessionToken(null);
       setAuthError(
-        err instanceof Error ? err.message : "Could not authenticate token."
+        err instanceof Error
+          ? err.message
+          : "Invalid, expired, or blocked session token."
       );
     } finally {
       setVerifyingToken(false);
@@ -597,13 +622,13 @@ export function SoftwareOverlay({
 
   // Hydrate exact remaining balance from backend on session launch without starting countdown
   useEffect(() => {
-    if (!isSessionLive || !tokenState?.token) return;
-    void fetchTokenQuota(tokenState.token).then((res) => {
+    if (!isSessionLive || !activeSessionToken?.token) return;
+    void fetchTokenQuota(activeSessionToken.token).then((res) => {
       if (res.ok) {
         applyQuotaSnapshot(res.quota);
       }
     });
-  }, [isSessionLive, tokenState?.token, applyQuotaSnapshot]);
+  }, [isSessionLive, activeSessionToken?.token, applyQuotaSnapshot]);
 
   // Real-time Server & AI Key Diagnostics (/api/health -> boolean readiness flags)
   const checkServerDiagnostics = useCallback(async () => {
@@ -722,7 +747,7 @@ export function SoftwareOverlay({
 
   // Background 20s quota sync with AdminStore (ONLY deducts elapsed seconds when Start actually ran)
   useEffect(() => {
-    if (!isSessionLive || !tokenState?.token) return;
+    if (!isSessionLive || !activeSessionToken?.token) return;
     const intervalId = window.setInterval(() => {
       const currentTok = tokenStateRef.current?.token;
       if (!currentTok) return;
@@ -747,29 +772,37 @@ export function SoftwareOverlay({
       });
     }, 20000);
     return () => window.clearInterval(intervalId);
-  }, [isSessionLive, tokenState?.token, applyQuotaSnapshot]);
+  }, [isSessionLive, activeSessionToken?.token, applyQuotaSnapshot]);
 
-  // Smooth auto-scroll when Scroll: ON
+  // 100% Free, non-hijacking scroll tracking:
+  // Never force-scroll when the user is reading older answers down the feed.
+  const handleFeedScroll = useCallback(() => {
+    const el = feedRef.current;
+    if (!el) return;
+    const nearTop = el.scrollTop < 60;
+    isAtTopRef.current = nearTop;
+    setShowJumpToTop(!nearTop);
+    if (nearTop) {
+      setHasUnseenLatest(false);
+    }
+  }, []);
+
+  const jumpToLatestTop = useCallback(() => {
+    if (feedRef.current) {
+      feedRef.current.scrollTo({ top: 0, behavior: "smooth" });
+    }
+    isAtTopRef.current = true;
+    setShowJumpToTop(false);
+    setHasUnseenLatest(false);
+  }, []);
+
+  // Only keep anchored at top when the user is ALREADY near the top (< 60px) and Scroll: ON
   useEffect(() => {
     if (!autoScroll || !feedRef.current) return;
-    feedRef.current.scrollTo({
-      top: feedRef.current.scrollHeight,
-      behavior: "smooth",
-    });
-  }, [qaList, interimText, liveTranscript, autoScroll]);
-
-  useEffect(() => {
-    if (!autoScroll) return;
-    const id = window.setInterval(() => {
-      const el = feedRef.current;
-      if (!el) return;
-      const remaining = el.scrollHeight - el.scrollTop - el.clientHeight;
-      if (remaining > 4) {
-        el.scrollTop += Math.min(remaining, 18);
-      }
-    }, 120);
-    return () => window.clearInterval(id);
-  }, [autoScroll]);
+    if (isAtTopRef.current && feedRef.current.scrollTop < 60) {
+      feedRef.current.scrollTop = 0;
+    }
+  }, [qaList.length, autoScroll]);
 
   useEffect(() => {
     if (monitorGainRef.current) {
@@ -836,6 +869,9 @@ export function SoftwareOverlay({
         );
         return;
       }
+
+      const requestStartedAt = performance.now();
+      let firstTokenRecorded = false;
 
       try {
         const resp = await fetch(targetUrl, {
@@ -916,6 +952,14 @@ export function SoftwareOverlay({
               }
               if (payload.dsaData) {
                 const dsaPayload = payload.dsaData;
+                let measuredLatency: number | undefined;
+                if (!firstTokenRecorded) {
+                  firstTokenRecorded = true;
+                  measuredLatency = Math.max(
+                    1,
+                    Math.round(performance.now() - requestStartedAt)
+                  );
+                }
                 setActiveProblemContext(dsaPayload.problemContext);
                 activeProblemContextRef.current = dsaPayload.problemContext;
                 setQaList((prev) =>
@@ -925,15 +969,34 @@ export function SoftwareOverlay({
                           ...q,
                           question: `${dsaPayload.problemContext.title} (${dsaPayload.problemContext.preferredLanguage})`,
                           dsaData: dsaPayload,
+                          ...(measuredLatency !== undefined
+                            ? { latencyMs: measuredLatency }
+                            : {}),
                         }
                       : q
                   )
                 );
               }
               if (payload.chunk) {
+                let measuredLatency: number | undefined;
+                if (!firstTokenRecorded) {
+                  firstTokenRecorded = true;
+                  measuredLatency = Math.max(
+                    1,
+                    Math.round(performance.now() - requestStartedAt)
+                  );
+                }
                 setQaList((prev) =>
                   prev.map((q) =>
-                    q.id === qaId ? { ...q, answer: q.answer + payload.chunk } : q
+                    q.id === qaId
+                      ? {
+                          ...q,
+                          answer: q.answer + payload.chunk,
+                          ...(measuredLatency !== undefined
+                            ? { latencyMs: measuredLatency }
+                            : {}),
+                        }
+                      : q
                   )
                 );
               }
@@ -1019,8 +1082,8 @@ export function SoftwareOverlay({
       setPromptsUsed((c) => Math.min(maxPrompts, c + 1));
 
       const qaId = `qa-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+      // Newest-first reverse stack order: push latest Q&A to the very top
       setQaList((prev) => [
-        ...prev,
         {
           id: qaId,
           timestamp: formatNow(),
@@ -1029,12 +1092,17 @@ export function SoftwareOverlay({
           engine: "AI",
           isStreaming: true,
         },
+        ...prev,
       ]);
+      if (!isAtTopRef.current) {
+        setHasUnseenLatest(true);
+      }
 
       const cur = profileRef.current;
       const recentHistory = qaListRef.current
         .filter((q) => q.id !== "system-init" && !q.isStreaming && q.answer)
-        .slice(-3)
+        .slice(0, 3)
+        .reverse()
         .map((q) => ({ question: q.question, answer: q.answer }));
 
       await streamAnswerFromEndpoint(
@@ -1093,13 +1161,7 @@ export function SoftwareOverlay({
             profile?: TargetProfile;
             activeProblemContext?: ActiveProblemContext | null;
           };
-          // Keep fresh Desktop .exe launch at Gate 1 (do not auto-skip from initial "connected" snapshot)
-          if (
-            data.token !== undefined &&
-            !(isDesktopApp() && data.type === "connected")
-          ) {
-            onTokenChange(data.token);
-          }
+          // NEVER auto-authenticate or overwrite activeSessionToken from SSE broadcasts
           if (data.type === "dsa_problem_updated" && data.activeProblemContext) {
             setActiveProblemContext(data.activeProblemContext);
             activeProblemContextRef.current = data.activeProblemContext;
@@ -1116,7 +1178,8 @@ export function SoftwareOverlay({
           if (
             data.type === "quota_updated" &&
             data.quota &&
-            (!data.tokenValue || data.tokenValue === tokenStateRef.current?.token)
+            tokenStateRef.current?.token &&
+            (!data.tokenValue || data.tokenValue === tokenStateRef.current.token)
           ) {
             applyQuotaSnapshot(data.quota);
           }
@@ -1166,18 +1229,18 @@ export function SoftwareOverlay({
       console.error("[Crackpilot Overlay SSE] Failed to open EventSource:", err);
       return false;
     }
-  }, [askQuestion, onProfileChange, onTokenChange]);
+  }, [applyQuotaSnapshot, askQuestion, onProfileChange]);
 
   useEffect(() => {
     const unsubLocal = subscribeLocalSync((msg) => {
-      if (msg.token !== undefined) onTokenChange(msg.token);
+      // Only sync target profile silently; NEVER bypass authentication via BroadcastChannel
       if (msg.profile) onProfileChange(msg.profile);
     });
     return () => {
       unsubLocal();
       sseRef.current?.close();
     };
-  }, [onProfileChange, onTokenChange]);
+  }, [onProfileChange]);
 
   useEffect(() => {
     const onOffline = () => {
@@ -1300,13 +1363,46 @@ export function SoftwareOverlay({
   }, []);
 
   const rebuildLiveTranscript = useCallback(() => {
-    const merged = Array.from(orderedChunkTextsRef.current.entries())
+    const orderedChunks = Array.from(orderedChunkTextsRef.current.entries())
       .sort((a, b) => a[0] - b[0])
       .map(([, txt]) => txt.trim())
-      .filter(Boolean)
-      .join(" ")
-      .replace(/\s+/g, " ")
-      .trim();
+      .filter(Boolean);
+
+    const normalizeWord = (w: string) =>
+      w.toLowerCase().replace(/^[^\w]+|[^\w]+$/g, "");
+
+    const accWords: string[] = [];
+    for (const chunk of orderedChunks) {
+      const nextWords = chunk.split(/\s+/).filter(Boolean);
+      if (nextWords.length === 0) continue;
+
+      // Boundary deduplication: strip up to 3 overlapping words between adjacent chunks
+      // so phrases like "multiple multiple" never duplicate across 3s micro-chunk boundaries
+      let overlap = 0;
+      const maxCheck = Math.min(3, accWords.length, nextWords.length);
+      for (let k = maxCheck; k >= 1; k--) {
+        let allMatch = true;
+        for (let i = 0; i < k; i++) {
+          const prevW = normalizeWord(accWords[accWords.length - k + i]);
+          const currW = normalizeWord(nextWords[i]);
+          if (!prevW || prevW !== currW) {
+            allMatch = false;
+            break;
+          }
+        }
+        if (allMatch) {
+          overlap = k;
+          break;
+        }
+      }
+
+      const trimmedNext = nextWords.slice(overlap);
+      for (const w of trimmedNext) {
+        accWords.push(w);
+      }
+    }
+
+    const merged = accWords.join(" ").replace(/\s+/g, " ").trim();
     liveTranscriptRef.current = merged;
     setLiveTranscript(merged);
     return merged;
@@ -1397,7 +1493,7 @@ export function SoftwareOverlay({
       const transcribeUrl = `${apiUrl("/api/transcribe")}?${qs}`;
 
       try {
-        // Send complete self-contained binary .wav Blob (~469KB per 15s rolling chunk, well below Vercel 4.5MB limit)
+        // Send complete self-contained binary .wav Blob (~94KB per 3s micro-chunk, well below Vercel 4.5MB limit)
         const resp = await fetch(transcribeUrl, {
           method: "POST",
           headers: {
@@ -1477,9 +1573,9 @@ export function SoftwareOverlay({
     [commitPendingAnswerIfReady]
   );
 
-  // Unified Web Audio API 16kHz Mono PCM Rolling Utterance Capture + 60fps AnalyserNode Level Meter
-  // Slices continuous 4-10+ minute speech into rolling 15-second WAV chunks (~469KB each), appending live text
-  // into the active Q box and triggering the AI answer after a 2.2s pause (or instantly via "Answer Now").
+  // Unified Web Audio API 16kHz Mono PCM Micro-Chunk Capture + Adaptive Noise Floor + 60fps AnalyserNode Meter
+  // Calibrates ambient noise floor during the first 300ms, slices continuous speech into strictly non-overlapping
+  // 3-second WAV micro-chunks (~94KB each) for instant live text, and triggers AI answer after an 850ms silence pause.
   const attachAudioMeter = useCallback(
     (audioStream: MediaStream, monitor: boolean) => {
       try {
@@ -1529,14 +1625,21 @@ export function SoftwareOverlay({
         preRollPcmRef.current = [];
         speechPcmRef.current = [];
 
-        const ROLLING_CHUNK_MS = 15_000; // 15s rolling WAV chunks (~469 KB) -> supports 4-10+ minute questions
-        const PAUSE_TRIGGER_MS = 2_200; // 2.2s silence pause at end of question triggers AI answer
+        const ROLLING_CHUNK_MS = 3_000; // Strictly non-overlapping 3s WAV micro-chunks (~94 KB each)
+        const PAUSE_TRIGGER_MS = 850; // Fast 850ms silence pause triggers sub-second AI streaming
 
-        // Keep ~0.45s pre-roll so the very first syllable of each question is never clipped
+        // Compact ~0.25s pre-roll ONLY prepended on silence -> speech transition (cleared immediately, zero overlap)
         const maxPreRollFrames = Math.max(
-          2,
-          Math.ceil((ctx.sampleRate * 0.45) / 4096)
+          1,
+          Math.ceil((ctx.sampleRate * 0.25) / 4096)
         );
+
+        // Adaptive room/speaker ambient noise floor calibration (first 300ms + gentle idle tracking)
+        const calibrationEndsAt = Date.now() + 300;
+        let isCalibratingNoise = true;
+        let noiseSampleSum = 0;
+        let noiseSampleCount = 0;
+        let noiseFloorRms = 0.008;
 
         const flushSpeechToWav = (opts?: {
           isFinalFlush?: boolean;
@@ -1550,6 +1653,7 @@ export function SoftwareOverlay({
             setIsSpeechDetected(false);
           }
 
+          // Strictly non-overlapping slice: splice out all buffered frames so nothing is re-sent
           const frames = speechPcmRef.current.splice(0);
           chunkStartedAtRef.current = Date.now();
 
@@ -1621,7 +1725,37 @@ export function SoftwareOverlay({
           const rms = Math.sqrt(sumSq / frameCopy.length);
           const now = Date.now();
 
-          if (rms > 0.011) {
+          // Phase 1: 300ms ambient noise floor calibration so room/speaker hum never sticks "Speech detected"
+          if (isCalibratingNoise) {
+            noiseSampleSum += rms;
+            noiseSampleCount += 1;
+            preRollPcmRef.current.push(frameCopy);
+            if (preRollPcmRef.current.length > maxPreRollFrames) {
+              preRollPcmRef.current.shift();
+            }
+            if (now >= calibrationEndsAt) {
+              const avgAmbient =
+                noiseSampleCount > 0 ? noiseSampleSum / noiseSampleCount : 0.008;
+              noiseFloorRms = Math.min(0.045, Math.max(0.004, avgAmbient));
+              isCalibratingNoise = false;
+            }
+            return;
+          }
+
+          // Dynamic hysteresis thresholds above calibrated ambient floor
+          const speechStartThreshold = Math.min(
+            0.14,
+            Math.max(0.018, noiseFloorRms * 2.5 + 0.008)
+          );
+          const speechSustainThreshold = Math.min(
+            0.11,
+            Math.max(0.014, noiseFloorRms * 2.0 + 0.006)
+          );
+          const activeThreshold = speechActiveRef.current
+            ? speechSustainThreshold
+            : speechStartThreshold;
+
+          if (rms > activeThreshold) {
             if (pauseTriggerTimerRef.current !== null) {
               window.clearTimeout(pauseTriggerTimerRef.current);
               pauseTriggerTimerRef.current = null;
@@ -1633,13 +1767,14 @@ export function SoftwareOverlay({
               if (speechSessionStartedAtRef.current === 0) {
                 speechSessionStartedAtRef.current = now;
               }
-              speechPcmRef.current = [...preRollPcmRef.current, frameCopy];
+              const preRoll = preRollPcmRef.current.splice(0);
+              speechPcmRef.current = [...preRoll, frameCopy];
             } else {
               speechPcmRef.current.push(frameCopy);
             }
             lastSpeechAtRef.current = now;
 
-            // Rolling 15-second WAV chunk slice during long continuous speech (4-10+ min questions)
+            // Non-overlapping 3-second live micro-chunk slice during continuous speech
             if (now - chunkStartedAtRef.current >= ROLLING_CHUNK_MS) {
               flushSpeechToWav({ isFinalFlush: false, fastMode: false });
             }
@@ -1649,13 +1784,18 @@ export function SoftwareOverlay({
             const chunkMs = now - chunkStartedAtRef.current;
 
             if (silenceMs >= PAUSE_TRIGGER_MS) {
-              // 2.2-second pause at end of question -> flush trailing audio and trigger AI answer immediately
+              // Fast 850ms silence pause -> flush trailing audio and stream AI answer immediately
               flushSpeechToWav({ isFinalFlush: true, fastMode: false });
             } else if (chunkMs >= ROLLING_CHUNK_MS) {
-              // Still within a brief breath pause inside a long question -> slice rolling 15s chunk
+              // Brief breath pause inside continuous speech -> slice 3s non-overlapping micro-chunk
               flushSpeechToWav({ isFinalFlush: false, fastMode: false });
             }
           } else {
+            // Gently adapt ambient floor while silent so AC/fan/speaker hum never triggers false speech
+            noiseFloorRms = Math.min(
+              0.045,
+              Math.max(0.004, noiseFloorRms * 0.96 + rms * 0.04)
+            );
             preRollPcmRef.current.push(frameCopy);
             if (preRollPcmRef.current.length > maxPreRollFrames) {
               preRollPcmRef.current.shift();
@@ -1803,7 +1943,7 @@ export function SoftwareOverlay({
                 setInterimText("");
               }
 
-              // Reset 2.2-second pause timer on every live word so 4-10 minute questions accumulate smoothly
+              // Reset 850ms silence trigger on every live word for fast response after speech ends
               if (pauseTriggerTimerRef.current !== null) {
                 window.clearTimeout(pauseTriggerTimerRef.current);
               }
@@ -1811,7 +1951,7 @@ export function SoftwareOverlay({
                 pauseTriggerTimerRef.current = window.setTimeout(() => {
                   pendingFinalizeRef.current = { fastMode: false };
                   commitPendingAnswerIfReady();
-                }, 2200);
+                }, 850);
               }
             };
 
@@ -2200,7 +2340,6 @@ export function SoftwareOverlay({
         const isDsa = Boolean(cur.dsaModeEnabled);
         const qaId = `cap-${Date.now()}`;
         setQaList((prev) => [
-          ...prev,
           {
             id: qaId,
             timestamp: formatNow(),
@@ -2213,7 +2352,11 @@ export function SoftwareOverlay({
             engine: isDsa ? "DSA Vision" : "Vision",
             isStreaming: true,
           },
+          ...prev,
         ]);
+        if (!isAtTopRef.current) {
+          setHasUnseenLatest(true);
+        }
 
         await streamAnswerFromEndpoint(qaId, "/api/analyze-screen", {
           token: tokenStateRef.current?.token,
@@ -2305,7 +2448,6 @@ export function SoftwareOverlay({
 
           const qaId = `vid-${Date.now()}`;
           setQaList((prev) => [
-            ...prev,
             {
               id: qaId,
               timestamp: formatNow(),
@@ -2314,7 +2456,11 @@ export function SoftwareOverlay({
               engine: "Video AI",
               isStreaming: true,
             },
+            ...prev,
           ]);
+          if (!isAtTopRef.current) {
+            setHasUnseenLatest(true);
+          }
 
           void streamAnswerFromEndpoint(qaId, "/api/analyze-video", {
             token: tokenStateRef.current?.token,
@@ -2362,9 +2508,7 @@ export function SoftwareOverlay({
       return;
     }
 
-    const lastRealQa = [...qaListRef.current]
-      .reverse()
-      .find((q) => q.id !== "system-init");
+    const lastRealQa = qaListRef.current.find((q) => q.id !== "system-init");
     if (lastRealQa && !isListeningRef.current) {
       await askQuestion(lastRealQa.question, true);
       return;
@@ -2560,21 +2704,32 @@ export function SoftwareOverlay({
     }
   }, [connectEventStream, pauseEngineSession, startSelectedAudioSource]);
 
-  // Disconnect (Disconnect button, Cross × icon, or Alt+D)
+  // Disconnect (Disconnect button, Cross × icon, or Alt+D) — strictly reset auth state & return to Authenticate Crackpilot screen
   const handleDisconnect = useCallback(() => {
     pauseEngineSession("Session Disconnected.");
     stopScreenStream();
-    setIsConnected(false);
-    const currentTok = tokenStateRef.current;
-    if (currentTok) {
-      onTokenChange({ ...currentTok, sessionActive: false });
+    if (sseRef.current) {
+      sseRef.current.close();
+      sseRef.current = null;
     }
+    flushElapsedSeconds();
+    clearOverlayAuthStorage();
+    setIsConnected(false);
+    setIsAuthenticated(false);
+    setActiveSessionToken(null);
+    tokenStateRef.current = null;
+    sessionActiveRef.current = false;
+    setTokenInput("");
+    setAuthError(null);
+    setShowLiveQaBench(false);
+    setShowContextPanel(false);
+    onTokenChange(null);
     void stopLiveSession();
-  }, [onTokenChange, pauseEngineSession, stopScreenStream]);
+  }, [flushElapsedSeconds, onTokenChange, pauseEngineSession, stopScreenStream]);
 
   disconnectSessionRef.current = handleDisconnect;
 
-  // Pause timer whenever Electron minimizes/hides the window or browser tab is minimized/hidden
+  // Pause timer on minimize/hide AND strictly wipe auth state on beforeunload / window close
   useEffect(() => {
     const onVisibilityChange = () => {
       if (document.hidden && isEngineRunningRef.current) {
@@ -2585,6 +2740,11 @@ export function SoftwareOverlay({
     };
     const onBeforeUnload = () => {
       flushElapsedSeconds();
+      clearOverlayAuthStorage();
+      setIsAuthenticated(false);
+      setActiveSessionToken(null);
+      tokenStateRef.current = null;
+      sessionActiveRef.current = false;
     };
     document.addEventListener("visibilitychange", onVisibilityChange);
     window.addEventListener("beforeunload", onBeforeUnload);
@@ -2673,9 +2833,12 @@ export function SoftwareOverlay({
       const next = typeof forceOn === "boolean" ? forceOn : !prev;
       if (next && feedRef.current) {
         feedRef.current.scrollTo({
-          top: feedRef.current.scrollHeight,
+          top: 0,
           behavior: "smooth",
         });
+        isAtTopRef.current = true;
+        setShowJumpToTop(false);
+        setHasUnseenLatest(false);
       }
       return next;
     });
@@ -2936,19 +3099,21 @@ export function SoftwareOverlay({
             >
               <MoreHorizontal className="h-4 w-4" />
             </button>
-            <button
-              type="button"
-              onClick={() => setShowLiveQaBench((v) => !v)}
-              title="Dual-Pipeline Ultra-Low-Latency Live Audio Q&A (Deepgram+Groq vs Gemini Live)"
-              className={`app-no-drag inline-flex items-center gap-1 rounded-md border px-2 py-1 text-[11px] font-semibold transition-colors cursor-pointer ${
-                showLiveQaBench
-                  ? "border-[#c6f527]/60 bg-[#1a2610] text-[#c6f527]"
-                  : "border-slate-700/80 bg-slate-800/70 text-slate-300 hover:text-white"
-              }`}
-            >
-              <Zap className="h-3 w-3 text-[#c6f527]" />
-              <span>Live A/B</span>
-            </button>
+            {isSessionLive && (
+              <button
+                type="button"
+                onClick={() => setShowLiveQaBench((v) => !v)}
+                title="Dual-Pipeline Ultra-Low-Latency Live Audio Q&A (Deepgram+Groq vs Gemini Live)"
+                className={`app-no-drag inline-flex items-center gap-1 rounded-md border px-2 py-1 text-[11px] font-semibold transition-colors cursor-pointer ${
+                  showLiveQaBench
+                    ? "border-[#c6f527]/60 bg-[#1a2610] text-[#c6f527]"
+                    : "border-slate-700/80 bg-slate-800/70 text-slate-300 hover:text-white"
+                }`}
+              >
+                <Zap className="h-3 w-3 text-[#c6f527]" />
+                <span>Live A/B</span>
+              </button>
+            )}
           </div>
 
           {/* Right Drag Spacer */}
@@ -3176,15 +3341,15 @@ export function SoftwareOverlay({
           </div>
         )}
 
-        {/* Dual-Pipeline Ultra-Low-Latency Live Audio Q&A Panel */}
-        {showLiveQaBench && (
+        {/* Dual-Pipeline Ultra-Low-Latency Live Audio Q&A Panel (Strictly gated behind authentication) */}
+        {isSessionLive && showLiveQaBench && (
           <div className="shrink-0 max-h-[75vh] overflow-y-auto hud-scroll border-b border-slate-700/70 bg-[#080d17]/98 p-3">
             <LiveAudioQAEngine compact />
           </div>
         )}
 
-        {/* GATE 1: Token Authentication Screen */}
-        {!isAuthenticated ? (
+        {/* MANDATORY AUTHENTICATION GATE: Block main Q&A workspace and control bar until isAuthenticated === true */}
+        {!isSessionLive ? (
           <div className="flex-1 flex items-center justify-center p-6">
             <form
               onSubmit={handleVerifyToken}
@@ -3252,193 +3417,225 @@ export function SoftwareOverlay({
         ) : (
           /* ACTIVE LIVE HUD OVERLAY — Opens directly after token auth (Timer PAUSED, Monitor OFF until Start) */
           <>
-            {/* Scrollable Q&A Stream Feed */}
-            <div
-              ref={feedRef}
-              className="hud-scroll flex-1 overflow-y-auto px-4 py-4 space-y-3"
-            >
-              {qaList.map((item) => (
-                <article
-                  key={item.id}
-                  className="rounded-xl border border-slate-700/60 bg-[#0e1525]/92 px-5 py-4 shadow-lg"
+            {/* Scrollable Q&A Stream Feed (Newest-First Stack + Top-Pinned Live Listening + Free Scroll) */}
+            <div className="relative flex-1 min-h-0 flex flex-col">
+              {showJumpToTop && (
+                <button
+                  type="button"
+                  onClick={jumpToLatestTop}
+                  className={`absolute top-3 right-5 z-20 inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-semibold shadow-xl backdrop-blur-md transition-all cursor-pointer ${
+                    hasUnseenLatest
+                      ? "border-[#b4f416]/70 bg-[#b4f416] text-slate-950 hover:bg-[#c8ff3d]"
+                      : "border-sky-400/50 bg-[#0f192d]/95 text-sky-100 hover:bg-[#162440]"
+                  }`}
                 >
-                  <div className="flex items-start justify-between gap-3">
-                    <div className="flex items-start gap-2.5 min-w-0">
-                      <span
-                        style={{ fontSize: `${questionFontPx}px` }}
-                        className="mt-0.5 font-mono font-bold text-sky-400 shrink-0"
-                      >
+                  <ArrowUp className="h-3.5 w-3.5" />
+                  <span>{hasUnseenLatest ? "New Answer · Jump to Top" : "Latest Answer"}</span>
+                </button>
+              )}
+
+              <div
+                ref={feedRef}
+                onScroll={handleFeedScroll}
+                className="hud-scroll flex-1 overflow-y-auto px-4 py-4 space-y-3"
+              >
+                {/* Pinned Real-Time Live Transcribed Q Card at the VERY TOP */}
+                {(liveTranscript ||
+                  interimText ||
+                  isTranscribing ||
+                  isSpeechDetected ||
+                  (isListening && audioLevel >= 14)) && (
+                  <div className="rounded-xl border border-sky-400/50 bg-[#0f192d]/95 px-4 py-3 text-xs text-sky-100 flex items-start justify-between gap-3 shadow-lg">
+                    <div className="flex items-start gap-2.5 min-w-0 flex-1">
+                      <span className="mt-0.5 font-mono text-sm font-bold text-sky-400 shrink-0">
                         Q
                       </span>
-                      <h2
-                        style={{ fontSize: `${questionFontPx}px` }}
-                        className="font-semibold text-white leading-snug break-words"
-                      >
-                        {item.question}
-                      </h2>
-                    </div>
-
-                    <div className="flex items-center gap-1.5 shrink-0">
-                      {item.id !== "system-init" && item.answer && (
-                        <button
-                          type="button"
-                          onClick={() => handleSpeakCard(item)}
-                          title="Read aloud"
-                          className={`inline-flex items-center gap-1 rounded-md border px-2 py-1 text-[11px] font-medium transition-colors cursor-pointer ${
-                            speakingId === item.id
-                              ? "border-sky-500/50 bg-sky-500/20 text-sky-200"
-                              : "border-slate-700/80 bg-[#172136] text-slate-300 hover:text-white"
-                          }`}
-                        >
-                          <Volume2 className="h-3 w-3" />
-                        </button>
-                      )}
-                      <button
-                        type="button"
-                        onClick={() => void handleCopyCard(item)}
-                        className="inline-flex items-center gap-1.5 rounded-md border border-slate-700/80 bg-[#172136] px-2.5 py-1 text-[11px] font-medium text-slate-200 hover:bg-slate-700/80 transition-colors cursor-pointer"
-                      >
-                        {copiedId === item.id ? (
-                          <Check className="h-3 w-3 text-emerald-400" />
-                        ) : (
-                          <Copy className="h-3 w-3 text-slate-400" />
-                        )}
-                        <span>{copiedId === item.id ? "Copied" : "Copy"}</span>
-                      </button>
-                    </div>
-                  </div>
-
-                  <div className="mt-2.5 flex items-start gap-2.5">
-                    <span
-                      style={{ fontSize: `${fontSizePx}px` }}
-                      className="mt-0.5 font-mono font-bold text-rose-400 shrink-0"
-                    >
-                      A
-                    </span>
-                    <div className="flex-1 min-w-0">
-                      {item.error ? (
-                        <p className="text-xs text-rose-300">{item.error}</p>
-                      ) : item.dsaData ? (
-                        <DsaTeleprompterView
-                          data={item.dsaData}
-                          fontSizePx={fontSizePx}
-                        />
-                      ) : item.answer ? (
-                        <AnswerView
-                          markdown={item.answer}
-                          isStreaming={item.isStreaming}
-                          fontSizePx={fontSizePx}
-                        />
-                      ) : (
-                        <p className="text-xs text-slate-400">
-                          {profile.dsaModeEnabled
-                            ? "Parsing problem & preparing structured DSA teleprompter..."
-                            : "Generating personalized human answer..."}
-                        </p>
-                      )}
-                    </div>
-                  </div>
-                </article>
-              ))}
-
-              {/* Real-Time Live Transcribed Q Preview (supports rolling 4-10+ minute questions + instant Answer Now) */}
-              {(liveTranscript ||
-                interimText ||
-                isTranscribing ||
-                isSpeechDetected ||
-                (isListening && audioLevel >= 14)) && (
-                <div className="rounded-xl border border-sky-400/50 bg-[#0f192d]/95 px-4 py-3 text-xs text-sky-100 flex items-start justify-between gap-3">
-                  <div className="flex items-start gap-2.5 min-w-0 flex-1">
-                    <span className="mt-0.5 font-mono text-sm font-bold text-sky-400 shrink-0">
-                      Q
-                    </span>
-                    <div className="min-w-0 flex-1">
-                      <div className="flex flex-wrap items-center gap-2 mb-1">
-                        <span className="inline-flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-wider text-sky-300">
-                          <span className="h-1.5 w-1.5 rounded-full bg-[#b4f416] animate-pulse" />
-                          {isTranscribing
-                            ? "Transcribing live chunk..."
-                            : "Live Listening (15s rolling)"}
-                        </span>
-                        {liveSpeechSeconds > 0 && (
-                          <span className="rounded bg-slate-800/90 px-1.5 py-0.5 font-mono text-[10px] text-[#b4f416] tabular-nums">
-                            {Math.floor(liveSpeechSeconds / 60)}:
-                            {String(liveSpeechSeconds % 60).padStart(2, "0")}
+                      <div className="min-w-0 flex-1">
+                        <div className="flex flex-wrap items-center gap-2 mb-1">
+                          <span className="inline-flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-wider text-sky-300">
+                            <span className="h-1.5 w-1.5 rounded-full bg-[#b4f416] animate-pulse" />
+                            {isTranscribing
+                              ? "Transcribing live chunk..."
+                              : "LIVE LISTENING (3s micro-chunks)"}
                           </span>
-                        )}
+                          {liveSpeechSeconds > 0 && (
+                            <span className="rounded bg-slate-800/90 px-1.5 py-0.5 font-mono text-[10px] text-[#b4f416] tabular-nums">
+                              {Math.floor(liveSpeechSeconds / 60)}:
+                              {String(liveSpeechSeconds % 60).padStart(2, "0")}
+                            </span>
+                          )}
+                        </div>
+                        <p className="max-h-36 overflow-y-auto hud-scroll font-medium text-sky-100 leading-relaxed break-words">
+                          {[liveTranscript, interimText].filter(Boolean).join(" ") ||
+                            (isTranscribing
+                              ? "Transcribing spoken question..."
+                              : "Speech detected — capturing interviewer question...")}
+                        </p>
+                        <p className="mt-1 text-[10px] font-mono text-sky-300/75">
+                          Auto-answers after 0.85s pause, or click Answer Now anytime
+                        </p>
                       </div>
-                      <p className="max-h-36 overflow-y-auto hud-scroll font-medium text-sky-100 leading-relaxed break-words">
-                        {[liveTranscript, interimText].filter(Boolean).join(" ") ||
-                          (isTranscribing
-                            ? "Transcribing spoken question..."
-                            : "Speech detected — capturing interviewer question...")}
-                      </p>
-                      <p className="mt-1 text-[10px] font-mono text-sky-300/75">
-                        Auto-answers after 2.2s pause, or click Answer Now anytime during long questions
-                      </p>
                     </div>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => handleAnswerNow(false)}
-                    className="shrink-0 rounded-md border border-[#b4f416]/60 bg-[#b4f416]/20 px-3 py-1.5 text-[11px] font-semibold text-[#d9ff66] hover:bg-[#b4f416]/30 transition-colors cursor-pointer"
-                  >
-                    Answer Now
-                  </button>
-                </div>
-              )}
-
-              {/* Active Glitch Offline / Video Scan / Status Banners */}
-              {glitchCountdown > 0 && (
-                <div className="rounded-xl border border-amber-500/45 bg-amber-950/75 px-4 py-2.5 text-xs text-amber-200 flex items-center justify-between">
-                  <span className="inline-flex items-center gap-2 font-medium">
-                    <WifiOff className="h-4 w-4 text-amber-400" />
-                    <span>
-                      Glitch Active: Internet paused — auto-restoring in{" "}
-                      <strong className="font-mono text-white">
-                        {glitchCountdown}s
-                      </strong>
-                    </span>
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => void handleReconnect()}
-                    className="rounded bg-amber-500/25 px-2 py-0.5 text-[11px] font-semibold text-amber-100 hover:bg-amber-500/40 cursor-pointer"
-                  >
-                    Restore Now
-                  </button>
-                </div>
-              )}
-
-              {videoScanCountdown > 0 && (
-                <div className="rounded-xl border border-sky-500/50 bg-sky-950/75 px-4 py-2.5 text-xs text-sky-200 flex items-center justify-between">
-                  <span className="inline-flex items-center gap-2 font-medium">
-                    <Video className="h-4 w-4 text-sky-400" />
-                    <span>
-                      Recording Page Video Scan: scroll through questions now —{" "}
-                      <strong className="font-mono text-white">
-                        {videoScanCountdown}s left
-                      </strong>{" "}
-                      ({videoFramesCount} frames captured)
-                    </span>
-                  </span>
-                </div>
-              )}
-
-              {statusNotice &&
-                glitchCountdown === 0 &&
-                videoScanCountdown === 0 && (
-                  <div className="rounded-lg border border-slate-700/70 bg-[#0d1424]/90 px-3.5 py-2 text-xs text-slate-300 flex items-center justify-between gap-2">
-                    <span>{statusNotice}</span>
                     <button
                       type="button"
-                      onClick={() => setStatusNotice(null)}
-                      className="text-slate-400 hover:text-white cursor-pointer"
+                      onClick={() => handleAnswerNow(false)}
+                      className="shrink-0 rounded-md border border-[#b4f416]/60 bg-[#b4f416]/20 px-3 py-1.5 text-[11px] font-semibold text-[#d9ff66] hover:bg-[#b4f416]/30 transition-colors cursor-pointer"
                     >
-                      <X className="h-3.5 w-3.5" />
+                      Answer Now
                     </button>
                   </div>
                 )}
+
+                {/* Active Glitch Offline / Video Scan / Status Banners */}
+                {glitchCountdown > 0 && (
+                  <div className="rounded-xl border border-amber-500/45 bg-amber-950/75 px-4 py-2.5 text-xs text-amber-200 flex items-center justify-between">
+                    <span className="inline-flex items-center gap-2 font-medium">
+                      <WifiOff className="h-4 w-4 text-amber-400" />
+                      <span>
+                        Glitch Active: Internet paused — auto-restoring in{" "}
+                        <strong className="font-mono text-white">
+                          {glitchCountdown}s
+                        </strong>
+                      </span>
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => void handleReconnect()}
+                      className="rounded bg-amber-500/25 px-2 py-0.5 text-[11px] font-semibold text-amber-100 hover:bg-amber-500/40 cursor-pointer"
+                    >
+                      Restore Now
+                    </button>
+                  </div>
+                )}
+
+                {videoScanCountdown > 0 && (
+                  <div className="rounded-xl border border-sky-500/50 bg-sky-950/75 px-4 py-2.5 text-xs text-sky-200 flex items-center justify-between">
+                    <span className="inline-flex items-center gap-2 font-medium">
+                      <Video className="h-4 w-4 text-sky-400" />
+                      <span>
+                        Recording Page Video Scan: scroll through questions now —{" "}
+                        <strong className="font-mono text-white">
+                          {videoScanCountdown}s left
+                        </strong>{" "}
+                        ({videoFramesCount} frames captured)
+                      </span>
+                    </span>
+                  </div>
+                )}
+
+                {statusNotice &&
+                  glitchCountdown === 0 &&
+                  videoScanCountdown === 0 && (
+                    <div className="rounded-lg border border-slate-700/70 bg-[#0d1424]/90 px-3.5 py-2 text-xs text-slate-300 flex items-center justify-between gap-2">
+                      <span>{statusNotice}</span>
+                      <button
+                        type="button"
+                        onClick={() => setStatusNotice(null)}
+                        className="text-slate-400 hover:text-white cursor-pointer"
+                      >
+                        <X className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
+                  )}
+
+                {/* Q&A Cards in Newest-First (Reverse Chronological) Order */}
+                {qaList.map((item) => (
+                  <article
+                    key={item.id}
+                    className="rounded-xl border border-slate-700/60 bg-[#0e1525]/92 px-5 py-4 shadow-lg"
+                  >
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="flex items-start gap-2.5 min-w-0">
+                        <span
+                          style={{ fontSize: `${questionFontPx}px` }}
+                          className="mt-0.5 font-mono font-bold text-sky-400 shrink-0"
+                        >
+                          Q
+                        </span>
+                        <h2
+                          style={{ fontSize: `${questionFontPx}px` }}
+                          className="font-semibold text-white leading-snug break-words"
+                        >
+                          {item.question}
+                        </h2>
+                      </div>
+
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        {typeof item.latencyMs === "number" && (
+                          <span
+                            className={`inline-flex items-center gap-1 rounded-md border px-2 py-0.5 font-mono text-[10px] font-semibold tabular-nums ${
+                              item.latencyMs < 1000
+                                ? "border-[#b4f416]/45 bg-[#b4f416]/15 text-[#d9ff66]"
+                                : "border-sky-500/40 bg-sky-500/15 text-sky-200"
+                            }`}
+                            title="Time to first streamed answer token"
+                          >
+                            <Zap className="h-2.5 w-2.5" />
+                            <span>{item.latencyMs}ms</span>
+                          </span>
+                        )}
+                        {item.id !== "system-init" && item.answer && (
+                          <button
+                            type="button"
+                            onClick={() => handleSpeakCard(item)}
+                            title="Read aloud"
+                            className={`inline-flex items-center gap-1 rounded-md border px-2 py-1 text-[11px] font-medium transition-colors cursor-pointer ${
+                              speakingId === item.id
+                                ? "border-sky-500/50 bg-sky-500/20 text-sky-200"
+                                : "border-slate-700/80 bg-[#172136] text-slate-300 hover:text-white"
+                            }`}
+                          >
+                            <Volume2 className="h-3 w-3" />
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => void handleCopyCard(item)}
+                          className="inline-flex items-center gap-1.5 rounded-md border border-slate-700/80 bg-[#172136] px-2.5 py-1 text-[11px] font-medium text-slate-200 hover:bg-slate-700/80 transition-colors cursor-pointer"
+                        >
+                          {copiedId === item.id ? (
+                            <Check className="h-3 w-3 text-emerald-400" />
+                          ) : (
+                            <Copy className="h-3 w-3 text-slate-400" />
+                          )}
+                          <span>{copiedId === item.id ? "Copied" : "Copy"}</span>
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="mt-2.5 flex items-start gap-2.5">
+                      <span
+                        style={{ fontSize: `${fontSizePx}px` }}
+                        className="mt-0.5 font-mono font-bold text-rose-400 shrink-0"
+                      >
+                        A
+                      </span>
+                      <div className="flex-1 min-w-0">
+                        {item.error ? (
+                          <p className="text-xs text-rose-300">{item.error}</p>
+                        ) : item.dsaData ? (
+                          <DsaTeleprompterView
+                            data={item.dsaData}
+                            fontSizePx={fontSizePx}
+                          />
+                        ) : item.answer ? (
+                          <AnswerView
+                            markdown={item.answer}
+                            isStreaming={item.isStreaming}
+                            fontSizePx={fontSizePx}
+                          />
+                        ) : (
+                          <p className="text-xs text-slate-400">
+                            {profile.dsaModeEnabled
+                              ? "Parsing problem & preparing structured DSA teleprompter..."
+                              : "Generating personalized human answer..."}
+                          </p>
+                        )}
+                      </div>
+                    </div>
+                  </article>
+                ))}
+              </div>
             </div>
 
             {/* Bottom Docked Input + Telemetry Strip + 2-Row HUD Controls */}

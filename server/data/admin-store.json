@@ -2,6 +2,25 @@
   "adminCredential": null,
   "accounts": [
     {
+      "id": "acc-154d849c",
+      "token": "CP-B14D36-C78DDA-C4D9",
+      "label": "Candidate Session",
+      "email": "",
+      "accountType": "REGULAR",
+      "planType": "Starter",
+      "paymentStatus": "Pending",
+      "status": "Active",
+      "remainingSeconds": 14400,
+      "totalMinutesGranted": 240,
+      "capturesUsed": 0,
+      "captureLimit": 80,
+      "promptsUsed": 0,
+      "promptLimit": 80,
+      "createdAt": "2026-11-27T14:19:33.671Z",
+      "expiresAt": "2026-11-29T14:19:33.671Z",
+      "lastActiveAt": null
+    },
+    {
       "id": "acc-776e7c0d",
       "token": "CP-B173D2-42A59F-6FFA",
       "label": "Candidate Session",

@@ -6,6 +6,7 @@ import { LoginView } from "./components/LoginView";
 import { SoftwareOverlay } from "./components/SoftwareOverlay";
 import { apiUrl, isDesktopApp } from "./lib/api";
 import {
+  clearOverlayAuthStorage,
   hydrateWorkspaceState,
   logoutAccount,
   probeBackendHealth,
@@ -80,16 +81,26 @@ export default function App() {
     return () => window.removeEventListener("popstate", onPopState);
   }, []);
 
-  // Hydrate auth, token, and target profile safely from backend or local storage
+  // Hydrate target profile silently on startup, NEVER auto-authenticating the software overlay
   useEffect(() => {
     let active = true;
     const desktop = isDesktopApp();
+    const startsInSoftware = desktop || getViewFromLocation() === "software";
 
-    void hydrateWorkspaceState(DEFAULT_PROFILE)
+    if (startsInSoftware) {
+      clearOverlayAuthStorage();
+      setTokenState(null);
+    }
+
+    void hydrateWorkspaceState(DEFAULT_PROFILE, {
+      skipAuthToken: startsInSoftware,
+    })
       .then((state) => {
         if (!active) return;
         if (state.user) setUser(state.user);
-        if (state.token) setTokenState(state.token);
+        if (!startsInSoftware && state.token) {
+          setTokenState(state.token);
+        }
         if (state.profile) setProfile(sanitizeProfile(state.profile));
       })
       .catch((err) => {
@@ -97,7 +108,9 @@ export default function App() {
       });
 
     const unsubLocal = subscribeLocalSync((msg) => {
-      if (msg.token !== undefined) setTokenState(msg.token);
+      if (msg.token !== undefined && !startsInSoftware) {
+        setTokenState(msg.token);
+      }
       if (msg.profile) setProfile(sanitizeProfile(msg.profile));
     });
 
@@ -118,11 +131,8 @@ export default function App() {
               quota?: AccountQuotaSnapshot;
               profile?: TargetProfile;
             };
-            // On fresh Desktop .exe boot, never auto-skip Gate 1 from initial "connected" payload
-            if (
-              msg.token !== undefined &&
-              !(desktop && msg.type === "connected")
-            ) {
+            // Never auto-authenticate the software overlay via SSE broadcast on launch
+            if (msg.token !== undefined && !startsInSoftware) {
               setTokenState(msg.token);
             }
             if (msg.type === "quota_updated" && msg.quota && msg.tokenValue) {

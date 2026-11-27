@@ -6,6 +6,7 @@ export const DEFAULT_GROQ_CHAT_MODEL = "llama-3.1-8b-instant";
 
 export const PREFERRED_GROQ_MODELS = [
   "llama-3.1-8b-instant",
+  "meta-llama/llama-4-scout-17b-16e-instruct",
   "openai/gpt-oss-20b",
   "openai/gpt-oss-120b",
 ] as const;
@@ -131,6 +132,18 @@ export async function streamGroqChatCompletion(
 
   for (let i = 0; i < modelsToTry.length; i++) {
     const model = modelsToTry[i];
+    const isGptOssReasoning = /^openai\/gpt-oss/i.test(model);
+    const requestPayload: Record<string, unknown> = {
+      model,
+      stream: true,
+      temperature: params.temperature ?? 0.35,
+      max_tokens: params.maxTokens ?? 1400,
+      messages: params.messages,
+    };
+    if (isGptOssReasoning) {
+      requestPayload.reasoning_effort = "low";
+    }
+
     const upstream = await fetch(GROQ_CHAT_COMPLETIONS_URL, {
       method: "POST",
       headers: {
@@ -138,13 +151,7 @@ export async function streamGroqChatCompletion(
         "Content-Type": "application/json",
       },
       signal: params.signal,
-      body: JSON.stringify({
-        model,
-        stream: true,
-        temperature: params.temperature ?? 0.35,
-        max_tokens: params.maxTokens ?? 1400,
-        messages: params.messages,
-      }),
+      body: JSON.stringify(requestPayload),
     });
 
     if (!upstream.ok || !upstream.body) {

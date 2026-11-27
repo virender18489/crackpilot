@@ -1399,7 +1399,7 @@ async function startServer() {
             { role: "user", content: userPrompt },
           ],
           temperature: 0.35,
-          maxTokens: 1400,
+          maxTokens: isCodeReq || isDsaFollowUp ? 1400 : 360,
           onMeta: (model) => {
             sendEvent({ meta: { engine: "groq", model } });
           },

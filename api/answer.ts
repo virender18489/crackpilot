@@ -235,7 +235,7 @@ export default async function handler(
           { role: "user", content: userPrompt },
         ],
         temperature: 0.35,
-        maxTokens: 1400,
+        maxTokens: isCodeReq || useDsaFollowUp ? 1400 : 360,
         onMeta: (model) => {
           sendEvent({ meta: { engine: "groq", model } });
         },

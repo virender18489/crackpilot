@@ -81,6 +81,30 @@ function writeStorage<T>(key: string, value: T | null): void {
   }
 }
 
+// Strictly clear all persisted software overlay auth tokens so every fresh app/.exe launch
+// or Disconnect forces the user through the "Authenticate Crackpilot" screen.
+export function clearOverlayAuthStorage(): void {
+  if (typeof window === "undefined") return;
+  const authKeys = [
+    STORAGE_KEYS.token,
+    "crackpilot_session_token",
+    "crackpilot_auth_token",
+    "crackpilot_active_session",
+  ];
+  for (const key of authKeys) {
+    try {
+      window.localStorage.removeItem(key);
+    } catch {
+      // Ignore storage access errors
+    }
+    try {
+      window.sessionStorage.removeItem(key);
+    } catch {
+      // Ignore storage access errors
+    }
+  }
+}
+
 export function broadcastLocalSync(payload: SyncPayload): void {
   if (typeof window === "undefined") return;
   try {
@@ -257,12 +281,18 @@ export async function probeBackendHealth(force = false): Promise<boolean> {
   return inflightHealthProbe;
 }
 
-export async function hydrateWorkspaceState(defaultProfile: TargetProfile): Promise<{
+export async function hydrateWorkspaceState(
+  defaultProfile: TargetProfile,
+  options?: { skipAuthToken?: boolean }
+): Promise<{
   user: UserAccount | null;
   token: SessionTokenState | null;
   profile: TargetProfile;
 }> {
-  const savedLocalToken = readStorage<SessionTokenState>(STORAGE_KEYS.token);
+  const skipAuthToken = Boolean(options?.skipAuthToken);
+  const savedLocalToken = skipAuthToken
+    ? null
+    : readStorage<SessionTokenState>(STORAGE_KEYS.token);
   const res = await tryApiJson<{
     user?: UserAccount | null;
     token?: SessionTokenState | null;
@@ -271,16 +301,13 @@ export async function hydrateWorkspaceState(defaultProfile: TargetProfile): Prom
 
   if (res.reachable && res.ok) {
     const user = res.data.user ?? readStorage<UserAccount>(STORAGE_KEYS.user);
-    const serverToken = res.data.token;
-    const rawToken =
-      serverToken?.authenticated
-        ? serverToken
-        : savedLocalToken?.authenticated
-          ? savedLocalToken
-          : serverToken ?? savedLocalToken;
-    const token = rawToken?.authenticated
-      ? { ...rawToken, sessionActive: true }
-      : rawToken ?? null;
+    const rawToken = skipAuthToken
+      ? null
+      : res.data.token ?? savedLocalToken ?? null;
+    // Never auto-authenticate the software overlay from stale storage/boot snapshots
+    const token = rawToken
+      ? { ...rawToken, authenticated: false, sessionActive: false }
+      : null;
     const profile = normalizeProfileRecord(
       res.data.profile ?? readStorage<TargetProfile>(STORAGE_KEYS.profile),
       defaultProfile
@@ -291,13 +318,14 @@ export async function hydrateWorkspaceState(defaultProfile: TargetProfile): Prom
     return { user, token, profile };
   }
 
-  const fallbackToken = savedLocalToken?.authenticated
-    ? { ...savedLocalToken, sessionActive: true }
-    : savedLocalToken;
+  const fallbackToken =
+    !skipAuthToken && savedLocalToken
+      ? { ...savedLocalToken, authenticated: false, sessionActive: false }
+      : null;
 
   return {
     user: readStorage<UserAccount>(STORAGE_KEYS.user),
-    token: fallbackToken ?? null,
+    token: fallbackToken,
     profile: normalizeProfileRecord(
       readStorage<TargetProfile>(STORAGE_KEYS.profile),
       defaultProfile
@@ -383,14 +411,22 @@ export async function generateSessionToken(): Promise<SessionTokenState> {
   return localToken;
 }
 
+const STRICT_SESSION_TOKEN_REGEX =
+  /^(CP|DEMO)-[A-Z0-9]{4,}(?:-[A-Z0-9]{3,}){1,3}$/i;
+const TOKEN_MAX_AGE_MS = 48 * 60 * 60 * 1000;
+
 export async function verifySessionToken(submittedToken: string): Promise<{
   token: SessionTokenState;
   profile?: TargetProfile;
 }> {
   const submitted = submittedToken.trim();
   if (!submitted) {
-    throw new Error("Please paste the token generated in Dashboard → Overview.");
+    throw new Error(
+      "Please enter your Session Token Key from Dashboard → Overview."
+    );
   }
+
+  const validFormat = STRICT_SESSION_TOKEN_REGEX.test(submitted);
 
   const res = await tryApiJson<{
     token?: SessionTokenState;
@@ -404,65 +440,79 @@ export async function verifySessionToken(submittedToken: string): Promise<{
 
   if (res.reachable) {
     if (!res.ok || !res.data.token) {
-      const msg = res.data.error || "Token verification failed.";
+      const msg =
+        res.data.error ||
+        "Invalid, expired, or blocked session token. Please check Dashboard → Overview.";
       console.error("[Crackpilot Token] /api/token/verify rejected:", res.status, msg);
       throw new Error(msg);
+    }
+    if (res.data.token.quota?.blockedReason) {
+      throw new Error(res.data.token.quota.blockedReason);
+    }
+    if (
+      res.data.token.quota &&
+      typeof res.data.token.quota.remainingSeconds === "number" &&
+      res.data.token.quota.remainingSeconds <= 0
+    ) {
+      throw new Error(
+        "This session token has expired or has no remaining session time."
+      );
     }
     const readyToken: SessionTokenState = {
       ...res.data.token,
       authenticated: true,
       sessionActive: true,
     };
-    writeStorage(STORAGE_KEYS.token, readyToken);
+    // Keep profile synced silently, but NEVER persist authenticated session token in localStorage/sessionStorage
     if (res.data.profile) writeStorage(STORAGE_KEYS.profile, res.data.profile);
-    broadcastLocalSync({
-      type: "token_authenticated",
-      token: readyToken,
-      profile: res.data.profile,
-    });
     return { token: readyToken, profile: res.data.profile };
   }
 
-  const stored = readStorage<SessionTokenState>(STORAGE_KEYS.token);
-  const validFormat = /^(CP|DEMO)-[A-Z0-9-]{6,}$/i.test(submitted);
+  // Fallback validation when serverless deployment does not host /api/token/verify
+  if (!validFormat) {
+    console.error("[Crackpilot Token] Token format validation failed:", submitted);
+    throw new Error(
+      "Invalid Session Token Key format. Enter a valid token (e.g. CP-XXXXXX-XXXXXX-XXXX) from Dashboard → Overview."
+    );
+  }
 
-  // In Desktop .exe standalone mode, accept any freshly generated CP-... token from Dashboard
-  if (isDesktopApp()) {
-    if (!validFormat) {
-      console.error("[Crackpilot Token] Desktop standalone format validation failed:", submitted);
+  const stored = readStorage<SessionTokenState>(STORAGE_KEYS.token);
+  if (stored && stored.token === submitted) {
+    if (stored.quota?.blockedReason) {
+      throw new Error(stored.quota.blockedReason);
+    }
+    if (
+      stored.quota &&
+      typeof stored.quota.remainingSeconds === "number" &&
+      stored.quota.remainingSeconds <= 0
+    ) {
       throw new Error(
-        "Invalid token format. Copy your CP-XXXX-XXXX-XXXX token from Dashboard → Overview."
+        "This session token has expired or has no remaining session time."
       );
     }
-  } else {
-    if (stored && submitted !== stored.token) {
-      console.error("[Crackpilot Token] Local web token mismatch.");
+    const createdAtMs = Date.parse(stored.createdAt);
+    if (Number.isFinite(createdAtMs) && Date.now() - createdAtMs > TOKEN_MAX_AGE_MS) {
       throw new Error(
-        "Invalid token. Copy the exact token from Dashboard → Overview."
+        "This 48-hour session token has expired. Generate a fresh token in Dashboard → Overview."
       );
     }
-    if (!stored && !validFormat) {
-      console.error("[Crackpilot Token] Local web token missing/invalid format.");
-      throw new Error(
-        "Invalid token format. Generate a token in Dashboard → Overview first."
-      );
-    }
+  } else if (!isDesktopApp() && stored && submitted !== stored.token) {
+    console.error("[Crackpilot Token] Local web token mismatch.");
+    throw new Error(
+      "Invalid token. Copy the exact token from Dashboard → Overview."
+    );
   }
 
   const verified: SessionTokenState = {
     token: submitted,
-    createdAt: new Date().toISOString(),
+    createdAt: stored?.token === submitted ? stored.createdAt : new Date().toISOString(),
     authenticated: true,
     sessionActive: true,
+    quota: stored?.token === submitted ? stored.quota : undefined,
   };
   const savedProfile = readStorage<TargetProfile>(STORAGE_KEYS.profile) ?? undefined;
-  writeStorage(STORAGE_KEYS.token, verified);
-  broadcastLocalSync({
-    type: "token_authenticated",
-    token: verified,
-    profile: savedProfile,
-  });
-  console.info("[Crackpilot Token] Authenticated locally:", submitted);
+  // Do NOT persist authenticated=true to localStorage so every fresh launch requires login
+  console.info("[Crackpilot Token] Authenticated for active in-memory session:", submitted);
   return { token: verified, profile: savedProfile };
 }
 
@@ -482,39 +532,23 @@ export async function startLiveSession(): Promise<{
       console.error("[Crackpilot Session] /api/session/start rejected:", res.status, msg);
       throw new Error(msg);
     }
-    writeStorage(STORAGE_KEYS.token, res.data.token);
-    broadcastLocalSync({
-      type: "session_started",
-      token: res.data.token,
-      profile: res.data.profile,
-    });
     return { token: res.data.token, profile: res.data.profile };
   }
 
-  const stored = readStorage<SessionTokenState>(STORAGE_KEYS.token);
-  if (!stored || !stored.authenticated) {
-    console.error("[Crackpilot Session] Attempted start without authenticated token.");
-    throw new Error("Authenticate your Crackpilot software token first.");
-  }
-  const active: SessionTokenState = { ...stored, sessionActive: true };
   const savedProfile = readStorage<TargetProfile>(STORAGE_KEYS.profile) ?? undefined;
-  writeStorage(STORAGE_KEYS.token, active);
-  broadcastLocalSync({
-    type: "session_started",
-    token: active,
-    profile: savedProfile,
-  });
-  return { token: active, profile: savedProfile };
+  const fallback: SessionTokenState = {
+    token: "",
+    createdAt: new Date().toISOString(),
+    authenticated: true,
+    sessionActive: true,
+  };
+  return { token: fallback, profile: savedProfile };
 }
 
 export async function stopLiveSession(): Promise<void> {
+  clearOverlayAuthStorage();
   await tryApiJson("/api/session/stop", { method: "POST" });
-  const stored = readStorage<SessionTokenState>(STORAGE_KEYS.token);
-  if (stored) {
-    const stopped: SessionTokenState = { ...stored, sessionActive: false };
-    writeStorage(STORAGE_KEYS.token, stopped);
-    broadcastLocalSync({ type: "session_stopped", token: stopped });
-  }
+  broadcastLocalSync({ type: "session_stopped", token: null });
 }
 
 export async function saveTargetProfile(
