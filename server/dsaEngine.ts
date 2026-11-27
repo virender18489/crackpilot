@@ -63,10 +63,10 @@ const ANTI_AI_HUMAN_RULES = [
 ].join("\n");
 
 const PRONUNCIATION_NORMALIZATION_RULE = [
-  "PRONUNCIATION & ACCENT AUTO-ADJUSTMENT (CRITICAL FOR LIVE INTERVIEWER AUDIO):",
-  "- The incoming question may come from live remote audio where the interviewer has a regional accent or slightly mispronounces technical/domain terms (e.g., 'eye dock' -> 'IDoc', 'bappy' -> 'BAPI', 's four hana' -> 'S/4HANA', 'cube netties' -> 'Kubernetes', 'red ducks' -> 'Redux', 'pie spark' -> 'PySpark', 'see quel' -> 'SQL', 'd b t' -> 'dbt', 'use affect' -> 'useEffect').",
-  "- ALWAYS silently interpret and adjust any phonetically close, garbled, or slightly mispronounced term based on the Candidate Target Role, Core Skills & Tech Stack, Resume, and Job Description.",
-  "- Answer the true intended domain question directly and accurately—NEVER mock, lecture, or draw attention to the interviewer's pronunciation.",
+  "SMART PHONETIC AUTO-CORRECTION & ACCENT NORMALIZATION (CRITICAL FOR LIVE SPEECH TRANSCRIPTS):",
+  "- The incoming question often comes from live speech-to-text (STT) with Indian English or regional accents that can produce phonetic typos or slightly garbled technical terms (for example: 'virtual dome and lingual dome' or 'real dome' -> 'Virtual DOM and Real DOM', 'Jawa Script' or 'java script' -> 'JavaScript', 'use affect' -> 'useEffect', 'use estate' -> 'useState', 'red ducks' -> 'Redux', 'hoist thing' -> 'Hoisting', 'closer' -> 'Closure', 'next js' -> 'Next.js', 'node js' -> 'Node.js', 'type script' -> 'TypeScript', 'eye dock' -> 'IDoc', 'bappy' -> 'BAPI', 's four hana' -> 'S/4HANA', 'cube netties' -> 'Kubernetes', 'pie spark' -> 'PySpark', 'see quel' -> 'SQL').",
+  "- ALWAYS silently infer the true intended technical interview question using the Candidate Target Role, Core Skills & Tech Stack, Resume, and Job Description, and answer the true intended concept directly in crisp, natural human spoken language.",
+  "- STRICTLY FORBIDDEN: NEVER mention, quote, point out, or complain about speech recognition typos or weird phrasing (for example, NEVER say 'There is no concept called lingual dome', 'You probably meant...', 'Assuming you mean...', 'I think there was a typo', or 'Did you mean...?'). Just answer the real technical question smoothly as if you heard it perfectly.",
 ].join("\n");
 
 export function buildHumanInterviewSystemPrompt(params: HumanPromptParams): string {

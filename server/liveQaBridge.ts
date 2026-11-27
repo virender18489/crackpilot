@@ -28,14 +28,14 @@ import {
   resolveActiveGroqChatModel,
   streamGroqChatCompletion,
 } from "./groqHelper.ts";
+import { buildDeepgramLiveWsUrl } from "./sttConfig.ts";
 
 export interface LiveQaContextProvider {
   getProfile: () => TargetProfile;
   getActiveProblem: () => ActiveProblemContext | null;
 }
 
-const DEEPGRAM_WS_URL =
-  "wss://api.deepgram.com/v1/listen?model=nova-3&encoding=linear16&sample_rate=16000&channels=1&smart_format=true&interim_results=true&endpointing=900&utterance_end_ms=1200";
+const DEEPGRAM_WS_URL = buildDeepgramLiveWsUrl("en-IN");
 const GEMINI_LIVE_MODEL = "gemini-3.8-live";
 
 function readCleanKey(name: string, placeholder?: string): string {

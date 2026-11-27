@@ -23,6 +23,10 @@ import {
   normalizeProgrammingLanguage,
 } from "./server/dsaEngine.ts";
 import { streamGroqChatCompletion } from "./server/groqHelper.ts";
+import {
+  transcribeWithDeepgramEnglish,
+  transcribeWithGroqWhisperEnglish,
+} from "./server/sttConfig.ts";
 import type {
   ActiveProblemContext,
   AnswerStyle,
@@ -1053,25 +1057,7 @@ async function startServer() {
     });
   });
 
-  app.post("/api/incoming-question", (req, res) => {
-    const { question, source = "system-audio" } = req.body as {
-      question?: string;
-      source?: string;
-    };
-    if (!question || !question.trim()) {
-      res.status(400).json({ error: "Missing question text." });
-      return;
-    }
-    broadcastEvent({
-      type: "incoming_question",
-      question: question.trim(),
-      source,
-      timestamp: new Date().toISOString(),
-    });
-    res.json({ ok: true, deliveredTo: sseClients.size });
-  });
-
-  // Audio Transcription (raw binary audio/wav or base64 JSON; Deepgram Nova-3 -> Groq Whisper -> OpenAI -> Gemini fallback)
+  // Audio Transcription (raw binary audio/wav or base64 JSON; strictly English-locked Deepgram Nova-3 + keyterms -> Groq Whisper -> OpenAI -> Gemini)
   app.post(
     "/api/transcribe",
     express.raw({ type: "audio/*", limit: "15mb" }),
@@ -1158,39 +1144,17 @@ async function startServer() {
         const geminiKey = cleanEnv("GEMINI_API_KEY");
         const errors: string[] = [];
 
-        // Tier 1: Deepgram Nova-3 (raw binary forwarding with matching Content-Type)
+        // Tier 1: Deepgram Nova-3 (strictly English en-IN -> en + technical keyterms)
         if (dgKey) {
           try {
-            const langParam =
-              language === "hi" ? "language=hi" : "detect_language=true";
-            const dgRes = await fetch(
-              `https://api.deepgram.com/v1/listen?model=nova-3&smart_format=true&punctuate=true&${langParam}`,
-              {
-                method: "POST",
-                headers: {
-                  Authorization: `Token ${dgKey}`,
-                  "Content-Type": cleanMime,
-                },
-                body: new Uint8Array(audioBuffer),
-              }
-            );
-            if (!dgRes.ok) {
-              const errText = await dgRes.text().catch(() => "");
-              throw new Error(
-                `Deepgram Nova-3 error (${dgRes.status}): ${errText.slice(0, 180)}`
-              );
-            }
-            const dgJson = (await dgRes.json()) as {
-              results?: {
-                channels?: Array<{
-                  alternatives?: Array<{ transcript?: string }>;
-                }>;
-              };
-            };
-            const text = (
-              dgJson.results?.channels?.[0]?.alternatives?.[0]?.transcript || ""
-            ).trim();
-            res.json({ text, engine: "deepgram", model: "nova-3" });
+            const { text, language: matchedLang } =
+              await transcribeWithDeepgramEnglish(audioBuffer, cleanMime, dgKey);
+            res.json({
+              text,
+              engine: "deepgram",
+              model: "nova-3",
+              language: matchedLang,
+            });
             return;
           } catch (dgErr) {
             const msg = dgErr instanceof Error ? dgErr.message : String(dgErr);
@@ -1199,44 +1163,19 @@ async function startServer() {
           }
         }
 
-        // Tier 2: Groq Whisper fallback (whisper-large-v3-turbo)
+        // Tier 2: Groq Whisper fallback (whisper-large-v3-turbo, locked English + tech prompt)
         if (groqKey) {
           try {
-            const ext = cleanMime.includes("wav")
-              ? "wav"
-              : cleanMime.includes("mp4")
-                ? "mp4"
-                : "webm";
-            const form = new FormData();
-            form.append(
-              "file",
-              new Blob([new Uint8Array(audioBuffer)], { type: cleanMime }),
-              `utterance.${ext}`
+            const text = await transcribeWithGroqWhisperEnglish(
+              audioBuffer,
+              cleanMime,
+              groqKey
             );
-            form.append("model", "whisper-large-v3-turbo");
-            form.append("response_format", "json");
-            if (language === "hi") {
-              form.append("language", "hi");
-            }
-            const groqRes = await fetch(
-              "https://api.groq.com/openai/v1/audio/transcriptions",
-              {
-                method: "POST",
-                headers: { Authorization: `Bearer ${groqKey}` },
-                body: form,
-              }
-            );
-            if (!groqRes.ok) {
-              const errText = await groqRes.text().catch(() => "");
-              throw new Error(
-                `Groq Whisper error (${groqRes.status}): ${errText.slice(0, 180)}`
-              );
-            }
-            const groqJson = (await groqRes.json()) as { text?: string };
             res.json({
-              text: (groqJson.text || "").trim(),
+              text,
               engine: "groq-whisper",
               model: "whisper-large-v3-turbo",
+              language: "en",
             });
             return;
           } catch (groqErr) {
@@ -1299,8 +1238,27 @@ async function startServer() {
     }
   );
 
-  // Live Streaming Interview Answer (tailored to Target Profile + Resume + JD, or Active DSA Problem Context)
-  app.post("/api/answer", async (req, res) => {
+  // Shared sub-second SSE streaming interview answer handler (mounted on both /api/incoming-question and /api/answer)
+  const handleStreamingInterviewAnswer = async (
+    req: express.Request,
+    res: express.Response
+  ) => {
+    const bodyObj = (req.body || {}) as {
+      broadcastOnly?: boolean;
+      source?: string;
+      question?: string;
+    };
+    if (bodyObj.broadcastOnly && bodyObj.question?.trim()) {
+      broadcastEvent({
+        type: "incoming_question",
+        question: bodyObj.question.trim(),
+        source: bodyObj.source || "system-audio",
+        timestamp: new Date().toISOString(),
+      });
+      res.json({ ok: true, deliveredTo: sseClients.size });
+      return;
+    }
+
     const {
       token,
       question,
@@ -1358,6 +1316,8 @@ async function startServer() {
     res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
     res.setHeader("Cache-Control", "no-cache, no-transform");
     res.setHeader("Connection", "keep-alive");
+    res.setHeader("X-Accel-Buffering", "no");
+    res.flushHeaders();
 
     const sendEvent = (payload: Record<string, unknown>) => {
       res.write(`data: ${JSON.stringify(payload)}\n\n`);
@@ -1584,6 +1544,17 @@ async function startServer() {
       });
       res.end();
     }
+  };
+
+  app.post("/api/answer", handleStreamingInterviewAnswer);
+  app.post("/api/incoming-question", handleStreamingInterviewAnswer);
+  app.get("/api/incoming-question", (_req, res) => {
+    res.json({
+      ok: true,
+      endpoint: "/api/incoming-question",
+      streaming: true,
+      ready: true,
+    });
   });
 
   // Screen & Chat Box Capture Solver (supports both standard mode & DSA Coding / OA Teleprompter)

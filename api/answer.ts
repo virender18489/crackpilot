@@ -163,6 +163,10 @@ export default async function handler(
   res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
   res.setHeader("Cache-Control", "no-cache, no-transform");
   res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  if (typeof (res as ServerResponse & { flushHeaders?: () => void }).flushHeaders === "function") {
+    (res as ServerResponse & { flushHeaders?: () => void }).flushHeaders?.();
+  }
 
   const sendEvent = (payload: Record<string, unknown>) => {
     res.write(`data: ${JSON.stringify(payload)}\n\n`);

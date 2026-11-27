@@ -247,8 +247,12 @@ export function SoftwareOverlay({
   const pcmProcessorRef = useRef<ScriptProcessorNode | null>(null);
   const preRollPcmRef = useRef<Float32Array[]>([]);
   const speechPcmRef = useRef<Float32Array[]>([]);
-  const flushPcmUtteranceRef = useRef<((fastMode?: boolean) => void) | null>(null);
+  const flushPcmUtteranceRef = useRef<
+    ((opts?: { isFinalFlush?: boolean; fastMode?: boolean }) => void) | null
+  >(null);
   const chunkTimerRef = useRef<number | null>(null);
+  const pauseTriggerTimerRef = useRef<number | null>(null);
+  const liveSpeechTickRef = useRef<number | null>(null);
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const mixAudioCtxRef = useRef<AudioContext | null>(null);
@@ -261,6 +265,10 @@ export function SoftwareOverlay({
   const videoScanTimerRef = useRef<number | null>(null);
   const videoFrameIntervalRef = useRef<number | null>(null);
   const capturedVideoFramesRef = useRef<string[]>([]);
+
+  const [liveTranscript, setLiveTranscript] = useState("");
+  const [liveSpeechSeconds, setLiveSpeechSeconds] = useState(0);
+  const [isSpeechDetected, setIsSpeechDetected] = useState(false);
 
   const isEngineRunningRef = useRef(false);
   const isListeningRef = useRef(false);
@@ -280,6 +288,14 @@ export function SoftwareOverlay({
   const speechActiveRef = useRef<boolean>(false);
   const lastSpeechAtRef = useRef<number>(0);
   const chunkStartedAtRef = useRef<number>(0);
+  const speechSessionStartedAtRef = useRef<number>(0);
+  const liveTranscriptRef = useRef<string>("");
+  const interimTextRef = useRef<string>("");
+  const chunkSeqRef = useRef<number>(0);
+  const orderedChunkTextsRef = useRef<Map<number, string>>(new Map());
+  const inFlightChunksRef = useRef<number>(0);
+  const pendingFinalizeRef = useRef<{ fastMode: boolean } | null>(null);
+  const activeQuestionEpochRef = useRef<number>(0);
   const recognitionWorkingRef = useRef<boolean>(false);
   const lastAskedRef = useRef<{ text: string; at: number }>({ text: "", at: 0 });
   const unsyncedSecondsRef = useRef<number>(0);
@@ -746,7 +762,7 @@ export function SoftwareOverlay({
       top: feedRef.current.scrollHeight,
       behavior: "smooth",
     });
-  }, [qaList, interimText, autoScroll]);
+  }, [qaList, interimText, liveTranscript, autoScroll]);
 
   useEffect(() => {
     if (!autoScroll) return;
@@ -774,7 +790,11 @@ export function SoftwareOverlay({
   const streamAnswerFromEndpoint = useCallback(
     async (
       qaId: string,
-      endpoint: "/api/answer" | "/api/analyze-screen" | "/api/analyze-video",
+      endpoint:
+        | "/api/incoming-question"
+        | "/api/answer"
+        | "/api/analyze-screen"
+        | "/api/analyze-video",
       body: Record<string, unknown>,
       allowWhenPaused = false
     ) => {
@@ -1025,7 +1045,7 @@ export function SoftwareOverlay({
 
       await streamAnswerFromEndpoint(
         qaId,
-        "/api/answer",
+        "/api/incoming-question",
         {
           token: tokenStateRef.current?.token,
           question: cleaned,
@@ -1190,11 +1210,31 @@ export function SoftwareOverlay({
     setListenMode(null);
     setMonitorAudio(false);
     setInterimText("");
+    interimTextRef.current = "";
+    setLiveTranscript("");
+    liveTranscriptRef.current = "";
+    setLiveSpeechSeconds(0);
+    setIsSpeechDetected(false);
     setAudioLevel(0);
+
+    activeQuestionEpochRef.current += 1;
+    orderedChunkTextsRef.current.clear();
+    inFlightChunksRef.current = 0;
+    pendingFinalizeRef.current = null;
+    speechSessionStartedAtRef.current = 0;
+    speechActiveRef.current = false;
 
     if (chunkTimerRef.current !== null) {
       window.clearInterval(chunkTimerRef.current);
       chunkTimerRef.current = null;
+    }
+    if (pauseTriggerTimerRef.current !== null) {
+      window.clearTimeout(pauseTriggerTimerRef.current);
+      pauseTriggerTimerRef.current = null;
+    }
+    if (liveSpeechTickRef.current !== null) {
+      window.clearInterval(liveSpeechTickRef.current);
+      liveSpeechTickRef.current = null;
     }
     if (rafLevelRef.current !== null) {
       cancelAnimationFrame(rafLevelRef.current);
@@ -1265,8 +1305,65 @@ export function SoftwareOverlay({
     setHasSharedScreen(false);
   }, []);
 
+  const rebuildLiveTranscript = useCallback(() => {
+    const merged = Array.from(orderedChunkTextsRef.current.entries())
+      .sort((a, b) => a[0] - b[0])
+      .map(([, txt]) => txt.trim())
+      .filter(Boolean)
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim();
+    liveTranscriptRef.current = merged;
+    setLiveTranscript(merged);
+    return merged;
+  }, []);
+
+  const commitPendingAnswerIfReady = useCallback(() => {
+    const pending = pendingFinalizeRef.current;
+    if (!pending) return;
+    if (inFlightChunksRef.current > 0) return;
+
+    pendingFinalizeRef.current = null;
+    if (pauseTriggerTimerRef.current !== null) {
+      window.clearTimeout(pauseTriggerTimerRef.current);
+      pauseTriggerTimerRef.current = null;
+    }
+
+    const combined = [liveTranscriptRef.current, interimTextRef.current]
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    activeQuestionEpochRef.current += 1;
+    orderedChunkTextsRef.current.clear();
+    chunkSeqRef.current = 0;
+    liveTranscriptRef.current = "";
+    interimTextRef.current = "";
+    speechSessionStartedAtRef.current = 0;
+    speechActiveRef.current = false;
+    setLiveTranscript("");
+    setInterimText("");
+    setLiveSpeechSeconds(0);
+    setIsSpeechDetected(false);
+
+    if (combined.length > 2) {
+      // Zero artificial delay: fire streaming SSE answer immediately
+      void askQuestion(combined, pending.fastMode);
+    }
+  }, [askQuestion]);
+
   const transcribeWavBlob = useCallback(
-    async (wavBlob: Blob, fastMode = false) => {
+    async (
+      wavBlob: Blob,
+      opts: {
+        epoch: number;
+        seq: number;
+        isFinalFlush: boolean;
+        fastMode?: boolean;
+      }
+    ) => {
       if (
         !isConnectedRef.current ||
         !isEngineRunningRef.current ||
@@ -1277,6 +1374,10 @@ export function SoftwareOverlay({
 
       // Skip tiny/empty WAV buffers (< 0.4s @ 16kHz 16-bit mono = 44 + 12800 bytes)
       if (wavBlob.size < 44 + 12800) {
+        if (opts.isFinalFlush) {
+          pendingFinalizeRef.current = { fastMode: Boolean(opts.fastMode) };
+          commitPendingAnswerIfReady();
+        }
         return;
       }
 
@@ -1287,17 +1388,22 @@ export function SoftwareOverlay({
         return;
       }
 
+      if (opts.isFinalFlush) {
+        pendingFinalizeRef.current = { fastMode: Boolean(opts.fastMode) };
+      }
+
+      inFlightChunksRef.current += 1;
       setIsTranscribing(true);
+
       const curProfile = profileRef.current;
-      const lang = curProfile.answerLanguage === "Hindi" ? "hi" : "auto";
       const qs = new URLSearchParams({
-        language: lang,
+        language: "en-IN",
         role: curProfile.role || "",
       }).toString();
       const transcribeUrl = `${apiUrl("/api/transcribe")}?${qs}`;
 
       try {
-        // Send complete self-contained binary .wav Blob directly with matching audio/wav Content-Type
+        // Send complete self-contained binary .wav Blob (~469KB per 15s rolling chunk, well below Vercel 4.5MB limit)
         const resp = await fetch(transcribeUrl, {
           method: "POST",
           headers: {
@@ -1333,14 +1439,13 @@ export function SoftwareOverlay({
         if (!resp.ok) {
           throw new Error(data.error || "Transcription failed.");
         }
-        if (data.skipped) {
-          return;
-        }
-        const cleanedTranscript = (data.text || "").trim();
         setLiveApiError(null);
-        if (cleanedTranscript.length > 2) {
-          setInterimText("");
-          void askQuestion(cleanedTranscript, fastMode);
+        if (!data.skipped && opts.epoch === activeQuestionEpochRef.current) {
+          const cleanedChunk = (data.text || "").trim();
+          if (cleanedChunk.length > 0) {
+            orderedChunkTextsRef.current.set(opts.seq, cleanedChunk);
+            rebuildLiveTranscript();
+          }
         }
       } catch (err) {
         console.error("[Crackpilot Transcribe] Error:", err);
@@ -1349,14 +1454,38 @@ export function SoftwareOverlay({
         setLiveApiError(errMsg);
         setStatusNotice(errMsg);
       } finally {
-        setIsTranscribing(false);
+        inFlightChunksRef.current = Math.max(0, inFlightChunksRef.current - 1);
+        if (inFlightChunksRef.current === 0) {
+          setIsTranscribing(false);
+        }
+        if (opts.epoch === activeQuestionEpochRef.current && pendingFinalizeRef.current) {
+          commitPendingAnswerIfReady();
+        }
       }
     },
-    [askQuestion]
+    [commitPendingAnswerIfReady, rebuildLiveTranscript]
   );
 
-  // Unified Web Audio API 16kHz Mono PCM Utterance Capture + 60fps AnalyserNode Level Meter
-  // Encodes every detected spoken question into a complete, valid 44-byte RIFF/WAV Blob (skipping < 0.4s clicks)
+  // Instant manual trigger ("Answer Now") — works anytime during a short or 4-10 minute explanation
+  const handleAnswerNow = useCallback(
+    (fastMode = false) => {
+      if (pauseTriggerTimerRef.current !== null) {
+        window.clearTimeout(pauseTriggerTimerRef.current);
+        pauseTriggerTimerRef.current = null;
+      }
+      if (flushPcmUtteranceRef.current && speechPcmRef.current.length > 0) {
+        flushPcmUtteranceRef.current({ isFinalFlush: true, fastMode });
+        return;
+      }
+      pendingFinalizeRef.current = { fastMode };
+      commitPendingAnswerIfReady();
+    },
+    [commitPendingAnswerIfReady]
+  );
+
+  // Unified Web Audio API 16kHz Mono PCM Rolling Utterance Capture + 60fps AnalyserNode Level Meter
+  // Slices continuous 4-10+ minute speech into rolling 15-second WAV chunks (~469KB each), appending live text
+  // into the active Q box and triggering the AI answer after a 2.2s pause (or instantly via "Answer Now").
   const attachAudioMeter = useCallback(
     (audioStream: MediaStream, monitor: boolean) => {
       try {
@@ -1402,32 +1531,86 @@ export function SoftwareOverlay({
         speechActiveRef.current = false;
         lastSpeechAtRef.current = 0;
         chunkStartedAtRef.current = Date.now();
+        speechSessionStartedAtRef.current = 0;
         preRollPcmRef.current = [];
         speechPcmRef.current = [];
 
-        // Keep ~0.35s pre-roll so the first syllable of each question is never clipped
+        const ROLLING_CHUNK_MS = 15_000; // 15s rolling WAV chunks (~469 KB) -> supports 4-10+ minute questions
+        const PAUSE_TRIGGER_MS = 2_200; // 2.2s silence pause at end of question triggers AI answer
+
+        // Keep ~0.45s pre-roll so the very first syllable of each question is never clipped
         const maxPreRollFrames = Math.max(
           2,
-          Math.ceil((ctx.sampleRate * 0.35) / 4096)
+          Math.ceil((ctx.sampleRate * 0.45) / 4096)
         );
 
-        const flushSpeechToWav = (fastMode = false) => {
-          speechActiveRef.current = false;
+        const flushSpeechToWav = (opts?: {
+          isFinalFlush?: boolean;
+          fastMode?: boolean;
+        }) => {
+          const isFinalFlush = Boolean(opts?.isFinalFlush);
+          const fastMode = Boolean(opts?.fastMode);
+
+          if (isFinalFlush) {
+            speechActiveRef.current = false;
+            setIsSpeechDetected(false);
+          }
+
           const frames = speechPcmRef.current.splice(0);
-          if (frames.length === 0 || recognitionWorkingRef.current) {
+          chunkStartedAtRef.current = Date.now();
+
+          if (recognitionWorkingRef.current) {
+            if (isFinalFlush) {
+              pendingFinalizeRef.current = { fastMode };
+              commitPendingAnswerIfReady();
+            }
             return;
           }
-          const encoded = encodePcm16WavBlob(frames, ctx.sampleRate, {
-            targetSampleRate: 16000,
-            minDurationSec: 0.4,
-          });
+
+          const epoch = activeQuestionEpochRef.current;
+          const seq = ++chunkSeqRef.current;
+
+          const encoded =
+            frames.length > 0
+              ? encodePcm16WavBlob(frames, ctx.sampleRate, {
+                  targetSampleRate: 16000,
+                  minDurationSec: 0.4,
+                })
+              : null;
+
           if (!encoded) {
+            if (isFinalFlush) {
+              pendingFinalizeRef.current = { fastMode };
+              commitPendingAnswerIfReady();
+            }
             return;
           }
-          void transcribeWavBlob(encoded.blob, fastMode);
+
+          void transcribeWavBlob(encoded.blob, {
+            epoch,
+            seq,
+            isFinalFlush,
+            fastMode,
+          });
         };
 
         flushPcmUtteranceRef.current = flushSpeechToWav;
+
+        if (liveSpeechTickRef.current !== null) {
+          window.clearInterval(liveSpeechTickRef.current);
+        }
+        liveSpeechTickRef.current = window.setInterval(() => {
+          if (speechSessionStartedAtRef.current > 0) {
+            setLiveSpeechSeconds(
+              Math.max(
+                1,
+                Math.floor((Date.now() - speechSessionStartedAtRef.current) / 1000)
+              )
+            );
+          } else {
+            setLiveSpeechSeconds(0);
+          }
+        }, 500);
 
         processor.onaudioprocess = (ev) => {
           if (!isListeningRef.current) return;
@@ -1444,21 +1627,39 @@ export function SoftwareOverlay({
           const rms = Math.sqrt(sumSq / frameCopy.length);
           const now = Date.now();
 
-          if (rms > 0.012) {
+          if (rms > 0.011) {
+            if (pauseTriggerTimerRef.current !== null) {
+              window.clearTimeout(pauseTriggerTimerRef.current);
+              pauseTriggerTimerRef.current = null;
+            }
             if (!speechActiveRef.current) {
               speechActiveRef.current = true;
+              setIsSpeechDetected(true);
               chunkStartedAtRef.current = now;
+              if (speechSessionStartedAtRef.current === 0) {
+                speechSessionStartedAtRef.current = now;
+              }
               speechPcmRef.current = [...preRollPcmRef.current, frameCopy];
             } else {
               speechPcmRef.current.push(frameCopy);
             }
             lastSpeechAtRef.current = now;
+
+            // Rolling 15-second WAV chunk slice during long continuous speech (4-10+ min questions)
+            if (now - chunkStartedAtRef.current >= ROLLING_CHUNK_MS) {
+              flushSpeechToWav({ isFinalFlush: false, fastMode: false });
+            }
           } else if (speechActiveRef.current) {
             speechPcmRef.current.push(frameCopy);
             const silenceMs = now - lastSpeechAtRef.current;
-            const utteranceMs = now - chunkStartedAtRef.current;
-            if (silenceMs >= 850 || utteranceMs >= 10000) {
-              flushSpeechToWav(false);
+            const chunkMs = now - chunkStartedAtRef.current;
+
+            if (silenceMs >= PAUSE_TRIGGER_MS) {
+              // 2.2-second pause at end of question -> flush trailing audio and trigger AI answer immediately
+              flushSpeechToWav({ isFinalFlush: true, fastMode: false });
+            } else if (chunkMs >= ROLLING_CHUNK_MS) {
+              // Still within a brief breath pause inside a long question -> slice rolling 15s chunk
+              flushSpeechToWav({ isFinalFlush: false, fastMode: false });
             }
           } else {
             preRollPcmRef.current.push(frameCopy);
@@ -1496,7 +1697,7 @@ export function SoftwareOverlay({
         console.warn("[Crackpilot Audio] Web Audio PCM WAV init warning:", err);
       }
     },
-    [transcribeWavBlob]
+    [commitPendingAnswerIfReady, transcribeWavBlob]
   );
 
   // Capture Microphone audio (captures nearby speaker / interviewer laptop voice & works out of the box in Electron + Browser)
@@ -1532,7 +1733,13 @@ export function SoftwareOverlay({
             audio: audioConstraint,
           });
         } catch {
-          micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          micStream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+              echoCancellation: true,
+              noiseSuppression: true,
+              autoGainControl: true,
+            },
+          });
         }
 
         if (!isEngineRunningRef.current) {
@@ -1571,8 +1778,7 @@ export function SoftwareOverlay({
             const rec = new SpeechRecCtor();
             rec.continuous = true;
             rec.interimResults = true;
-            rec.lang =
-              profileRef.current.answerLanguage === "Hindi" ? "hi-IN" : "en-US";
+            rec.lang = "en-IN";
 
             rec.onresult = (event) => {
               recognitionWorkingRef.current = true;
@@ -1586,11 +1792,32 @@ export function SoftwareOverlay({
                   interim += text;
                 }
               }
-              setInterimText(interim.trim());
+              const trimmedInterim = interim.trim();
+              interimTextRef.current = trimmedInterim;
+              setInterimText(trimmedInterim);
+
+              if (speechSessionStartedAtRef.current === 0 && (trimmedInterim || finalChunk.trim())) {
+                speechSessionStartedAtRef.current = Date.now();
+              }
+
               const cleanedFinal = finalChunk.trim();
-              if (cleanedFinal.length > 2) {
+              if (cleanedFinal.length > 0) {
+                const seq = ++chunkSeqRef.current;
+                orderedChunkTextsRef.current.set(seq, cleanedFinal);
+                rebuildLiveTranscript();
+                interimTextRef.current = "";
                 setInterimText("");
-                void askQuestion(cleanedFinal, false);
+              }
+
+              // Reset 2.2-second pause timer on every live word so 4-10 minute questions accumulate smoothly
+              if (pauseTriggerTimerRef.current !== null) {
+                window.clearTimeout(pauseTriggerTimerRef.current);
+              }
+              if (liveTranscriptRef.current || interimTextRef.current) {
+                pauseTriggerTimerRef.current = window.setTimeout(() => {
+                  pendingFinalizeRef.current = { fastMode: false };
+                  commitPendingAnswerIfReady();
+                }, 2200);
               }
             };
 
@@ -1654,8 +1881,9 @@ export function SoftwareOverlay({
       }
     },
     [
-      askQuestion,
       attachAudioMeter,
+      commitPendingAnswerIfReady,
+      rebuildLiveTranscript,
       refreshAudioInputDevices,
       stopAudioListening,
     ]
@@ -2128,10 +2356,8 @@ export function SoftwareOverlay({
       return;
     }
 
-    if (interimText.trim()) {
-      const text = interimText.trim();
-      setInterimText("");
-      await askQuestion(text, true);
+    if (liveTranscriptRef.current || interimTextRef.current || speechPcmRef.current.length > 0) {
+      handleAnswerNow(true);
       return;
     }
 
@@ -2139,14 +2365,6 @@ export function SoftwareOverlay({
       const text = questionInput.trim();
       setQuestionInput("");
       await askQuestion(text, true);
-      return;
-    }
-
-    if (
-      flushPcmUtteranceRef.current &&
-      speechPcmRef.current.length > 0
-    ) {
-      flushPcmUtteranceRef.current(true);
       return;
     }
 
@@ -2163,7 +2381,7 @@ export function SoftwareOverlay({
     }
   }, [
     askQuestion,
-    interimText,
+    handleAnswerNow,
     questionInput,
     startSelectedAudioSource,
   ]);
@@ -3215,41 +3433,50 @@ export function SoftwareOverlay({
                 </article>
               ))}
 
-              {/* Real-Time Live Transcribed Q Preview */}
-              {(interimText || isTranscribing || (isListening && audioLevel >= 14)) && (
-                <div className="rounded-xl border border-sky-400/45 bg-[#0f192d]/95 px-4 py-3 text-xs text-sky-100 flex items-center justify-between gap-3">
-                  <div className="flex items-start gap-2.5 min-w-0">
+              {/* Real-Time Live Transcribed Q Preview (supports rolling 4-10+ minute questions + instant Answer Now) */}
+              {(liveTranscript ||
+                interimText ||
+                isTranscribing ||
+                isSpeechDetected ||
+                (isListening && audioLevel >= 14)) && (
+                <div className="rounded-xl border border-sky-400/50 bg-[#0f192d]/95 px-4 py-3 text-xs text-sky-100 flex items-start justify-between gap-3">
+                  <div className="flex items-start gap-2.5 min-w-0 flex-1">
                     <span className="mt-0.5 font-mono text-sm font-bold text-sky-400 shrink-0">
                       Q
                     </span>
-                    <div className="min-w-0">
-                      <p className="font-medium text-sky-100 break-words">
-                        {interimText
-                          ? interimText
-                          : isTranscribing
+                    <div className="min-w-0 flex-1">
+                      <div className="flex flex-wrap items-center gap-2 mb-1">
+                        <span className="inline-flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-wider text-sky-300">
+                          <span className="h-1.5 w-1.5 rounded-full bg-[#b4f416] animate-pulse" />
+                          {isTranscribing
+                            ? "Transcribing live chunk..."
+                            : "Live Listening (15s rolling)"}
+                        </span>
+                        {liveSpeechSeconds > 0 && (
+                          <span className="rounded bg-slate-800/90 px-1.5 py-0.5 font-mono text-[10px] text-[#b4f416] tabular-nums">
+                            {Math.floor(liveSpeechSeconds / 60)}:
+                            {String(liveSpeechSeconds % 60).padStart(2, "0")}
+                          </span>
+                        )}
+                      </div>
+                      <p className="max-h-36 overflow-y-auto hud-scroll font-medium text-sky-100 leading-relaxed break-words">
+                        {[liveTranscript, interimText].filter(Boolean).join(" ") ||
+                          (isTranscribing
                             ? "Transcribing spoken question..."
-                            : "Speech detected — listening to question..."}
+                            : "Speech detected — capturing interviewer question...")}
                       </p>
-                      <p className="mt-0.5 text-[10px] font-mono text-sky-300/75">
-                        {isTranscribing
-                          ? "Finalizing transcript and triggering AI answer..."
-                          : "Pause briefly when finished to stream the answer in A automatically"}
+                      <p className="mt-1 text-[10px] font-mono text-sky-300/75">
+                        Auto-answers after 2.2s pause, or click Answer Now anytime during long questions
                       </p>
                     </div>
                   </div>
-                  {interimText && (
-                    <button
-                      type="button"
-                      onClick={() => {
-                        const text = interimText.trim();
-                        setInterimText("");
-                        void askQuestion(text, true);
-                      }}
-                      className="shrink-0 rounded bg-emerald-500/20 px-2.5 py-1 text-[11px] font-semibold text-emerald-300 hover:bg-emerald-500/30 cursor-pointer"
-                    >
-                      Answer Now (Alt+X)
-                    </button>
-                  )}
+                  <button
+                    type="button"
+                    onClick={() => handleAnswerNow(false)}
+                    className="shrink-0 rounded-md border border-[#b4f416]/60 bg-[#b4f416]/20 px-3 py-1.5 text-[11px] font-semibold text-[#d9ff66] hover:bg-[#b4f416]/30 transition-colors cursor-pointer"
+                  >
+                    Answer Now
+                  </button>
                 </div>
               )}
 

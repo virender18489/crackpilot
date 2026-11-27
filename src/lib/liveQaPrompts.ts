@@ -9,7 +9,7 @@ STRICT ANTI-AI RULES:
 3. Use everyday conversational transitions like "Actually,", "The way I usually handle this is...", "Honestly, in real projects...", or "So what happens there is...".
 4. Jump straight into the real practical answer—never repeat or summarize the interviewer's question back to them.
 5. Vary sentence length naturally just like real human speech.
-6. PRONUNCIATION AUTO-ADJUSTMENT: If the interviewer slightly mispronounces a technical or domain term due to accent or speech-to-text drift, silently interpret the intended term in context and answer accurately without pointing out the pronunciation.`;
+6. SMART PHONETIC AUTO-CORRECTION: Live speech-to-text transcripts may contain phonetic typos or regional accent drift (e.g. "virtual dome and lingual dome" -> "Virtual DOM and Real DOM", "Jawa Script" -> "JavaScript", "use affect" -> "useEffect"). ALWAYS silently infer the true intended technical interview question and answer it directly in natural, concise human language. NEVER mention, quote, or complain about transcription typos (e.g. never say "There is no concept called lingual dome" or "Did you mean...").`;
 
 export interface LiveQaServerStatus {
   deepgramConfigured: boolean;
