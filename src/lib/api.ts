@@ -4,12 +4,21 @@ export interface CrackpilotDesktopBridge {
   minimizeWindow: () => Promise<{ ok: boolean; hidden: boolean } | void>;
   minimizeWindowSync?: () => boolean;
   hideWindow: () => Promise<{ ok: boolean; hidden: boolean } | void>;
+  closeWindow?: () => Promise<{ ok: boolean } | void>;
   showWindow: () => Promise<{ ok: boolean } | void>;
   toggleMaximize: () => Promise<boolean>;
   setCompact: (compact: boolean) => Promise<void>;
   setOpacity: (opacity: number) => Promise<void>;
   setAlwaysOnTop: (enabled: boolean) => Promise<void>;
+  setBehindMode?: (enabled: boolean) => Promise<boolean>;
+  toggleBehindMode?: () => Promise<boolean>;
+  getBehindMode?: () => Promise<boolean>;
+  setBehindHoverInteractive?: (hovering: boolean) => Promise<boolean>;
   openExternal: (url: string) => Promise<void>;
+  reloadLiveApp?: () => Promise<{ ok: boolean } | void>;
+  onBehindModeChanged?: (callback: (enabled: boolean) => void) => () => void;
+  onWindowMinimized?: (callback: () => void) => () => void;
+  onWindowClosing?: (callback: () => void) => () => void;
 }
 
 declare global {
@@ -19,6 +28,8 @@ declare global {
 }
 
 const SERVER_STORAGE_KEY = "crackpilot_api_base_url";
+export const DEFAULT_BACKEND_URL = "https://crackpilot.vercel.app";
+export const DEFAULT_PRODUCTION_API_URL = DEFAULT_BACKEND_URL;
 
 function readEnvApiBase(): string {
   const raw =
@@ -82,7 +93,7 @@ export function getApiBaseUrl(): string {
           normalized
         );
         window.localStorage.removeItem(SERVER_STORAGE_KEY);
-      } else {
+      } else if (/^https?:\/\//i.test(normalized)) {
         return normalized;
       }
     }
@@ -90,20 +101,18 @@ export function getApiBaseUrl(): string {
     console.warn("[Crackpilot API] Could not read saved server URL:", err);
   }
 
-  if (envBase && !isAuthWalledPreviewUrl(envBase)) {
+  if (envBase && !isAuthWalledPreviewUrl(envBase) && /^https?:\/\//i.test(envBase)) {
     return envBase;
   }
 
-  // Standalone desktop mode: no private proxy URL hardcoded — falls back cleanly to local auth/session
-  return "";
+  // Electron desktop default: NEVER return empty string (which resolves to file:///api/...).
+  // Always route API calls to the deployed production backend unless overridden in Settings.
+  return DEFAULT_BACKEND_URL;
 }
 
 export function hasConfiguredBackend(): boolean {
-  if (typeof window === "undefined") return false;
-  if (isDesktopApp()) {
-    return Boolean(getApiBaseUrl());
-  }
-  return window.location.protocol === "http:" || window.location.protocol === "https:";
+  if (typeof window === "undefined") return Boolean(DEFAULT_BACKEND_URL);
+  return Boolean(getApiBaseUrl() || DEFAULT_BACKEND_URL);
 }
 
 export function setApiBaseUrl(url: string): string {
@@ -129,17 +138,35 @@ export function setApiBaseUrl(url: string): string {
 export function apiUrl(path: string): string {
   const normalized = path.startsWith("/") ? path : `/${path}`;
   const base = getApiBaseUrl();
-  return base ? `${base}${normalized}` : normalized;
+  if (base && /^https?:\/\//i.test(base)) {
+    return `${base}${normalized}`;
+  }
+  if (
+    typeof window !== "undefined" &&
+    (isDesktopApp() ||
+      window.location.protocol === "file:" ||
+      window.location.origin === "null")
+  ) {
+    return `${DEFAULT_BACKEND_URL}${normalized}`;
+  }
+  return normalized;
 }
 
 export function wsUrl(path: string): string {
   const normalized = path.startsWith("/") ? path : `/${path}`;
   const base = getApiBaseUrl();
-  if (base) {
+  if (base && /^https?:\/\//i.test(base)) {
     return `${base.replace(/^http/i, "ws")}${normalized}`;
   }
   if (typeof window === "undefined") {
     return `ws://localhost:3000${normalized}`;
+  }
+  if (
+    isDesktopApp() ||
+    window.location.protocol === "file:" ||
+    window.location.origin === "null"
+  ) {
+    return `${DEFAULT_BACKEND_URL.replace(/^http/i, "ws")}${normalized}`;
   }
   const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
   return `${proto}//${window.location.host}${normalized}`;

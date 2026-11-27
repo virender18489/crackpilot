@@ -12,17 +12,39 @@ import {
   getLiveQaServerStatus,
 } from "./server/liveQaBridge.ts";
 import {
+  DEFAULT_ANSWER_STYLE,
+  analyzeDsaProblem,
+  buildDsaAnalysisSummaryMarkdown,
+  buildDsaFollowUpSystemPrompt,
+  buildHumanInterviewSystemPrompt,
+  generateContentStreamResilient,
+  isCodeCreationRequest,
+  normalizeAnswerStyle,
+  normalizeProgrammingLanguage,
+} from "./server/dsaEngine.ts";
+import type {
+  ActiveProblemContext,
+  AnswerStyle,
+  DsaAssessmentType,
+  OaQuestionKind,
+  ProgrammingLanguage,
+} from "./src/types.ts";
+import {
   type AccountStatus,
   type AccountType,
+  type PaymentStatus,
+  type PlanType,
   adjustAccountQuotas,
   buildAdminClearCookieHeader,
   buildAdminSetCookieHeader,
   buildQuotaSnapshot,
   checkQuotaForAction,
   claimFirstRunAdmin,
+  computeAdminStats,
   consumeAccountUsage,
   createManagedAccount,
   deleteAccountByToken,
+  findAccountByEmail,
   findAccountByToken,
   getAdminAuthConfigStatus,
   getAdminCookieName,
@@ -30,6 +52,7 @@ import {
   parseCookieHeader,
   registerRegularToken,
   signAdminSessionToken,
+  updateAccountPaymentStatus,
   updateAccountStatus,
   verifyAdminCredentials,
   verifyAdminSessionToken,
@@ -50,7 +73,9 @@ interface StoredProfile {
   jdFileName: string;
   jdText: string;
   answerLanguage: "English" | "Hinglish" | "Hindi";
-  answerStyle: "Concise Bullets" | "STAR Method" | "Technical + Code";
+  answerStyle: AnswerStyle;
+  dsaModeEnabled: boolean;
+  preferredLanguage: ProgrammingLanguage;
   updatedAt: string;
 }
 
@@ -71,16 +96,20 @@ let currentUser: StoredUser | null = null;
 
 let activeToken: StoredToken | null = null;
 
+let activeProblemContext: ActiveProblemContext | null = null;
+
 let activeProfile: StoredProfile = {
-  role: "Frontend Developer (React & TypeScript)",
-  experience: "3 years",
-  skills: "React, TypeScript, Next.js, Tailwind CSS, Node.js, REST APIs, System Design",
+  role: "Frontend Development (React, Next.js, Vue, Web)",
+  experience: "Junior (1-3 Years)",
+  skills: "",
   resumeFileName: "",
   resumeText: "",
   jdFileName: "",
   jdText: "",
   answerLanguage: "English",
-  answerStyle: "Concise Bullets",
+  answerStyle: DEFAULT_ANSWER_STYLE,
+  dsaModeEnabled: false,
+  preferredLanguage: "Python",
   updatedAt: new Date().toISOString(),
 };
 
@@ -112,70 +141,34 @@ function buildInterviewSystemPrompt(params: {
   jdText?: string;
   answerLanguage?: string;
   answerStyle?: string;
+  fastMode?: boolean;
+  question?: string;
 }): string {
-  const role = params.role || activeProfile.role;
-  const experience = params.experience || activeProfile.experience;
-  const skills = params.skills || activeProfile.skills;
-  const resumeText = (params.resumeText ?? activeProfile.resumeText).trim();
-  const jdText = (params.jdText ?? activeProfile.jdText).trim();
-  const answerLanguage = params.answerLanguage || activeProfile.answerLanguage;
-  const answerStyle = params.answerStyle || activeProfile.answerStyle;
+  return buildHumanInterviewSystemPrompt({
+    role: params.role || activeProfile.role,
+    experience: params.experience || activeProfile.experience,
+    skills: params.skills ?? activeProfile.skills,
+    resumeText: params.resumeText ?? activeProfile.resumeText,
+    jdText: params.jdText ?? activeProfile.jdText,
+    answerLanguage: params.answerLanguage || activeProfile.answerLanguage,
+    answerStyle: params.answerStyle || activeProfile.answerStyle,
+    fastMode: params.fastMode,
+    question: params.question,
+  });
+}
 
-  const langRule =
-    answerLanguage === "Hindi"
-      ? "Write the entire answer in clear, natural conversational Hindi (Devanagari script) with standard English technical terms."
-      : answerLanguage === "Hinglish"
-        ? "Write the answer in natural Hinglish (Hindi written in Roman script mixed with standard English technical terms), suitable for speaking aloud in an Indian tech interview."
-        : "Write the answer in crisp, natural spoken English.";
-
-  const styleRule =
-    answerStyle === "STAR Method"
-      ? "Structure behavioral or scenario answers briefly using Situation, Task, Action, and Result."
-      : answerStyle === "Technical + Code"
-        ? "Provide sharp technical depth and include a short, clean code snippet or architecture flow whenever the question is technical."
-        : "Keep it ultra-concise and scannable so the candidate can glance at the screen and speak smoothly without reading essays.";
-
-  const profileSections: string[] = [
-    `Candidate Target Role: ${role}`,
-    `Experience Level: ${experience}`,
-  ];
-  if (skills) {
-    profileSections.push(`Core Skills: ${skills}`);
-  }
-  if (resumeText) {
-    profileSections.push(
-      `Candidate Resume Context (anchor examples, projects, and metrics directly in this resume whenever relevant):\n${resumeText.slice(0, 4500)}`
-    );
-  }
-  if (jdText) {
-    profileSections.push(
-      `Target Job Description (align terminology, requirements, and priorities with this JD):\n${jdText.slice(0, 3500)}`
-    );
-  }
-
-  return [
-    "You are Crackpilot, a real-time interview assistant generating personalized, first-person spoken answers for the candidate.",
-    langRule,
-    styleRule,
-    "",
-    ...profileSections,
-    "",
-    "Output format rules (use clean markdown headings, zero filler intros):",
-    "### Quick Opener",
-    "One short natural first-person sentence the candidate can say immediately.",
-    "",
-    "### Key Talking Points",
-    "3 to 4 crisp, high-impact first-person bullet points tailored to the candidate's target profile, resume, and JD.",
-    "",
-    "### Example or Code (Only if relevant)",
-    "Include a concrete project example from the resume or a short code snippet when helpful.",
-  ].join("\n");
+interface TranscribeProfileContext {
+  role?: string;
+  experience?: string;
+  skills?: string;
+  jdText?: string;
 }
 
 async function transcribeWithOpenAI(
   audioBase64: string,
   mimeType: string,
-  language?: string
+  language?: string,
+  profileCtx?: TranscribeProfileContext
 ): Promise<string> {
   const apiKey = process.env.OPENAI_API_KEY!;
   const buffer = Buffer.from(audioBase64, "base64");
@@ -193,6 +186,13 @@ async function transcribeWithOpenAI(
   formData.append("model", "whisper-1");
   if (language && language !== "auto") {
     formData.append("language", language);
+  }
+  const vocabParts = [
+    profileCtx?.role ? `Interview role: ${profileCtx.role}.` : "",
+    profileCtx?.skills ? `Key domain terms: ${profileCtx.skills}.` : "",
+  ].filter(Boolean);
+  if (vocabParts.length > 0) {
+    formData.append("prompt", vocabParts.join(" ").slice(0, 800));
   }
 
   const resp = await fetch("https://api.openai.com/v1/audio/transcriptions", {
@@ -213,14 +213,33 @@ async function transcribeWithOpenAI(
 async function transcribeWithGemini(
   audioBase64: string,
   mimeType: string,
-  language?: string
+  language?: string,
+  profileCtx?: TranscribeProfileContext
 ): Promise<string> {
   const ai = getGeminiClient();
   const cleanMime = (mimeType || "audio/webm").split(";")[0].trim();
-  const hint =
+  const role = (profileCtx?.role || activeProfile.role || "").trim();
+  const skills = (profileCtx?.skills || activeProfile.skills || "").trim();
+  const jdSnippet = (profileCtx?.jdText || activeProfile.jdText || "").trim().slice(0, 600);
+
+  const profileHint = [
+    role ? `Target Role: ${role}` : "",
+    skills ? `Domain Core Skills & Tech Terms: ${skills}` : "",
+    jdSnippet ? `JD Context: ${jdSnippet}` : "",
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  const hint = [
     language === "hi"
-      ? "Transcribe the spoken interviewer audio accurately in Hindi/Hinglish. Output only the spoken transcript with no timestamps or commentary. If silent, return an empty string."
-      : "Transcribe the spoken interviewer audio accurately. Output only the spoken transcript with no timestamps or commentary. If silent, return an empty string.";
+      ? "Transcribe the remote interviewer's spoken question from this laptop/meeting system audio accurately in Hindi/Hinglish (keep technical/domain terms in English)."
+      : "Transcribe the remote interviewer's spoken question from this laptop/meeting system audio accurately.",
+    "PRONUNCIATION AUTO-ADJUSTMENT: The speaker may have a regional accent or slightly mispronounce technical/domain terms. Using the Target Profile below, automatically correct any phonetically similar or slightly mispronounced words into the exact intended domain terminology (for example: 'eye dock' -> 'IDoc', 'bappy' -> 'BAPI', 'cube netties' -> 'Kubernetes', 'red ducks' -> 'Redux', 'pie spark' -> 'PySpark', 's four hana' -> 'S/4HANA').",
+    profileHint ? `TARGET PROFILE CONTEXT:\n${profileHint}` : "",
+    "Output ONLY the clean, adjusted spoken question text with no timestamps, labels, or commentary. If silent or only background noise, return an empty string.",
+  ]
+    .filter(Boolean)
+    .join("\n\n");
 
   const response = await ai.models.generateContent({
     model: "gemini-3.5-transcribe",
@@ -314,7 +333,27 @@ async function startServer() {
 
   // Health & Config
   app.get("/api/health", (_req, res) => {
-    res.json({ ok: true, ts: Date.now() });
+    const cleanEnv = (k: string) => {
+      const v = (process.env[k] || "").trim().replace(/^['"]|['"]$/g, "");
+      return Boolean(v && !/your_|placeholder/i.test(v));
+    };
+    const groq = cleanEnv("GROQ_API_KEY");
+    const deepgram = cleanEnv("DEEPGRAM_API_KEY");
+    const openai = hasOpenAIKey();
+    const gemini = cleanEnv("GEMINI_API_KEY");
+    res.json({
+      ok: true,
+      sseSupported: true,
+      ts: Date.now(),
+      engines: {
+        groq,
+        deepgram,
+        openai,
+        gemini,
+        sttReady: deepgram || openai || gemini,
+        llmReady: groq || openai || gemini,
+      },
+    });
   });
 
   app.get("/api/config", (_req, res) => {
@@ -339,14 +378,32 @@ async function startServer() {
   app.post("/api/auth/login", (req, res) => {
     const { email, name } = req.body as { email?: string; name?: string };
     const cleanEmail = (email || "candidate@crackpilot.app").trim();
-    const cleanName =
-      (name || cleanEmail.split("@")[0] || "Candidate").trim();
+    const managed = findAccountByEmail(cleanEmail);
+    const cleanName = (
+      name ||
+      managed?.label ||
+      cleanEmail.split("@")[0] ||
+      "Candidate"
+    ).trim();
     currentUser = {
-      id: "usr-" + crypto.randomBytes(4).toString("hex"),
+      id: managed?.id || "usr-" + crypto.randomBytes(4).toString("hex"),
       name: cleanName.charAt(0).toUpperCase() + cleanName.slice(1),
       email: cleanEmail,
     };
-    res.json({ ok: true, user: currentUser });
+
+    let linkedTokenPayload: (StoredToken & { quota?: ReturnType<typeof buildQuotaSnapshot> }) | null = null;
+    if (managed) {
+      const quota = buildQuotaSnapshot(managed);
+      activeToken = {
+        token: managed.token,
+        createdAt: managed.createdAt,
+        authenticated: false,
+        sessionActive: false,
+      };
+      linkedTokenPayload = { ...activeToken, quota };
+    }
+
+    res.json({ ok: true, user: currentUser, token: linkedTokenPayload });
   });
 
   app.post("/api/auth/logout", (_req, res) => {
@@ -578,29 +635,89 @@ async function startServer() {
   app.get("/api/admin/accounts", requireAdminAuth, (req, res) => {
     const search = String(req.query.search || "");
     const rawFilter = String(req.query.filter || "all");
-    const filter =
-      rawFilter === "active" || rawFilter === "demo" || rawFilter === "expired"
-        ? rawFilter
-        : "all";
+    const allowedFilters = ["all", "paid", "pending", "active", "demo", "expired"] as const;
+    const filter = (allowedFilters as readonly string[]).includes(rawFilter)
+      ? (rawFilter as (typeof allowedFilters)[number])
+      : "all";
 
-    const all = listAllAccounts();
     const filtered = listAllAccounts({ search, filter });
+    const stats = computeAdminStats();
 
     res.setHeader("Cache-Control", "no-store");
     res.json({
       ok: true,
       accounts: filtered,
-      stats: {
-        total: all.length,
-        active: all.filter((a) => a.status === "Active").length,
-        demo: all.filter((a) => a.accountType === "DEMO").length,
-        expiredOrSuspended: all.filter(
-          (a) => a.status === "Expired" || a.status === "Suspended"
-        ).length,
-      },
+      stats,
     });
   });
 
+  // Create New User ID (with Full Name, Email, Password, Plan Type, Minutes, Quota, Payment Status)
+  app.post("/api/admin/accounts", requireAdminAuth, (req, res) => {
+    if (!verifyAdminCsrf(req, res)) return;
+    const {
+      label,
+      email,
+      password,
+      planType,
+      paymentStatus,
+      minutes,
+      captureLimit,
+      promptLimit,
+      expiryHours,
+      notes,
+    } = req.body as {
+      label?: string;
+      email?: string;
+      password?: string;
+      planType?: PlanType;
+      paymentStatus?: PaymentStatus;
+      minutes?: number;
+      captureLimit?: number;
+      promptLimit?: number;
+      expiryHours?: number | null;
+      notes?: string;
+    };
+
+    const cleanLabel = String(label || "").trim();
+    if (!cleanLabel) {
+      res.status(400).json({ error: "Full Name is required." });
+      return;
+    }
+
+    const validPlan: PlanType =
+      planType === "Demo" ||
+      planType === "Starter" ||
+      planType === "Pro Plan" ||
+      planType === "Unlimited"
+        ? planType
+        : "Pro Plan";
+    const validPayment: PaymentStatus = paymentStatus === "Paid" ? "Paid" : "Pending";
+    const isDemo = validPlan === "Demo";
+
+    const { account, generatedPassword } = createManagedAccount({
+      label: cleanLabel,
+      email: typeof email === "string" ? email : "",
+      password: typeof password === "string" ? password : "",
+      accountType: isDemo ? "DEMO" : "REGULAR",
+      planType: validPlan,
+      paymentStatus: validPayment,
+      minutes: Number(minutes) > 0 ? Number(minutes) : isDemo ? 30 : 240,
+      captureLimit: Number(captureLimit) > 0 ? Number(captureLimit) : isDemo ? 15 : 80,
+      promptLimit: Number(promptLimit) > 0 ? Number(promptLimit) : undefined,
+      expiryHours:
+        expiryHours === null ? 48 : Number(expiryHours) > 0 ? Number(expiryHours) : 48,
+      notes: typeof notes === "string" ? notes : undefined,
+    });
+
+    res.status(201).json({
+      ok: true,
+      account,
+      generatedPassword,
+      quota: buildQuotaSnapshot(account),
+    });
+  });
+
+  // 1-Click Dummy / Demo ID Generator
   app.post("/api/admin/accounts/demo", requireAdminAuth, (req, res) => {
     if (!verifyAdminCsrf(req, res)) return;
     const {
@@ -623,29 +740,32 @@ async function startServer() {
       notes?: string;
     };
 
-    const cleanLabel = String(label || "").trim();
-    if (!cleanLabel) {
-      res.status(400).json({ error: "Team member / user name is required." });
-      return;
-    }
-
     const type: AccountType = accountType === "REGULAR" ? "REGULAR" : "DEMO";
-    const created = createManagedAccount({
+    const cleanLabel =
+      String(label || "").trim() ||
+      (type === "DEMO"
+        ? `Live Demo #${crypto.randomBytes(2).toString("hex").toUpperCase()}`
+        : "New User");
+
+    const { account, generatedPassword } = createManagedAccount({
       label: cleanLabel,
       email: typeof email === "string" ? email : "",
       accountType: type,
-      minutes: Number(minutes) || 30,
-      captureLimit: Number(captureLimit) || 15,
+      planType: type === "DEMO" ? "Demo" : "Starter",
+      paymentStatus: "Pending",
+      minutes: Number(minutes) > 0 ? Number(minutes) : 30,
+      captureLimit: Number(captureLimit) > 0 ? Number(captureLimit) : 15,
       promptLimit: promptLimit ? Number(promptLimit) : undefined,
       expiryHours:
-        expiryHours === null ? null : Number(expiryHours) > 0 ? Number(expiryHours) : 24,
+        expiryHours === null ? 48 : Number(expiryHours) > 0 ? Number(expiryHours) : 24,
       notes: typeof notes === "string" ? notes : undefined,
     });
 
     res.status(201).json({
       ok: true,
-      account: created,
-      quota: buildQuotaSnapshot(created),
+      account,
+      generatedPassword,
+      quota: buildQuotaSnapshot(account),
     });
   });
 
@@ -657,6 +777,23 @@ async function startServer() {
       return;
     }
     const updated = updateAccountStatus(req.params.token, status);
+    if (!updated) {
+      res.status(404).json({ error: "Account token not found." });
+      return;
+    }
+    const quota = buildQuotaSnapshot(updated);
+    broadcastEvent({ type: "quota_updated", tokenValue: updated.token, quota });
+    res.json({ ok: true, account: updated, quota });
+  });
+
+  app.patch("/api/admin/accounts/:token/payment", requireAdminAuth, (req, res) => {
+    if (!verifyAdminCsrf(req, res)) return;
+    const { paymentStatus } = req.body as { paymentStatus?: PaymentStatus };
+    if (paymentStatus !== "Paid" && paymentStatus !== "Pending") {
+      res.status(400).json({ error: "paymentStatus must be Paid or Pending." });
+      return;
+    }
+    const updated = updateAccountPaymentStatus(req.params.token, paymentStatus);
     if (!updated) {
       res.status(404).json({ error: "Account token not found." });
       return;
@@ -733,11 +870,99 @@ async function startServer() {
       jdFileName: patch.jdFileName ?? activeProfile.jdFileName,
       jdText: patch.jdText ?? activeProfile.jdText,
       answerLanguage: patch.answerLanguage ?? activeProfile.answerLanguage,
-      answerStyle: patch.answerStyle ?? activeProfile.answerStyle,
+      answerStyle:
+        patch.answerStyle !== undefined
+          ? normalizeAnswerStyle(patch.answerStyle)
+          : activeProfile.answerStyle,
+      dsaModeEnabled:
+        typeof patch.dsaModeEnabled === "boolean"
+          ? patch.dsaModeEnabled
+          : activeProfile.dsaModeEnabled,
+      preferredLanguage:
+        patch.preferredLanguage !== undefined
+          ? normalizeProgrammingLanguage(patch.preferredLanguage)
+          : activeProfile.preferredLanguage,
       updatedAt: new Date().toISOString(),
     };
     broadcastEvent({ type: "profile_updated", profile: activeProfile });
     res.json({ ok: true, profile: activeProfile });
+  });
+
+  // Persistent DSA Coding & Assessment Context Routes
+  app.get("/api/dsa/context", (_req, res) => {
+    res.json({ ok: true, activeProblemContext });
+  });
+
+  app.post("/api/dsa/context/clear", (_req, res) => {
+    activeProblemContext = null;
+    broadcastEvent({ type: "dsa_problem_cleared" });
+    res.json({ ok: true });
+  });
+
+  app.post("/api/dsa/analyze", async (req, res) => {
+    try {
+      const {
+        problemText,
+        images,
+        preferredLanguage,
+        answerLanguage,
+        role,
+        experience,
+        source,
+        assessmentTypeOverride,
+        oaQuestionKindOverride,
+      } = req.body as {
+        problemText?: string;
+        images?: Array<{ data: string; mimeType: string }>;
+        preferredLanguage?: string;
+        answerLanguage?: string;
+        role?: string;
+        experience?: string;
+        source?: ActiveProblemContext["source"];
+        assessmentTypeOverride?: DsaAssessmentType;
+        oaQuestionKindOverride?: OaQuestionKind;
+      };
+
+      if (
+        (!problemText || !problemText.trim()) &&
+        (!Array.isArray(images) || images.length === 0)
+      ) {
+        res.status(400).json({
+          error: "Provide either problemText or captured screen images.",
+        });
+        return;
+      }
+
+      const dsaData = await analyzeDsaProblem({
+        problemText,
+        images,
+        preferredLanguage: preferredLanguage || activeProfile.preferredLanguage,
+        answerLanguage: answerLanguage || activeProfile.answerLanguage,
+        role: role || activeProfile.role,
+        experience: experience || activeProfile.experience,
+        source: source || "text_simulator",
+        assessmentTypeOverride,
+        oaQuestionKindOverride,
+      });
+
+      activeProblemContext = dsaData.problemContext;
+      broadcastEvent({
+        type: "dsa_problem_updated",
+        activeProblemContext,
+      });
+
+      res.json({
+        ok: true,
+        dsaData,
+        activeProblemContext,
+        summaryMarkdown: buildDsaAnalysisSummaryMarkdown(dsaData),
+      });
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "DSA analysis failed.";
+      console.error("[/api/dsa/analyze]", message);
+      res.status(500).json({ error: message });
+    }
   });
 
   app.post("/api/profile/extract", async (req, res) => {
@@ -809,6 +1034,7 @@ async function startServer() {
         type: "connected",
         token: activeToken,
         profile: activeProfile,
+        activeProblemContext,
       })}\n\n`
     );
     sseClients.add(res);
@@ -835,23 +1061,87 @@ async function startServer() {
     res.json({ ok: true, deliveredTo: sseClients.size });
   });
 
-  // Audio Transcription
+  // Audio Transcription (Target-Profile-aware pronunciation auto-adjustment)
   app.post("/api/transcribe", async (req, res) => {
     try {
-      const { audioBase64, mimeType, language } = req.body as {
-        audioBase64?: string;
-        mimeType?: string;
-        language?: string;
-      };
+      const { audioBase64, mimeType, language, role, experience, skills, jdText } =
+        req.body as {
+          audioBase64?: string;
+          mimeType?: string;
+          language?: string;
+          role?: string;
+          experience?: string;
+          skills?: string;
+          jdText?: string;
+        };
 
       if (!audioBase64) {
         res.status(400).json({ error: "Missing audioBase64 payload." });
         return;
       }
 
+      const profileCtx: TranscribeProfileContext = {
+        role: role || activeProfile.role,
+        experience: experience || activeProfile.experience,
+        skills: skills || activeProfile.skills,
+        jdText: jdText || activeProfile.jdText,
+      };
+
+      const dgKey = (process.env.DEEPGRAM_API_KEY || "")
+        .trim()
+        .replace(/^['"]|['"]$/g, "");
+      const hasDeepgram = Boolean(dgKey && !/your_|placeholder/i.test(dgKey));
+
+      if (hasDeepgram) {
+        const cleanMime =
+          (mimeType || "audio/webm").split(";")[0].trim() || "audio/webm";
+        const audioBuffer = Buffer.from(audioBase64, "base64");
+        const langParam =
+          language === "hi" ? "language=hi" : "detect_language=true";
+        const dgRes = await fetch(
+          `https://api.deepgram.com/v1/listen?model=nova-3&smart_format=true&punctuate=true&${langParam}`,
+          {
+            method: "POST",
+            headers: {
+              Authorization: `Token ${dgKey}`,
+              "Content-Type": cleanMime,
+            },
+            body: audioBuffer,
+          }
+        );
+        if (!dgRes.ok) {
+          const errText = await dgRes.text().catch(() => "");
+          throw new Error(
+            `Deepgram Nova-3 error (${dgRes.status}): ${errText.slice(0, 180)}`
+          );
+        }
+        const dgJson = (await dgRes.json()) as {
+          results?: {
+            channels?: Array<{
+              alternatives?: Array<{ transcript?: string }>;
+            }>;
+          };
+        };
+        const text = (
+          dgJson.results?.channels?.[0]?.alternatives?.[0]?.transcript || ""
+        ).trim();
+        res.json({ text, engine: "deepgram", model: "nova-3" });
+        return;
+      }
+
       const text = hasOpenAIKey()
-        ? await transcribeWithOpenAI(audioBase64, mimeType || "audio/webm", language)
-        : await transcribeWithGemini(audioBase64, mimeType || "audio/webm", language);
+        ? await transcribeWithOpenAI(
+            audioBase64,
+            mimeType || "audio/webm",
+            language,
+            profileCtx
+          )
+        : await transcribeWithGemini(
+            audioBase64,
+            mimeType || "audio/webm",
+            language,
+            profileCtx
+          );
 
       res.json({
         text,
@@ -865,7 +1155,7 @@ async function startServer() {
     }
   });
 
-  // Live Streaming Interview Answer (tailored to Target Profile + Resume + JD)
+  // Live Streaming Interview Answer (tailored to Target Profile + Resume + JD, or Active DSA Problem Context)
   app.post("/api/answer", async (req, res) => {
     const {
       token,
@@ -877,6 +1167,10 @@ async function startServer() {
       jdText,
       answerLanguage,
       answerStyle,
+      fastMode,
+      dsaModeEnabled,
+      preferredLanguage,
+      activeProblemContext: reqProblemContext,
       history = [],
     } = req.body as {
       token?: string;
@@ -888,6 +1182,10 @@ async function startServer() {
       jdText?: string;
       answerLanguage?: string;
       answerStyle?: string;
+      fastMode?: boolean;
+      dsaModeEnabled?: boolean;
+      preferredLanguage?: string;
+      activeProblemContext?: ActiveProblemContext | null;
       history?: Array<{ question: string; answer: string }>;
     };
 
@@ -921,15 +1219,41 @@ async function startServer() {
       res.write(`data: ${JSON.stringify(payload)}\n\n`);
     };
 
-    const systemPrompt = buildInterviewSystemPrompt({
-      role,
-      experience,
-      skills,
-      resumeText,
-      jdText,
-      answerLanguage,
-      answerStyle,
-    });
+    const effectiveDsaMode =
+      typeof dsaModeEnabled === "boolean"
+        ? dsaModeEnabled
+        : activeProfile.dsaModeEnabled;
+    const boundProblem =
+      reqProblemContext !== undefined ? reqProblemContext : activeProblemContext;
+    const effectiveProgLang = normalizeProgrammingLanguage(
+      preferredLanguage ||
+        boundProblem?.preferredLanguage ||
+        activeProfile.preferredLanguage
+    );
+
+    const isDsaFollowUp = Boolean(effectiveDsaMode && boundProblem);
+
+    const isCodeReq = !isDsaFollowUp && isCodeCreationRequest(question);
+
+    const systemPrompt = isDsaFollowUp
+      ? buildDsaFollowUpSystemPrompt({
+          problemContext: boundProblem!,
+          preferredLanguage: effectiveProgLang,
+          answerLanguage: answerLanguage || activeProfile.answerLanguage,
+          role: role || activeProfile.role,
+          experience: experience || activeProfile.experience,
+        })
+      : buildInterviewSystemPrompt({
+          role,
+          experience,
+          skills,
+          resumeText,
+          jdText,
+          answerLanguage,
+          answerStyle,
+          fastMode: Boolean(fastMode),
+          question: question.trim(),
+        });
 
     const recentContext =
       Array.isArray(history) && history.length > 0
@@ -937,16 +1261,87 @@ async function startServer() {
             .slice(-3)
             .map(
               (item, idx) =>
-                `Previous Q${idx + 1}: ${item.question}\nPrevious A${idx + 1}: ${item.answer.slice(0, 300)}`
+                `Previous Q${idx + 1}: ${item.question}\nPrevious A${idx + 1}: ${item.answer.slice(0, 350)}`
             )
             .join("\n\n")
         : "";
 
-    const userPrompt = recentContext
-      ? `Recent interview context:\n${recentContext}\n\nInterviewer just asked:\n"${question.trim()}"\n\nGenerate the personalized live interview answer now.`
-      : `Interviewer just asked:\n"${question.trim()}"\n\nGenerate the personalized live interview answer now.`;
+    const userPrompt = isDsaFollowUp
+      ? recentContext
+        ? `Recent coding discussion:\n${recentContext}\n\nInterviewer's live follow-up question on the current problem (${boundProblem!.title}):\n"${question.trim()}"\n\nAnswer directly with natural spoken guidance, updated ${effectiveProgLang} code, and updated Time/Space complexity.`
+        : `Interviewer's live follow-up question on the current problem (${boundProblem!.title}):\n"${question.trim()}"\n\nAnswer directly with natural spoken guidance, updated ${effectiveProgLang} code, and updated Time/Space complexity.`
+      : isCodeReq
+        ? recentContext
+          ? `Recent interview context:\n${recentContext}\n\nInterviewer just asked:\n"${question.trim()}"\n\nRespond strictly in two parts: (1) one crisp 3-4 sentence first-person developer summary paragraph with backticked identifiers and zero AI filler, immediately followed by (2) one complete runnable fenced code block with the exact language tag. Output zero text after the code block.`
+          : `Interviewer just asked:\n"${question.trim()}"\n\nRespond strictly in two parts: (1) one crisp 3-4 sentence first-person developer summary paragraph with backticked identifiers and zero AI filler, immediately followed by (2) one complete runnable fenced code block with the exact language tag. Output zero text after the code block.`
+        : recentContext
+          ? `Recent interview context:\n${recentContext}\n\nInterviewer just asked:\n"${question.trim()}"\n\nAnswer directly in natural human spoken language matching the exact Answer Style rules.`
+          : `Interviewer just asked:\n"${question.trim()}"\n\nAnswer directly in natural human spoken language matching the exact Answer Style rules.`;
 
     try {
+      const groqKey = (process.env.GROQ_API_KEY || "")
+        .trim()
+        .replace(/^['"]|['"]$/g, "");
+      if (groqKey && !/your_|placeholder/i.test(groqKey)) {
+        sendEvent({ meta: { engine: "groq", model: "llama-3.3-70b-versatile" } });
+        const groqRes = await fetch(
+          "https://api.groq.com/openai/v1/chat/completions",
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${groqKey}`,
+            },
+            body: JSON.stringify({
+              model: "llama-3.3-70b-versatile",
+              stream: true,
+              temperature: 0.35,
+              max_tokens: 1400,
+              messages: [
+                { role: "system", content: systemPrompt },
+                { role: "user", content: userPrompt },
+              ],
+            }),
+          }
+        );
+
+        if (!groqRes.ok || !groqRes.body) {
+          const errText = await groqRes.text().catch(() => "");
+          throw new Error(
+            `Groq API error (${groqRes.status}): ${errText.slice(0, 180)}`
+          );
+        }
+
+        const reader = groqRes.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n");
+          buffer = lines.pop() || "";
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed.startsWith("data:")) continue;
+            const dataStr = trimmed.slice(5).trim();
+            if (!dataStr || dataStr === "[DONE]") continue;
+            try {
+              const parsed = JSON.parse(dataStr) as {
+                choices?: Array<{ delta?: { content?: string } }>;
+              };
+              const delta = parsed.choices?.[0]?.delta?.content;
+              if (delta) sendEvent({ chunk: delta, text: delta });
+            } catch {
+              // Ignore incomplete fragments
+            }
+          }
+        }
+        sendEvent({ done: true });
+        res.end();
+        return;
+      }
+
       if (hasOpenAIKey()) {
         sendEvent({ meta: { engine: "openai", model: "gpt-4o-mini" } });
         const openaiRes = await fetch(
@@ -1003,16 +1398,14 @@ async function startServer() {
         return;
       }
 
-      sendEvent({ meta: { engine: "gemini", model: "gemini-4-hydrogen" } });
-      const ai = getGeminiClient();
-      const stream = await ai.models.generateContentStream({
-        model: "gemini-4-hydrogen",
+      const { model, stream } = await generateContentStreamResilient({
         contents: userPrompt,
         config: {
           systemInstruction: systemPrompt,
           thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
         },
       });
+      sendEvent({ meta: { engine: "gemini", model } });
 
       for await (const chunk of stream) {
         if (chunk.text) sendEvent({ chunk: chunk.text });
@@ -1028,7 +1421,7 @@ async function startServer() {
     }
   });
 
-  // Screen & Chat Box Capture Solver
+  // Screen & Chat Box Capture Solver (supports both standard mode & DSA Coding / OA Teleprompter)
   app.post("/api/analyze-screen", async (req, res) => {
     const {
       token,
@@ -1037,6 +1430,9 @@ async function startServer() {
       role,
       answerLanguage,
       answerStyle,
+      dsaModeEnabled,
+      preferredLanguage,
+      source = "alt_s",
     } = req.body as {
       token?: string;
       imageBase64?: string;
@@ -1044,6 +1440,9 @@ async function startServer() {
       role?: string;
       answerLanguage?: string;
       answerStyle?: string;
+      dsaModeEnabled?: boolean;
+      preferredLanguage?: string;
+      source?: ActiveProblemContext["source"];
     };
 
     if (!imageBase64) {
@@ -1079,6 +1478,44 @@ async function startServer() {
       res.write(`data: ${JSON.stringify(payload)}\n\n`);
     };
 
+    const effectiveDsaMode =
+      typeof dsaModeEnabled === "boolean"
+        ? dsaModeEnabled
+        : activeProfile.dsaModeEnabled;
+
+    if (effectiveDsaMode) {
+      try {
+        sendEvent({ meta: { engine: "gemini", model: "gemini-4-hydrogen (DSA Mode)" } });
+        const dsaData = await analyzeDsaProblem({
+          images: [{ data: imageBase64, mimeType }],
+          preferredLanguage: preferredLanguage || activeProfile.preferredLanguage,
+          answerLanguage: answerLanguage || activeProfile.answerLanguage,
+          role: role || activeProfile.role,
+          experience: activeProfile.experience,
+          source,
+        });
+        activeProblemContext = dsaData.problemContext;
+        broadcastEvent({
+          type: "dsa_problem_updated",
+          activeProblemContext,
+        });
+        sendEvent({
+          dsaData,
+          chunk: buildDsaAnalysisSummaryMarkdown(dsaData),
+        });
+        sendEvent({ done: true });
+        res.end();
+        return;
+      } catch (error) {
+        const message =
+          error instanceof Error ? error.message : "DSA screen analysis failed.";
+        console.error("[/api/analyze-screen DSA]", message);
+        sendEvent({ error: message });
+        res.end();
+        return;
+      }
+    }
+
     const systemPrompt = buildInterviewSystemPrompt({
       role,
       answerLanguage,
@@ -1086,7 +1523,7 @@ async function startServer() {
     });
 
     const userInstruction =
-      "Inspect this captured screen image carefully. Find any question visible in a chat box, meeting chat, coding editor, assessment page, slide, or browser window. First state the detected question briefly, then give a direct, accurate, personalized answer (with optimal code & complexity if it is a coding problem).";
+      "Inspect this captured screen image carefully. Find any question visible in a chat box, meeting chat, coding editor, assessment page, slide, or browser window. Give a direct, natural human-spoken answer matching the Answer Style rules.";
 
     try {
       if (hasOpenAIKey()) {
@@ -1154,10 +1591,7 @@ async function startServer() {
         return;
       }
 
-      sendEvent({ meta: { engine: "gemini", model: "gemini-4-hydrogen" } });
-      const ai = getGeminiClient();
-      const stream = await ai.models.generateContentStream({
-        model: "gemini-4-hydrogen",
+      const { model, stream } = await generateContentStreamResilient({
         contents: {
           parts: [
             { inlineData: { mimeType, data: imageBase64 } },
@@ -1169,6 +1603,7 @@ async function startServer() {
           thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
         },
       });
+      sendEvent({ meta: { engine: "gemini", model } });
 
       for await (const chunk of stream) {
         if (chunk.text) sendEvent({ chunk: chunk.text });
@@ -1184,7 +1619,7 @@ async function startServer() {
     }
   });
 
-  // Multi-frame 4s–10s Video Page Scanner
+  // Multi-frame 4s–10s Video Page Scanner (supports standard mode & DSA Coding / OA Teleprompter)
   app.post("/api/analyze-video", async (req, res) => {
     const {
       token,
@@ -1194,6 +1629,8 @@ async function startServer() {
       role,
       answerLanguage,
       answerStyle,
+      dsaModeEnabled,
+      preferredLanguage,
     } = req.body as {
       token?: string;
       frames?: string[];
@@ -1202,6 +1639,8 @@ async function startServer() {
       role?: string;
       answerLanguage?: string;
       answerStyle?: string;
+      dsaModeEnabled?: boolean;
+      preferredLanguage?: string;
     };
 
     if (!Array.isArray(frames) || frames.length === 0) {
@@ -1238,13 +1677,51 @@ async function startServer() {
       res.write(`data: ${JSON.stringify(payload)}\n\n`);
     };
 
+    const effectiveDsaMode =
+      typeof dsaModeEnabled === "boolean"
+        ? dsaModeEnabled
+        : activeProfile.dsaModeEnabled;
+
+    if (effectiveDsaMode) {
+      try {
+        sendEvent({ meta: { engine: "gemini", model: "gemini-4-hydrogen (DSA Video)" } });
+        const dsaData = await analyzeDsaProblem({
+          images: boundedFrames.map((data) => ({ data, mimeType })),
+          preferredLanguage: preferredLanguage || activeProfile.preferredLanguage,
+          answerLanguage: answerLanguage || activeProfile.answerLanguage,
+          role: role || activeProfile.role,
+          experience: activeProfile.experience,
+          source: "alt_v",
+        });
+        activeProblemContext = dsaData.problemContext;
+        broadcastEvent({
+          type: "dsa_problem_updated",
+          activeProblemContext,
+        });
+        sendEvent({
+          dsaData,
+          chunk: buildDsaAnalysisSummaryMarkdown(dsaData),
+        });
+        sendEvent({ done: true });
+        res.end();
+        return;
+      } catch (error) {
+        const message =
+          error instanceof Error ? error.message : "DSA video analysis failed.";
+        console.error("[/api/analyze-video DSA]", message);
+        sendEvent({ error: message });
+        res.end();
+        return;
+      }
+    }
+
     const systemPrompt = buildInterviewSystemPrompt({
       role,
       answerLanguage,
       answerStyle,
     });
 
-    const userInstruction = `These ${boundedFrames.length} sequential frames were recorded over a ${durationSec}-second screen video scan of a webpage/chat. Inspect ALL frames, deduplicate overlapping content, list EVERY distinct question visible across the entire page, and provide a clear, accurate answer for each question numbered sequentially (### Question 1, ### Question 2, etc.).`;
+    const userInstruction = `These ${boundedFrames.length} sequential frames were recorded over a ${durationSec}-second screen video scan of a webpage/chat. Inspect ALL frames, deduplicate overlapping content, identify every distinct question visible across the page, and provide clear, natural human-spoken answers in order.`;
 
     try {
       if (hasOpenAIKey()) {
@@ -1308,10 +1785,7 @@ async function startServer() {
         return;
       }
 
-      sendEvent({ meta: { engine: "gemini", model: "gemini-4-hydrogen" } });
-      const ai = getGeminiClient();
-      const stream = await ai.models.generateContentStream({
-        model: "gemini-4-hydrogen",
+      const { model, stream } = await generateContentStreamResilient({
         contents: {
           parts: [
             ...boundedFrames.map((b64) => ({
@@ -1325,6 +1799,7 @@ async function startServer() {
           thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
         },
       });
+      sendEvent({ meta: { engine: "gemini", model } });
 
       for await (const chunk of stream) {
         if (chunk.text) sendEvent({ chunk: chunk.text });
@@ -1414,7 +1889,10 @@ async function startServer() {
   }
 
   const httpServer = http.createServer(app);
-  attachLiveQaWebSocketServer(httpServer);
+  attachLiveQaWebSocketServer(httpServer, {
+    getProfile: () => activeProfile,
+    getActiveProblem: () => activeProblemContext,
+  });
 
   httpServer.listen(PORT, "0.0.0.0", () => {
     console.log(`Crackpilot server running on http://localhost:${PORT}`);

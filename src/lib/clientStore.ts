@@ -1,5 +1,32 @@
-import type { SessionTokenState, TargetProfile, UserAccount } from "../types";
-import { apiUrl, getApiBaseUrl, hasConfiguredBackend, isDesktopApp } from "./api";
+import type {
+  AccountQuotaSnapshot,
+  ActiveProblemContext,
+  DsaAssessmentType,
+  DsaTeleprompterData,
+  OaQuestionKind,
+  SessionTokenState,
+  TargetProfile,
+  UserAccount,
+} from "../types";
+import {
+  normalizeAnswerStyle,
+  normalizeProgrammingLanguage,
+} from "../data/roleSkills";
+import { apiUrl, isDesktopApp } from "./api";
+
+function normalizeProfileRecord(
+  raw: TargetProfile | null | undefined,
+  fallback: TargetProfile
+): TargetProfile {
+  if (!raw) return fallback;
+  return {
+    ...fallback,
+    ...raw,
+    answerStyle: normalizeAnswerStyle(raw.answerStyle),
+    dsaModeEnabled: Boolean(raw.dsaModeEnabled),
+    preferredLanguage: normalizeProgrammingLanguage(raw.preferredLanguage),
+  };
+}
 
 const STORAGE_KEYS = {
   user: "crackpilot_user_v1",
@@ -23,12 +50,10 @@ export type ApiJsonResult<T> =
 
 let cachedBackendHealth: boolean | null = null;
 let inflightHealthProbe: Promise<boolean> | null = null;
-let loggedStandaloneNotice = false;
 
 export function resetBackendHealthCache(): void {
   cachedBackendHealth = null;
   inflightHealthProbe = null;
-  loggedStandaloneNotice = false;
 }
 
 function readStorage<T>(key: string): T | null {
@@ -123,16 +148,6 @@ export async function tryApiJson<T>(
   path: string,
   init?: RequestInit
 ): Promise<ApiJsonResult<T>> {
-  if (!hasConfiguredBackend()) {
-    if (!loggedStandaloneNotice) {
-      loggedStandaloneNotice = true;
-      console.info(
-        "[Crackpilot API] Standalone Desktop mode (no remote backend server URL configured). Using local auth/workspace store."
-      );
-    }
-    return { reachable: false, reason: "no-backend-configured" };
-  }
-
   const targetUrl = apiUrl(path);
   const controller = new AbortController();
   const timer =
@@ -212,10 +227,6 @@ export async function tryApiJson<T>(
  * Prevents EventSource MIME console errors on static Vercel deployments and standalone Electron.
  */
 export async function probeBackendHealth(force = false): Promise<boolean> {
-  if (!hasConfiguredBackend()) {
-    cachedBackendHealth = false;
-    return false;
-  }
   if (!force && cachedBackendHealth !== null) {
     return cachedBackendHealth;
   }
@@ -223,17 +234,20 @@ export async function probeBackendHealth(force = false): Promise<boolean> {
     return inflightHealthProbe;
   }
 
-  inflightHealthProbe = tryApiJson<{ ok?: boolean }>("/api/health", {
-    cache: "no-store",
-  })
+  inflightHealthProbe = tryApiJson<{ ok?: boolean; sseSupported?: boolean }>(
+    "/api/health",
+    {
+      cache: "no-store",
+    }
+  )
     .then((res) => {
-      const healthy = Boolean(res.reachable && res.ok && res.data?.ok);
+      const healthy = Boolean(
+        res.reachable &&
+          res.ok &&
+          res.data?.ok &&
+          res.data?.sseSupported !== false
+      );
       cachedBackendHealth = healthy;
-      if (!healthy) {
-        console.info(
-          `[Crackpilot Health] Backend not detected at "${getApiBaseUrl() || "same-origin"}/api/health" (reason=${res.reachable ? `status-${res.status}` : res.reason}). Running in static/local sync mode.`
-        );
-      }
       return healthy;
     })
     .finally(() => {
@@ -261,17 +275,20 @@ export async function hydrateWorkspaceState(defaultProfile: TargetProfile): Prom
     const token = desktop
       ? null
       : res.data.token ?? readStorage<SessionTokenState>(STORAGE_KEYS.token);
-    const profile =
-      res.data.profile ??
-      readStorage<TargetProfile>(STORAGE_KEYS.profile) ??
-      defaultProfile;
+    const profile = normalizeProfileRecord(
+      res.data.profile ?? readStorage<TargetProfile>(STORAGE_KEYS.profile),
+      defaultProfile
+    );
     return { user, token, profile };
   }
 
   return {
     user: readStorage<UserAccount>(STORAGE_KEYS.user),
     token: desktop ? null : readStorage<SessionTokenState>(STORAGE_KEYS.token),
-    profile: readStorage<TargetProfile>(STORAGE_KEYS.profile) ?? defaultProfile,
+    profile: normalizeProfileRecord(
+      readStorage<TargetProfile>(STORAGE_KEYS.profile),
+      defaultProfile
+    ),
   };
 }
 
@@ -286,6 +303,7 @@ export async function loginAccount(params: {
   const res = await tryApiJson<{
     ok?: boolean;
     user?: UserAccount;
+    token?: SessionTokenState | null;
     error?: string;
   }>("/api/auth/login", {
     method: "POST",
@@ -300,6 +318,10 @@ export async function loginAccount(params: {
       throw new Error(msg);
     }
     writeStorage(STORAGE_KEYS.user, res.data.user);
+    if (res.data.token) {
+      writeStorage(STORAGE_KEYS.token, res.data.token);
+      broadcastLocalSync({ type: "token_generated", token: res.data.token });
+    }
     return res.data.user;
   }
 
@@ -384,7 +406,7 @@ export async function verifySessionToken(submittedToken: string): Promise<{
   }
 
   const stored = readStorage<SessionTokenState>(STORAGE_KEYS.token);
-  const validFormat = /^CP-[A-Z0-9-]{6,}$/i.test(submitted);
+  const validFormat = /^(CP|DEMO)-[A-Z0-9-]{6,}$/i.test(submitted);
 
   // In Desktop .exe standalone mode, accept any freshly generated CP-... token from Dashboard
   if (isDesktopApp()) {
@@ -532,4 +554,187 @@ export async function extractDocumentText(params: {
   }
 
   return `[Uploaded ${params.file.name} — paste key bullet points here if running without a backend server]`;
+}
+
+function mergeQuotaIntoStoredToken(
+  tokenValue: string,
+  quota: AccountQuotaSnapshot
+): SessionTokenState | null {
+  const stored = readStorage<SessionTokenState>(STORAGE_KEYS.token);
+  if (!stored) return null;
+  if (stored.token && tokenValue && stored.token !== tokenValue) return stored;
+  const updated: SessionTokenState = {
+    ...stored,
+    quota,
+  };
+  writeStorage(STORAGE_KEYS.token, updated);
+  broadcastLocalSync({ type: "quota_updated", token: updated });
+  return updated;
+}
+
+function buildDefaultQuotaSnapshot(
+  tokenValue: string,
+  remainingSeconds = 240 * 60
+): AccountQuotaSnapshot {
+  const clamped = Math.max(0, Math.round(remainingSeconds));
+  const storedUser = readStorage<UserAccount>(STORAGE_KEYS.user);
+  return {
+    token: tokenValue,
+    label: storedUser?.name || "Candidate",
+    email: storedUser?.email || "",
+    accountType: "REGULAR",
+    planType: "Pro Plan",
+    paymentStatus: "Paid",
+    status: clamped <= 0 ? "Expired" : "Active",
+    remainingSeconds: clamped,
+    remainingMinutes: Math.ceil(clamped / 60),
+    capturesUsed: 0,
+    captureLimit: 80,
+    promptsUsed: 0,
+    promptLimit: 80,
+    expiresAt: null,
+    blockedReason:
+      clamped <= 0
+        ? "Remaining time is 0 minutes. Ask the admin to add extra time, then click Reconnect."
+        : null,
+  };
+}
+
+export function deductLocalRemainingSeconds(
+  tokenValue: string,
+  elapsedSeconds: number
+): AccountQuotaSnapshot | null {
+  const delta = Math.max(0, Math.round(elapsedSeconds));
+  if (delta <= 0) return null;
+  const stored = readStorage<SessionTokenState>(STORAGE_KEYS.token);
+  if (!stored) return null;
+  if (stored.token && tokenValue && stored.token !== tokenValue) return null;
+  const baseQuota =
+    stored.quota ?? buildDefaultQuotaSnapshot(stored.token, 240 * 60);
+  const nextRemaining = Math.max(0, baseQuota.remainingSeconds - delta);
+  const nextQuota: AccountQuotaSnapshot = {
+    ...baseQuota,
+    remainingSeconds: nextRemaining,
+    remainingMinutes: Math.ceil(nextRemaining / 60),
+    status: nextRemaining <= 0 ? "Expired" : baseQuota.status,
+    blockedReason:
+      nextRemaining <= 0
+        ? "Remaining time is 0 minutes. Ask the admin to add extra time, then click Reconnect."
+        : baseQuota.blockedReason,
+  };
+  mergeQuotaIntoStoredToken(stored.token, nextQuota);
+  return nextQuota;
+}
+
+export async function fetchTokenQuota(token: string): Promise<
+  | { ok: true; quota: AccountQuotaSnapshot }
+  | { ok: false; revoked?: boolean; error?: string; offline?: boolean }
+> {
+  const clean = token.trim();
+  if (!clean) return { ok: false, error: "Missing token." };
+  const res = await tryApiJson<{
+    ok?: boolean;
+    quota?: AccountQuotaSnapshot;
+    revoked?: boolean;
+    error?: string;
+  }>(`/api/token/quota?token=${encodeURIComponent(clean)}`, {
+    cache: "no-store",
+  });
+  if (!res.reachable) {
+    const stored = readStorage<SessionTokenState>(STORAGE_KEYS.token);
+    if (stored?.token === clean && stored.quota) {
+      return { ok: true, quota: stored.quota };
+    }
+    return { ok: false, offline: true };
+  }
+  if (!res.ok || !res.data.quota) {
+    return {
+      ok: false,
+      revoked: Boolean(res.data.revoked || res.status === 404),
+      error: res.data.error || "Could not sync quota.",
+    };
+  }
+  mergeQuotaIntoStoredToken(clean, res.data.quota);
+  return { ok: true, quota: res.data.quota };
+}
+
+export async function syncTokenElapsedSeconds(
+  token: string,
+  elapsedSeconds: number
+): Promise<
+  | { ok: true; quota: AccountQuotaSnapshot }
+  | { ok: false; revoked?: boolean; error?: string; offline?: boolean }
+> {
+  const clean = token.trim();
+  const delta = Math.max(0, Math.round(elapsedSeconds));
+  if (!clean || delta <= 0) return { ok: false, offline: true };
+  const res = await tryApiJson<{
+    ok?: boolean;
+    quota?: AccountQuotaSnapshot;
+    revoked?: boolean;
+    error?: string;
+  }>("/api/token/consume", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ token: clean, elapsedSeconds: delta }),
+  });
+  if (!res.reachable) {
+    const localQuota = deductLocalRemainingSeconds(clean, delta);
+    if (localQuota) {
+      return { ok: true, quota: localQuota };
+    }
+    return { ok: false, offline: true };
+  }
+  if (!res.ok || !res.data.quota) {
+    return {
+      ok: false,
+      revoked: Boolean(res.data.revoked || res.status === 404),
+      error: res.data.error || "Usage sync failed.",
+    };
+  }
+  mergeQuotaIntoStoredToken(clean, res.data.quota);
+  return { ok: true, quota: res.data.quota };
+}
+
+export async function clearActiveProblemContextClient(): Promise<void> {
+  await tryApiJson<{ ok?: boolean }>("/api/dsa/context/clear", {
+    method: "POST",
+  });
+}
+
+export async function analyzeDsaProblemClient(params: {
+  problemText?: string;
+  images?: Array<{ data: string; mimeType: string }>;
+  preferredLanguage?: string;
+  answerLanguage?: string;
+  role?: string;
+  experience?: string;
+  source?: ActiveProblemContext["source"];
+  assessmentTypeOverride?: DsaAssessmentType;
+  oaQuestionKindOverride?: OaQuestionKind;
+}): Promise<{
+  dsaData: DsaTeleprompterData;
+  activeProblemContext: ActiveProblemContext;
+  summaryMarkdown: string;
+}> {
+  const resp = await fetch(apiUrl("/api/dsa/analyze"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(params),
+  });
+  const data = (await resp.json()) as {
+    ok?: boolean;
+    dsaData?: DsaTeleprompterData;
+    activeProblemContext?: ActiveProblemContext;
+    summaryMarkdown?: string;
+    error?: string;
+  };
+  if (!resp.ok || !data.dsaData || !data.activeProblemContext) {
+    throw new Error(data.error || "DSA problem analysis failed.");
+  }
+  return {
+    dsaData: data.dsaData,
+    activeProblemContext: data.activeProblemContext,
+    summaryMarkdown: data.summaryMarkdown || "",
+  };
 }

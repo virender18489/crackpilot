@@ -1,8 +1,0 @@
-{
-  "name": "Crackpilot",
-  "description": "AI interview preparation and live-assist desktop and mobile workspace with pay-per-use credits.",
-  "requestFramePermissions": [],
-  "majorCapabilities": [
-    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
-  ]
-}

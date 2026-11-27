@@ -8,6 +8,20 @@ import {
   type LiveQaServerEvent,
   type LiveQaServerStatus,
 } from "../src/lib/liveQaPrompts.ts";
+import type {
+  ActiveProblemContext,
+  TargetProfile,
+} from "../src/types.ts";
+import {
+  buildDsaFollowUpSystemPrompt,
+  buildHumanInterviewSystemPrompt,
+  normalizeProgrammingLanguage,
+} from "./dsaEngine.ts";
+
+export interface LiveQaContextProvider {
+  getProfile: () => TargetProfile;
+  getActiveProblem: () => ActiveProblemContext | null;
+}
 
 const DEEPGRAM_WS_URL =
   "wss://api.deepgram.com/v1/listen?model=nova-3&encoding=linear16&sample_rate=16000&channels=1&smart_format=true&interim_results=true&endpointing=900&utterance_end_ms=1200";
@@ -72,7 +86,36 @@ type ClientInboundMessage =
   | ClientTextQuestionMessage
   | ClientStopMessage;
 
-export function attachLiveQaWebSocketServer(httpServer: http.Server): void {
+export function attachLiveQaWebSocketServer(
+  httpServer: http.Server,
+  contextProvider?: LiveQaContextProvider
+): void {
+  const buildDynamicLiveSystemPrompt = (): string => {
+    if (!contextProvider) return HUMAN_LIVE_QA_SYSTEM_PROMPT;
+    const profile = contextProvider.getProfile();
+    const activeProblem = contextProvider.getActiveProblem();
+    if (profile.dsaModeEnabled && activeProblem) {
+      return buildDsaFollowUpSystemPrompt({
+        problemContext: activeProblem,
+        preferredLanguage: normalizeProgrammingLanguage(
+          profile.preferredLanguage || activeProblem.preferredLanguage
+        ),
+        answerLanguage: profile.answerLanguage,
+        role: profile.role,
+        experience: profile.experience,
+      });
+    }
+    return buildHumanInterviewSystemPrompt({
+      role: profile.role,
+      experience: profile.experience,
+      skills: profile.skills,
+      resumeText: profile.resumeText,
+      jdText: profile.jdText,
+      answerLanguage: profile.answerLanguage,
+      answerStyle: profile.answerStyle,
+    });
+  };
+
   const wss = new WebSocketServer({ noServer: true });
 
   httpServer.on("upgrade", (req, socket, head) => {
@@ -158,10 +201,10 @@ export function attachLiveQaWebSocketServer(httpServer: http.Server): void {
             body: JSON.stringify({
               model: GROQ_MODEL,
               stream: true,
-              temperature: 0.78,
-              max_tokens: 200,
+              temperature: 0.72,
+              max_tokens: 340,
               messages: [
-                { role: "system", content: HUMAN_LIVE_QA_SYSTEM_PROMPT },
+                { role: "system", content: buildDynamicLiveSystemPrompt() },
                 ...conversationHistory.slice(-4),
                 { role: "user", content: trimmed },
               ],
@@ -428,7 +471,7 @@ export function attachLiveQaWebSocketServer(httpServer: http.Server): void {
             responseModalities: [Modality.AUDIO],
             inputAudioTranscription: {},
             outputAudioTranscription: {},
-            systemInstruction: HUMAN_LIVE_QA_SYSTEM_PROMPT,
+            systemInstruction: buildDynamicLiveSystemPrompt(),
           },
           callbacks: {
             onopen: () => {

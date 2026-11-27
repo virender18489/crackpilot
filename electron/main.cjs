@@ -10,8 +10,10 @@ const {
 const fs = require("fs");
 const path = require("path");
 
-const APP_VERSION = "1.0.5";
+const APP_VERSION = "1.0.7";
+const PRODUCTION_OVERLAY_URL = "https://crackpilot.vercel.app/?mode=software";
 let mainWindow = null;
+let isBehindMode = false;
 
 function logInfo(...args) {
   console.log("[Crackpilot Main]", ...args);
@@ -46,12 +48,36 @@ function enforceStealthWindowFlags(win) {
   try {
     win.setMenuBarVisibility(false);
     win.setSkipTaskbar(true);
-    // win.setContentProtection(true); // Commented out so window remains visible on Print Screen / screenshots (uncomment to re-enable)
-    // win.setAlwaysOnTop(true, "screen-saver"); // Uncomment when re-enabling screen-capture protection
+    // Keep overlay visible on top in both normal and Behind (click-through) states
+    win.setAlwaysOnTop(true, "screen-saver");
     win.setContentProtection(false);
   } catch (err) {
     logError("Failed to apply stealth window flags:", err);
   }
+}
+
+function setBehindMode(enabled) {
+  isBehindMode = Boolean(enabled);
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    try {
+      mainWindow.setAlwaysOnTop(true, "screen-saver");
+      if (isBehindMode) {
+        mainWindow.setIgnoreMouseEvents(true, { forward: true });
+        logInfo("Behind Mode ON (Alt+M): clicks and typing pass through to background window.");
+      } else {
+        mainWindow.setIgnoreMouseEvents(false);
+        mainWindow.show();
+        mainWindow.focus();
+        logInfo("Behind Mode OFF (Alt+M): Crackpilot window interactive and focused.");
+      }
+      if (!mainWindow.webContents.isDestroyed()) {
+        mainWindow.webContents.send("behind-mode-changed", isBehindMode);
+      }
+    } catch (err) {
+      logError("setBehindMode failed:", err);
+    }
+  }
+  return isBehindMode;
 }
 
 function showOverlayWindow() {
@@ -76,9 +102,12 @@ function showOverlayWindow() {
 function hideOverlayWindow() {
   if (!mainWindow || mainWindow.isDestroyed()) return false;
   try {
+    if (!mainWindow.webContents.isDestroyed()) {
+      mainWindow.webContents.send("crackpilot:window-minimized");
+    }
     mainWindow.setSkipTaskbar(true);
     mainWindow.hide();
-    logInfo("Overlay window hidden (Alt+H or Desktop icon restores it).");
+    logInfo("Overlay window hidden (timer paused).");
     return true;
   } catch (err) {
     logError("hideOverlayWindow failed:", err);
@@ -105,9 +134,7 @@ function createWindow() {
     frame: false,
     transparent: true,
     backgroundColor: "#00000000",
-    // TESTING MODE: commented out alwaysOnTop so Print Screen / Snipping Tool captures the window cleanly
-    // alwaysOnTop: true,
-    alwaysOnTop: false,
+    alwaysOnTop: true,
     skipTaskbar: true,
     resizable: true,
     minimizable: true,
@@ -148,23 +175,46 @@ function createWindow() {
     });
   }
 
-  // Intercept OS-level minimize (e.g. Win+D) so skipTaskbar:true never leaves a bottom-left stub
+  // Intercept OS-level minimize (e.g. Win+D) so skipTaskbar:true never leaves a bottom-left stub and timer pauses immediately
   win.on("minimize", (event) => {
     event.preventDefault();
-    logInfo("OS minimize intercepted — hiding overlay cleanly.");
+    logInfo("OS minimize intercepted — pausing timer and hiding overlay cleanly.");
     hideOverlayWindow();
+  });
+
+  win.on("close", () => {
+    if (!win.isDestroyed() && !win.webContents.isDestroyed()) {
+      win.webContents.send("crackpilot:window-closing");
+    }
   });
 
   win.webContents.on("preload-error", (_event, preloadFile, error) => {
     logError("CRITICAL preload-error in", preloadFile, error);
   });
 
+  const distIndex = path.join(__dirname, "../dist/index.html");
+  let fellBackToLocal = false;
+
+  const loadLocalFallback = (reason) => {
+    if (fellBackToLocal || win.isDestroyed()) return;
+    fellBackToLocal = true;
+    logError("Falling back to local packaged UI:", reason);
+    win.loadFile(distIndex, { query: { mode: "software" } }).catch((loadErr) => {
+      logError("Fallback loadFile failed:", loadErr);
+    });
+  };
+
   win.webContents.on(
     "did-fail-load",
-    (_event, errorCode, errorDescription, validatedURL) => {
+    (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
+      // Ignore benign aborted navigations (-3)
+      if (errorCode === -3) return;
       logError(
         `did-fail-load (${errorCode}): ${errorDescription} | URL: ${validatedURL}`
       );
+      if (isMainFrame && /^https?:\/\//i.test(validatedURL || "")) {
+        loadLocalFallback(`${errorDescription} (${errorCode})`);
+      }
     }
   );
 
@@ -172,21 +222,29 @@ function createWindow() {
     logError("Renderer process gone:", details);
   });
 
-  // Always open Crackpilot Software Authentication screen directly from Desktop icon
-  const remoteAppUrl = process.env.CRACKPILOT_APP_URL;
-  const distIndex = path.join(__dirname, "../dist/index.html");
+  // Always load the live hosted Vercel overlay URL in production so UI/API updates
+  // appear automatically in the .exe without re-downloading, while keeping preload.cjs attached.
+  const useLocalOnly = process.env.CRACKPILOT_USE_LOCAL === "1";
+  const configuredUrl = (
+    process.env.CRACKPILOT_APP_URL || PRODUCTION_OVERLAY_URL
+  ).trim();
 
-  if (remoteAppUrl) {
-    const targetUrl = remoteAppUrl.includes("?")
-      ? `${remoteAppUrl}&mode=software`
-      : `${remoteAppUrl}?mode=software`;
-    logInfo("Loading remote CRACKPILOT_APP_URL:", targetUrl);
-    win.loadURL(targetUrl).catch((err) => {
-      logError("Remote loadURL failed, falling back to local dist:", err);
-      win.loadFile(distIndex, { query: { mode: "software" } }).catch((loadErr) => {
-        logError("Fallback loadFile failed:", loadErr);
+  if (!useLocalOnly && /^https?:\/\//i.test(configuredUrl)) {
+    const targetUrl = configuredUrl.includes("mode=software")
+      ? configuredUrl
+      : configuredUrl.includes("?")
+        ? `${configuredUrl}&mode=software`
+        : `${configuredUrl}?mode=software`;
+    logInfo("Loading live remote Crackpilot overlay:", targetUrl);
+    session.defaultSession
+      .clearCache()
+      .catch(() => {})
+      .finally(() => {
+        if (win.isDestroyed()) return;
+        win.loadURL(targetUrl).catch((err) => {
+          loadLocalFallback(err?.message || String(err));
+        });
       });
-    });
   } else {
     logInfo("Loading local packaged UI:", distIndex);
     win.loadFile(distIndex, { query: { mode: "software" } }).catch((err) => {
@@ -203,7 +261,6 @@ function createWindow() {
 function registerIpcHandlers() {
   // With skipTaskbar: true + frameless transparent window on Windows 11,
   // hide() cleanly minimizes/hides the window immediately without leaving a taskbar icon.
-  // Press Alt+H or click the Desktop icon to restore it anytime.
   ipcMain.handle("crackpilot:minimize", () => {
     logInfo("IPC crackpilot:minimize invoked.");
     const hidden = hideOverlayWindow();
@@ -220,6 +277,14 @@ function registerIpcHandlers() {
     logInfo("IPC crackpilot:hide invoked.");
     const hidden = hideOverlayWindow();
     return { ok: hidden, hidden };
+  });
+
+  ipcMain.handle("crackpilot:close", () => {
+    logInfo("IPC crackpilot:close invoked — closing window after session disconnect.");
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.close();
+    }
+    return { ok: true };
   });
 
   ipcMain.handle("crackpilot:show", () => {
@@ -274,11 +339,42 @@ function registerIpcHandlers() {
   ipcMain.handle("crackpilot:set-always-on-top", (_ev, enabled) => {
     if (!mainWindow || mainWindow.isDestroyed()) return;
     try {
-      // TESTING MODE: Uncomment screen-saver level when re-enabling stealth protection
-      // mainWindow.setAlwaysOnTop(Boolean(enabled), "screen-saver");
-      mainWindow.setAlwaysOnTop(Boolean(enabled));
+      mainWindow.setAlwaysOnTop(Boolean(enabled), "screen-saver");
     } catch (err) {
       logError("set-always-on-top failed:", err);
+    }
+  });
+
+  ipcMain.handle("crackpilot:set-behind-mode", (_ev, enabled) => {
+    return setBehindMode(Boolean(enabled));
+  });
+
+  ipcMain.handle("crackpilot:toggle-behind-mode", () => {
+    return setBehindMode(!isBehindMode);
+  });
+
+  ipcMain.handle("crackpilot:get-behind-mode", () => {
+    return isBehindMode;
+  });
+
+  // Smart hover detection on the Behind / Write button:
+  // Temporarily allow mouse clicks ONLY while hovering directly over the Behind button so user can click to turn it OFF
+  ipcMain.handle("crackpilot:set-behind-hover", (_ev, hovering) => {
+    if (!mainWindow || mainWindow.isDestroyed()) return false;
+    try {
+      if (isBehindMode) {
+        if (hovering) {
+          mainWindow.setIgnoreMouseEvents(false);
+        } else {
+          mainWindow.setIgnoreMouseEvents(true, { forward: true });
+        }
+      } else {
+        mainWindow.setIgnoreMouseEvents(false);
+      }
+      return true;
+    } catch (err) {
+      logError("set-behind-hover failed:", err);
+      return false;
     }
   });
 
@@ -288,45 +384,103 @@ function registerIpcHandlers() {
     }
     logError("Blocked invalid external URL:", url);
   });
+
+  ipcMain.handle("crackpilot:reload-live", async () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return { ok: false };
+    try {
+      await session.defaultSession.clearCache().catch(() => {});
+      const configuredUrl = (
+        process.env.CRACKPILOT_APP_URL || PRODUCTION_OVERLAY_URL
+      ).trim();
+      const targetUrl = configuredUrl.includes("mode=software")
+        ? configuredUrl
+        : configuredUrl.includes("?")
+          ? `${configuredUrl}&mode=software`
+          : `${configuredUrl}?mode=software`;
+      logInfo("IPC crackpilot:reload-live -> reloading fresh Vercel overlay:", targetUrl);
+      await mainWindow.loadURL(targetUrl);
+      return { ok: true };
+    } catch (err) {
+      logError("reload-live failed, reloading current contents:", err);
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.reloadIgnoringCache();
+      }
+      return { ok: false };
+    }
+  });
 }
 
 app.whenReady().then(() => {
   logInfo(`Electron app ready (v${APP_VERSION}, platform=${process.platform}).`);
 
+  const allowedPermissions = new Set([
+    "media",
+    "microphone",
+    "camera",
+    "display-capture",
+    "audioCapture",
+    "speaker-selection",
+    "mediaKeySystem",
+    "clipboard-read",
+    "clipboard-sanitized-write",
+  ]);
+
   session.defaultSession.setPermissionRequestHandler(
     (_webContents, permission, callback) => {
-      const allowed = [
-        "media",
-        "display-capture",
-        "audioCapture",
-        "clipboard-read",
-        "clipboard-sanitized-write",
-      ];
-      callback(allowed.includes(permission));
+      const granted = allowedPermissions.has(permission);
+      if (granted) {
+        logInfo("Auto-approved permission request:", permission);
+      }
+      callback(granted);
     }
   );
+
+  if (typeof session.defaultSession.setPermissionCheckHandler === "function") {
+    session.defaultSession.setPermissionCheckHandler(
+      (_webContents, permission) => {
+        return allowedPermissions.has(permission);
+      }
+    );
+  }
 
   if (typeof session.defaultSession.setDisplayMediaRequestHandler === "function") {
     session.defaultSession.setDisplayMediaRequestHandler(
       async (_request, callback) => {
         try {
           const sources = await desktopCapturer.getSources({
-            types: ["screen"],
+            types: ["screen", "window"],
           });
-          if (sources.length > 0) {
-            callback({ video: sources[0], audio: "loopback" });
+          const primaryScreen =
+            sources.find((s) => s.id.startsWith("screen:")) || sources[0];
+          if (primaryScreen) {
+            logInfo(
+              "Auto-granted display media with system audio loopback:",
+              primaryScreen.name || primaryScreen.id
+            );
+            callback({ video: primaryScreen, audio: "loopback" });
             return;
           }
         } catch (err) {
           logError("desktopCapturer.getSources failed:", err);
         }
         callback({});
-      }
+      },
+      { useSystemPicker: false }
     );
   }
 
   registerIpcHandlers();
   createWindow();
+
+  // Global Alt+M shortcut to toggle Behind (click-through) mode even when focus is on a background app
+  const registeredBehind = globalShortcut.register("Alt+M", () => {
+    setBehindMode(!isBehindMode);
+  });
+  if (!registeredBehind) {
+    logError("Could not register global shortcut Alt+M (may be in use by another app).");
+  } else {
+    logInfo("Registered global shortcut Alt+M for Behind (click-through) mode.");
+  }
 
   // === TEMPORARILY COMMENTED OUT: Alt+H global shortcut (uncomment when requested) ===
   // const registered = globalShortcut.register("Alt+H", () => {

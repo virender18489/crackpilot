@@ -1,13 +1,23 @@
 import type { IncomingMessage, ServerResponse } from "http";
-import { GoogleGenAI, ThinkingLevel } from "@google/genai";
+import { ThinkingLevel } from "@google/genai";
+import {
+  analyzeDsaProblem,
+  buildDsaAnalysisSummaryMarkdown,
+  buildHumanInterviewSystemPrompt,
+  generateContentStreamResilient,
+  normalizeProgrammingLanguage,
+} from "../server/dsaEngine.ts";
 
 interface VideoBody {
   frames?: string[];
   durationSec?: number;
   role?: string;
   experience?: string;
+  skills?: string;
   answerLanguage?: string;
   answerStyle?: string;
+  dsaModeEnabled?: boolean;
+  preferredLanguage?: string;
 }
 
 async function readJsonBody<T>(req: IncomingMessage): Promise<T> {
@@ -55,15 +65,35 @@ export default async function handler(
   };
 
   try {
-    const geminiKey = process.env.GEMINI_API_KEY?.trim();
-    if (!geminiKey) {
-      throw new Error(
-        "Configure GEMINI_API_KEY in Vercel Environment Variables to use Video Scan."
-      );
+    if (body.dsaModeEnabled) {
+      const preferredLanguage = normalizeProgrammingLanguage(body.preferredLanguage);
+      const dsaData = await analyzeDsaProblem({
+        images: frames.slice(0, 4).map((data) => ({
+          data,
+          mimeType: "image/jpeg",
+        })),
+        preferredLanguage,
+        answerLanguage: body.answerLanguage || "English",
+        role: body.role,
+        experience: body.experience,
+        source: "alt_v",
+      });
+      const summary = buildDsaAnalysisSummaryMarkdown(dsaData);
+      sendEvent({ dsaData, activeProblemContext: dsaData.problemContext });
+      sendEvent({ chunk: summary, text: summary });
+      sendEvent({ done: true });
+      res.end();
+      return;
     }
 
-    sendEvent({ meta: { engine: "gemini", model: "gemini-4-hydrogen" } });
-    const ai = new GoogleGenAI({ apiKey: geminiKey });
+    const systemPrompt = buildHumanInterviewSystemPrompt({
+      role: body.role || "Software Engineer",
+      experience: body.experience || "Junior (1-3 Years)",
+      skills: body.skills || "",
+      answerLanguage: body.answerLanguage || "English",
+      answerStyle: body.answerStyle,
+    });
+
     const parts: Array<
       | { inlineData: { mimeType: string; data: string } }
       | { text: string }
@@ -71,19 +101,19 @@ export default async function handler(
       inlineData: { mimeType: "image/jpeg", data },
     }));
     parts.push({
-      text: `These ${frames.length} sequential screenshots were recorded while scrolling a page over ${body.durationSec || 4}s. Identify EVERY distinct question, MCQ, or coding prompt visible across all frames and answer each in order. Language: ${body.answerLanguage || "English"}. Style: ${body.answerStyle || "Concise Bullets"}.`,
+      text: `These ${frames.length} sequential screenshots were recorded while scrolling a page over ${body.durationSec || 4}s. Identify EVERY distinct question, MCQ, or prompt visible across all frames and answer each in order in natural human spoken phrasing.`,
     });
 
-    const stream = await ai.models.generateContentStream({
-      model: "gemini-4-hydrogen",
+    const { model, stream } = await generateContentStreamResilient({
       contents: { parts },
       config: {
-        temperature: 0.25,
+        systemInstruction: systemPrompt,
         thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
       },
     });
+    sendEvent({ meta: { engine: "gemini", model } });
     for await (const chunk of stream) {
-      if (chunk.text) sendEvent({ text: chunk.text });
+      if (chunk.text) sendEvent({ chunk: chunk.text, text: chunk.text });
     }
     sendEvent({ done: true });
     res.end();

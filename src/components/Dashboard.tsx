@@ -3,6 +3,7 @@ import {
   Check,
   CheckCircle2,
   Chrome,
+  Code2,
   Copy,
   Download,
   ExternalLink,
@@ -23,24 +24,42 @@ import {
   Shield,
   Smartphone,
   Square,
+  Trash2,
   Upload,
   UserCheck,
+  X,
 } from "lucide-react";
 import {
   WINDOWS_EXE_FILENAME,
   WINDOWS_EXE_URL,
 } from "../data/crackpilotPackages";
 import {
+  ANSWER_STYLES,
+  CUSTOM_ROLE_OPTION,
+  EXPERIENCE_LEVELS,
+  PROGRAMMING_LANGUAGES,
+  TARGET_JOB_ROLES,
+  getSuggestedSkillsForRole,
+  hasSkillInCsv,
+  normalizeAnswerStyle,
+  normalizeProgrammingLanguage,
+  toggleSkillInCsv,
+} from "../data/roleSkills";
+import {
   extractDocumentText,
+  fetchTokenQuota,
   generateSessionToken,
   saveTargetProfile,
   startLiveSession,
 } from "../lib/clientStore";
+import { DsaPracticeLab } from "./DsaPracticeLab";
 import { LiveAudioQAEngine } from "./LiveAudioQAEngine";
+import { SearchableSelect } from "./SearchableSelect";
 import type {
   AnswerLanguage,
   AnswerStyle,
   DashboardTab,
+  ProgrammingLanguage,
   SessionTokenState,
   TargetProfile,
   UserAccount,
@@ -65,10 +84,17 @@ const TEST_SHORTCUTS = [
   { combo: "alt+s", label: "Alt+S", action: "Capture Screen / Chat Box" },
   { combo: "alt+v", label: "Alt+V", action: "4s–10s Video Page Scan" },
   { combo: "alt+r", label: "Alt+R", action: "Instant Reconnect" },
+  { combo: "alt+m", label: "Alt+M", action: "Behind Click-Through Mode ON / OFF" },
   // { combo: "alt+h", label: "Alt+H", action: "Hide / Show Overlay" }, // Temporarily commented out (uncomment when requested)
   { combo: "alt+f", label: "Alt+F", action: "Increase Q&A Font Size" },
   { combo: "alt+d", label: "Alt+D", action: "Disconnect Session" },
 ];
+
+export { CUSTOM_ROLE_OPTION, EXPERIENCE_LEVELS, TARGET_JOB_ROLES };
+
+const PRESET_ROLES_SET = new Set<string>(
+  TARGET_JOB_ROLES.filter((r) => r !== CUSTOM_ROLE_OPTION)
+);
 
 function fileToBase64(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -103,6 +129,14 @@ export function Dashboard({
 
   // Target Profile draft state
   const [draftProfile, setDraftProfile] = useState<TargetProfile>(profile);
+  const [isCustomRoleSelected, setIsCustomRoleSelected] = useState<boolean>(
+    () => !PRESET_ROLES_SET.has(profile.role)
+  );
+  const [customRoleInput, setCustomRoleInput] = useState<string>(() =>
+    PRESET_ROLES_SET.has(profile.role) || profile.role === CUSTOM_ROLE_OPTION
+      ? ""
+      : profile.role
+  );
   const [savingProfile, setSavingProfile] = useState(false);
   const [extractingResume, setExtractingResume] = useState(false);
   const [extractingJd, setExtractingJd] = useState(false);
@@ -123,6 +157,11 @@ export function Dashboard({
 
   useEffect(() => {
     setDraftProfile(profile);
+    const isPreset = PRESET_ROLES_SET.has(profile.role);
+    setIsCustomRoleSelected(!isPreset);
+    if (!isPreset && profile.role !== CUSTOM_ROLE_OPTION) {
+      setCustomRoleInput(profile.role);
+    }
   }, [profile]);
 
   useEffect(() => {
@@ -160,6 +199,34 @@ export function Dashboard({
   useEffect(() => {
     return () => stopAudioTest();
   }, []);
+
+  // Keep Overview → Session Credits synced in real time with backend, /admin edits, and desktop app timer
+  useEffect(() => {
+    const tokenValue = tokenState?.token;
+    if (!tokenValue) return;
+    let active = true;
+
+    const refreshQuota = () => {
+      void fetchTokenQuota(tokenValue).then((res) => {
+        if (!active || !res.ok) return;
+        onTokenChange({
+          ...tokenState,
+          quota: res.quota,
+        });
+      });
+    };
+
+    refreshQuota();
+    const onFocus = () => refreshQuota();
+    window.addEventListener("focus", onFocus);
+    const intervalId = window.setInterval(refreshQuota, 8000);
+
+    return () => {
+      active = false;
+      window.removeEventListener("focus", onFocus);
+      window.clearInterval(intervalId);
+    };
+  }, [tokenState?.token, activeTab]);
 
   const handleGenerateToken = async () => {
     setGeneratingToken(true);
@@ -219,6 +286,9 @@ export function Dashboard({
     }
   };
 
+  const resumeInputRef = useRef<HTMLInputElement | null>(null);
+  const jdInputRef = useRef<HTMLInputElement | null>(null);
+
   const handleUploadDoc = async (
     file: File | undefined,
     kind: "resume" | "jd"
@@ -237,7 +307,7 @@ export function Dashboard({
           : { ...prev, jdFileName: file.name, jdText: extracted }
       );
       setProfileNotice(
-        `${kind === "resume" ? "Resume" : "Job Description"} extracted from "${file.name}". Click Save Target Profile to sync with Crackpilot.`
+        `${kind === "resume" ? "Resume" : "Job Description"} extracted from "${file.name}". Click Save Target Profile below to sync with Crackpilot.`
       );
     } catch (err) {
       console.error("[Crackpilot Dashboard] Document extract failed:", err);
@@ -250,15 +320,50 @@ export function Dashboard({
     }
   };
 
+  const handleRemoveDoc = (kind: "resume" | "jd") => {
+    if (kind === "resume") {
+      setDraftProfile((prev) => ({
+        ...prev,
+        resumeFileName: "",
+        resumeText: "",
+      }));
+      if (resumeInputRef.current) {
+        resumeInputRef.current.value = "";
+      }
+      setProfileNotice(
+        "Resume removed. Click Save Target Profile below to save changes."
+      );
+    } else {
+      setDraftProfile((prev) => ({
+        ...prev,
+        jdFileName: "",
+        jdText: "",
+      }));
+      if (jdInputRef.current) {
+        jdInputRef.current.value = "";
+      }
+      setProfileNotice(
+        "Job Description removed. Click Save Target Profile below to save changes."
+      );
+    }
+  };
+
   const handleSaveProfile = async (e: React.FormEvent) => {
     e.preventDefault();
     setSavingProfile(true);
     setProfileNotice(null);
     try {
-      const saved = await saveTargetProfile(draftProfile);
+      const resolvedRole = isCustomRoleSelected
+        ? customRoleInput.trim() || CUSTOM_ROLE_OPTION
+        : draftProfile.role;
+      const payloadToSave: TargetProfile = {
+        ...draftProfile,
+        role: resolvedRole,
+      };
+      const saved = await saveTargetProfile(payloadToSave);
       onProfileChange(saved);
       setProfileNotice(
-        "Target Profile saved & synced! Crackpilot software will now tailor every answer to this Role, Resume, and JD."
+        "Target Profile saved & synced! Crackpilot software will now tailor every answer to this Role, Experience Level, Resume, and JD."
       );
     } catch (err) {
       console.error("[Crackpilot Dashboard] Save profile failed:", err);
@@ -467,16 +572,15 @@ export function Dashboard({
               {user?.email || "Sign in via Login"}
             </p>
           </div>
-          {user && (
-            <button
-              type="button"
-              onClick={onLogout}
-              title="Log Out"
-              className="inline-flex items-center gap-1 rounded-md border border-white/10 px-2 py-1 text-[11px] text-zinc-400 hover:bg-white/[0.06] hover:text-white transition-colors cursor-pointer"
-            >
-              <LogOut className="h-3.5 w-3.5" />
-            </button>
-          )}
+          <button
+            type="button"
+            onClick={onLogout}
+            title="Logout"
+            className="inline-flex items-center gap-1.5 rounded-md border border-white/10 px-2.5 py-1.5 text-[11px] font-medium text-zinc-300 hover:border-rose-500/40 hover:bg-rose-500/10 hover:text-rose-300 transition-colors cursor-pointer shrink-0"
+          >
+            <LogOut className="h-3.5 w-3.5" />
+            <span>Logout</span>
+          </button>
         </div>
       </aside>
 
@@ -495,13 +599,24 @@ export function Dashboard({
                 </span>
               )}
             </div>
-            <button
-              type="button"
-              onClick={onGoHome}
-              className="text-xs text-zinc-400 hover:text-white transition-colors cursor-pointer"
-            >
-              View Website ↗
-            </button>
+            <div className="flex items-center gap-3">
+              <button
+                type="button"
+                onClick={onGoHome}
+                className="text-xs text-zinc-400 hover:text-white transition-colors cursor-pointer"
+              >
+                View Website ↗
+              </button>
+              <button
+                type="button"
+                onClick={onLogout}
+                title="Logout"
+                className="inline-flex items-center gap-1.5 rounded-lg border border-white/10 bg-[#0d1117] px-3 py-1.5 text-xs font-semibold text-zinc-200 hover:border-rose-500/40 hover:bg-rose-500/10 hover:text-rose-300 transition-colors cursor-pointer"
+              >
+                <LogOut className="h-3.5 w-3.5" />
+                <span>Logout</span>
+              </button>
+            </div>
           </div>
 
           {/* OVERVIEW TAB (exact structure from final-2 Workspace Overview) */}
@@ -531,25 +646,40 @@ export function Dashboard({
                     </button>
                   </div>
                   <div>
-                    <h2 className="text-lg font-bold text-white">
-                      {profile.role}
-                    </h2>
-                    <p className="text-xs text-zinc-400 mt-0.5">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <h2 className="text-lg font-bold text-white">
+                        {profile.role}
+                      </h2>
+                      {profile.dsaModeEnabled && (
+                        <span className="inline-flex items-center gap-1 rounded-md border border-[#b4f416]/50 bg-[#b4f416]/15 px-2 py-0.5 font-mono text-[10px] font-bold uppercase tracking-wide text-[#b4f416]">
+                          <Code2 className="h-3 w-3" />
+                          <span>
+                            DSA CODING MODE ·{" "}
+                            {normalizeProgrammingLanguage(profile.preferredLanguage)}
+                          </span>
+                        </span>
+                      )}
+                    </div>
+                    <p className="text-xs text-zinc-400 mt-1">
                       {profile.experience} · {profile.answerLanguage} ·{" "}
-                      {profile.answerStyle}
+                      {normalizeAnswerStyle(profile.answerStyle)}
                     </p>
                   </div>
-                  {skillTags.length > 0 && (
+                  {skillTags.length > 0 ? (
                     <div className="flex flex-wrap gap-1.5">
                       {skillTags.map((sk) => (
                         <span
                           key={sk}
-                          className="rounded border border-white/10 bg-[#121820] px-2 py-0.5 font-mono text-[10px] text-zinc-300"
+                          className="rounded border border-[#b4f416]/30 bg-[#b4f416]/[0.07] px-2 py-0.5 font-mono text-[10px] text-[#d8fb7a]"
                         >
                           {sk}
                         </span>
                       ))}
                     </div>
+                  ) : (
+                    <p className="text-[11px] text-zinc-500">
+                      No core skills selected yet — click Configure to tap role-specific skill chips.
+                    </p>
                   )}
                   <div className="flex flex-wrap items-center justify-between gap-2 border-t border-white/[0.06] pt-3 text-[11px]">
                     <span className="font-mono text-zinc-400">
@@ -585,19 +715,38 @@ export function Dashboard({
                   <div className="space-y-3">
                     <div className="flex items-center justify-between text-xs">
                       <span className="text-zinc-400">Session Credits</span>
-                      <span className="rounded bg-[#1a2210] px-2 py-0.5 font-mono text-[10px] font-bold text-[#c6f527]">
-                        PRO PLAN
+                      <span className="rounded bg-[#1a2210] px-2 py-0.5 font-mono text-[10px] font-bold uppercase text-[#c6f527]">
+                        {tokenState?.quota?.paymentStatus === "Paid"
+                          ? `PAID / ${tokenState.quota.planType}`
+                          : tokenState?.quota?.planType || "PRO PLAN"}
                       </span>
                     </div>
-                    <p className="text-3xl font-extrabold text-white tabular-nums">
-                      240 mins left
-                    </p>
+                    <div className="flex items-baseline gap-2.5 flex-wrap">
+                      <p className="text-3xl font-extrabold text-white tabular-nums">
+                        {tokenState?.quota
+                          ? `${tokenState.quota.remainingMinutes} mins left`
+                          : "240 mins left"}
+                      </p>
+                      {tokenState?.quota && (
+                        <span className="rounded border border-[#b4f416]/30 bg-[#b4f416]/10 px-2 py-0.5 font-mono text-xs font-semibold text-[#c6f527] tabular-nums">
+                          {String(Math.floor(tokenState.quota.remainingSeconds / 60)).padStart(2, "0")}:
+                          {String(tokenState.quota.remainingSeconds % 60).padStart(2, "0")} exact
+                        </span>
+                      )}
+                    </div>
                     <p className="text-xs text-zinc-400">
-                      Screen captures &amp; written prompts: 0 / 80 used
+                      Screen captures &amp; written prompts:{" "}
+                      {tokenState?.quota
+                        ? `${tokenState.quota.capturesUsed} / ${tokenState.quota.captureLimit} used`
+                        : "0 / 80 used"}
                     </p>
                   </div>
                   <div className="flex items-center justify-between border-t border-white/[0.06] pt-3 text-[11px]">
-                    <span className="text-zinc-500">Credits never expire</span>
+                    <span className="text-zinc-500">
+                      {tokenState?.quota?.accountType === "DEMO"
+                        ? "Temporary Demo Account"
+                        : "Credits never expire"}
+                    </span>
                     <button
                       type="button"
                       onClick={() => onTabChange("testing")}
@@ -808,83 +957,176 @@ export function Dashboard({
           {/* TARGET PROFILE TAB */}
           {activeTab === "profile" && (
             <form onSubmit={handleSaveProfile} className="space-y-6">
-              <div className="flex flex-wrap items-end justify-between gap-4">
-                <div>
-                  <h1 className="text-2xl font-bold text-white">
-                    Target Profile
-                  </h1>
-                  <p className="mt-1 text-xs text-zinc-400">
-                    Upload your Resume and Job Description (JD). Crackpilot
-                    automatically uses this context to answer every interviewer
-                    question.
-                  </p>
-                </div>
-                <button
-                  type="submit"
-                  disabled={savingProfile}
-                  className="inline-flex items-center gap-2 rounded-full bg-[#c6f527] px-5 py-2.5 text-xs font-bold text-[#050709] hover:bg-[#b5e41c] transition-colors cursor-pointer disabled:opacity-60"
-                >
-                  <Save className="h-3.5 w-3.5" />
-                  <span>
-                    {savingProfile ? "Saving..." : "Save Target Profile"}
-                  </span>
-                </button>
+              <div>
+                <h1 className="text-2xl font-bold text-white">
+                  Target Profile
+                </h1>
+                <p className="mt-1 text-xs text-zinc-400">
+                  Fill in your Target Role, Experience, Core Skills, Answer
+                  Style, Resume, and Job Description, then click Save Target
+                  Profile at the bottom to sync with Crackpilot.
+                </p>
               </div>
 
-              {profileNotice && (
-                <p className="rounded-lg border border-emerald-500/35 bg-emerald-500/10 px-4 py-3 text-xs text-emerald-200">
-                  {profileNotice}
-                </p>
-              )}
-
-              <div className="rounded-2xl border border-white/[0.08] bg-[#0c1015] p-6 grid gap-4 sm:grid-cols-2">
-                <label className="block space-y-1.5">
-                  <span className="text-xs font-medium text-zinc-300">
-                    Target Job Role
-                  </span>
-                  <input
-                    type="text"
-                    value={draftProfile.role}
-                    onChange={(e) =>
-                      setDraftProfile((p) => ({ ...p, role: e.target.value }))
+              <div className="rounded-2xl border border-white/[0.08] bg-[#111111] p-6 grid gap-5 sm:grid-cols-2">
+                <div className="space-y-2.5">
+                  <SearchableSelect
+                    id="target-job-role-select"
+                    label="Target Role / Session Specialization Category"
+                    options={TARGET_JOB_ROLES}
+                    value={
+                      isCustomRoleSelected
+                        ? CUSTOM_ROLE_OPTION
+                        : draftProfile.role
                     }
-                    placeholder="e.g., Senior Frontend Engineer"
-                    className="w-full rounded-lg border border-white/10 bg-[#070a0e] px-3 py-2.5 text-sm text-white placeholder-zinc-500 focus:border-[#c6f527] focus:outline-none"
+                    onChange={(selected) => {
+                      if (selected === CUSTOM_ROLE_OPTION) {
+                        setIsCustomRoleSelected(true);
+                        setDraftProfile((p) => ({
+                          ...p,
+                          role: customRoleInput.trim() || CUSTOM_ROLE_OPTION,
+                          skills: p.role === (customRoleInput.trim() || CUSTOM_ROLE_OPTION) ? p.skills : "",
+                        }));
+                      } else {
+                        setIsCustomRoleSelected(false);
+                        setDraftProfile((p) => ({
+                          ...p,
+                          role: selected,
+                          // Clear previous role's skills so unrelated tech stacks never carry over
+                          skills: p.role === selected ? p.skills : "",
+                        }));
+                      }
+                    }}
+                    placeholder="Select specialization..."
+                    searchPlaceholder="Search 31 roles (e.g. SAP, Frontend, DevOps, Healthcare)..."
+                    searchable
                   />
-                </label>
 
-                <label className="block space-y-1.5">
-                  <span className="text-xs font-medium text-zinc-300">
-                    Experience Level
-                  </span>
-                  <input
-                    type="text"
-                    value={draftProfile.experience}
-                    onChange={(e) =>
-                      setDraftProfile((p) => ({
-                        ...p,
-                        experience: e.target.value,
-                      }))
-                    }
-                    placeholder="e.g., 4 years / Fresher"
-                    className="w-full rounded-lg border border-white/10 bg-[#070a0e] px-3 py-2.5 text-sm text-white placeholder-zinc-500 focus:border-[#c6f527] focus:outline-none"
-                  />
-                </label>
+                  {isCustomRoleSelected && (
+                    <input
+                      type="text"
+                      value={customRoleInput}
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        setCustomRoleInput(val);
+                        setDraftProfile((p) => ({
+                          ...p,
+                          role: val.trim() || CUSTOM_ROLE_OPTION,
+                        }));
+                      }}
+                      placeholder="Enter your custom role or specialization..."
+                      className="w-full rounded-lg border border-[#b4f416]/40 bg-[#0a0a0a] px-3 py-2 text-xs text-white placeholder-zinc-500 focus:border-[#b4f416] focus:outline-none"
+                    />
+                  )}
+                </div>
 
-                <label className="block space-y-1.5 sm:col-span-2">
-                  <span className="text-xs font-medium text-zinc-300">
-                    Core Skills &amp; Tech Stack
-                  </span>
-                  <input
-                    type="text"
-                    value={draftProfile.skills}
-                    onChange={(e) =>
-                      setDraftProfile((p) => ({ ...p, skills: e.target.value }))
-                    }
-                    placeholder="React, TypeScript, Node.js, Python, PostgreSQL, System Design"
-                    className="w-full rounded-lg border border-white/10 bg-[#070a0e] px-3 py-2.5 text-sm text-white placeholder-zinc-500 focus:border-[#c6f527] focus:outline-none"
-                  />
-                </label>
+                <SearchableSelect
+                  id="experience-level-select"
+                  label="Experience Level"
+                  options={EXPERIENCE_LEVELS}
+                  value={
+                    EXPERIENCE_LEVELS.includes(
+                      draftProfile.experience as (typeof EXPERIENCE_LEVELS)[number]
+                    )
+                      ? draftProfile.experience
+                      : EXPERIENCE_LEVELS[1]
+                  }
+                  onChange={(selected) =>
+                    setDraftProfile((p) => ({ ...p, experience: selected }))
+                  }
+                  placeholder="Select experience level..."
+                  searchPlaceholder="Filter experience level..."
+                  searchable={false}
+                />
+
+                {/* Dynamic Role-Based Core Skills Input + Clickable Skill Chips */}
+                {(() => {
+                  const activeRoleKey = isCustomRoleSelected
+                    ? CUSTOM_ROLE_OPTION
+                    : draftProfile.role;
+                  const suggestedSkills = getSuggestedSkillsForRole(activeRoleKey);
+                  return (
+                    <div className="space-y-2.5 sm:col-span-2">
+                      <div className="flex items-center justify-between gap-2">
+                        <label
+                          htmlFor="core-skills-input"
+                          className="text-xs font-medium text-zinc-300"
+                        >
+                          Core Skills &amp; Tech Stack
+                        </label>
+                        <span className="text-[11px] text-zinc-500">
+                          Tap chips below to add/remove or type custom skills
+                        </span>
+                      </div>
+
+                      <div className="relative">
+                        <input
+                          id="core-skills-input"
+                          type="text"
+                          value={draftProfile.skills}
+                          onChange={(e) =>
+                            setDraftProfile((p) => ({
+                              ...p,
+                              skills: e.target.value,
+                            }))
+                          }
+                          placeholder={
+                            suggestedSkills.slice(0, 5).join(", ") ||
+                            "Select chips below or type your core skills..."
+                          }
+                          className="w-full rounded-lg border border-white/10 bg-[#0a0a0a] pl-3.5 pr-16 py-2.5 text-sm text-white placeholder-zinc-500 focus:border-[#b4f416] focus:outline-none"
+                        />
+                        {draftProfile.skills.trim() && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setDraftProfile((p) => ({ ...p, skills: "" }))
+                            }
+                            className="absolute right-2 top-1/2 -translate-y-1/2 inline-flex items-center gap-1 rounded-md border border-white/10 bg-[#181818] px-2 py-1 text-[11px] font-medium text-zinc-400 hover:border-white/25 hover:text-white transition-colors cursor-pointer"
+                          >
+                            <X className="h-3 w-3" />
+                            <span>Clear</span>
+                          </button>
+                        )}
+                      </div>
+
+                      <div className="rounded-xl border border-white/[0.06] bg-[#0a0a0a] p-3 space-y-2">
+                        <p className="font-mono text-[10px] uppercase tracking-wider text-zinc-500">
+                          Suggested Core Skills for{" "}
+                          <span className="text-zinc-300">{activeRoleKey}</span>
+                        </p>
+                        <div className="flex flex-wrap gap-1.5">
+                          {suggestedSkills.map((chip) => {
+                            const selected = hasSkillInCsv(
+                              draftProfile.skills,
+                              chip
+                            );
+                            return (
+                              <button
+                                key={chip}
+                                type="button"
+                                onClick={() =>
+                                  setDraftProfile((p) => ({
+                                    ...p,
+                                    skills: toggleSkillInCsv(p.skills, chip),
+                                  }))
+                                }
+                                className={`inline-flex items-center gap-1 rounded-lg border px-2.5 py-1 text-xs font-medium transition-colors cursor-pointer ${
+                                  selected
+                                    ? "border-[#b4f416] bg-[#b4f416]/15 text-[#b4f416]"
+                                    : "border-white/10 bg-[#141414] text-zinc-300 hover:border-[#b4f416]/45 hover:text-white"
+                                }`}
+                              >
+                                {selected && <Check className="h-3 w-3" />}
+                                <span>{chip}</span>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })()}
 
                 <label className="block space-y-1.5">
                   <span className="text-xs font-medium text-zinc-300">
@@ -898,7 +1140,7 @@ export function Dashboard({
                         answerLanguage: e.target.value as AnswerLanguage,
                       }))
                     }
-                    className="w-full rounded-lg border border-white/10 bg-[#070a0e] px-3 py-2.5 text-sm text-white focus:border-[#c6f527] focus:outline-none"
+                    className="w-full rounded-lg border border-white/10 bg-[#0a0a0a] px-3 py-2.5 text-sm text-white focus:border-[#b4f416] focus:outline-none"
                   >
                     <option value="English">English</option>
                     <option value="Hinglish">Hinglish (Hindi + English)</option>
@@ -908,56 +1150,193 @@ export function Dashboard({
 
                 <label className="block space-y-1.5">
                   <span className="text-xs font-medium text-zinc-300">
-                    Answer Style
+                    Answer Style (Natural Human Speech)
                   </span>
                   <select
-                    value={draftProfile.answerStyle}
+                    value={normalizeAnswerStyle(draftProfile.answerStyle)}
                     onChange={(e) =>
                       setDraftProfile((p) => ({
                         ...p,
                         answerStyle: e.target.value as AnswerStyle,
                       }))
                     }
-                    className="w-full rounded-lg border border-white/10 bg-[#070a0e] px-3 py-2.5 text-sm text-white focus:border-[#c6f527] focus:outline-none"
+                    className="w-full rounded-lg border border-white/10 bg-[#0a0a0a] px-3 py-2.5 text-sm text-white focus:border-[#b4f416] focus:outline-none"
                   >
-                    <option value="Concise Bullets">Concise Bullets</option>
-                    <option value="STAR Method">STAR Method</option>
-                    <option value="Technical + Code">Technical + Code</option>
+                    {ANSWER_STYLES.map((styleOpt) => (
+                      <option key={styleOpt} value={styleOpt}>
+                        {styleOpt}
+                      </option>
+                    ))}
                   </select>
                 </label>
+
+                {/* Dedicated DSA Coding & Assessment Mode Toggle + Preferred Language */}
+                <div
+                  className={`sm:col-span-2 rounded-xl border p-4 transition-colors space-y-3.5 ${
+                    draftProfile.dsaModeEnabled
+                      ? "border-[#b4f416]/50 bg-[#141a0b]"
+                      : "border-white/[0.08] bg-[#0a0a0a]"
+                  }`}
+                >
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div className="flex items-start gap-3">
+                      <span
+                        className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border ${
+                          draftProfile.dsaModeEnabled
+                            ? "border-[#b4f416]/50 bg-[#b4f416]/15 text-[#b4f416]"
+                            : "border-white/10 bg-[#141414] text-zinc-400"
+                        }`}
+                      >
+                        <Code2 className="h-4 w-4" />
+                      </span>
+                      <div>
+                        <div className="flex items-center gap-2">
+                          <span className="text-sm font-bold text-white">
+                            DSA Coding / Assessment Mode
+                          </span>
+                          <span
+                            className={`rounded px-1.5 py-0.5 font-mono text-[10px] font-bold uppercase ${
+                              draftProfile.dsaModeEnabled
+                                ? "bg-[#b4f416] text-[#0a0a0a]"
+                                : "bg-white/[0.07] text-zinc-400"
+                            }`}
+                          >
+                            {draftProfile.dsaModeEnabled ? "ON" : "OFF"}
+                          </span>
+                        </div>
+                        <p className="mt-0.5 text-xs text-zinc-400">
+                          Activates the 5-step Live Coding Teleprompter (no premature code dump), OA auto-solver (Full Coding / Bug-Fix / MCQ / Work-Style), and zero-recapture voice follow-ups. Keep OFF for standard non-coding interviews.
+                        </p>
+                      </div>
+                    </div>
+
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked={Boolean(draftProfile.dsaModeEnabled)}
+                      onClick={() =>
+                        setDraftProfile((p) => ({
+                          ...p,
+                          dsaModeEnabled: !p.dsaModeEnabled,
+                          preferredLanguage: normalizeProgrammingLanguage(
+                            p.preferredLanguage
+                          ),
+                        }))
+                      }
+                      className={`relative inline-flex h-7 w-13 shrink-0 items-center rounded-full border transition-colors cursor-pointer ${
+                        draftProfile.dsaModeEnabled
+                          ? "border-[#b4f416] bg-[#b4f416]"
+                          : "border-white/15 bg-[#1b1b1b]"
+                      }`}
+                    >
+                      <span
+                        className={`inline-block h-5 w-5 transform rounded-full transition-transform ${
+                          draftProfile.dsaModeEnabled
+                            ? "translate-x-6.5 bg-[#0a0a0a]"
+                            : "translate-x-1 bg-zinc-400"
+                        }`}
+                      />
+                    </button>
+                  </div>
+
+                  {draftProfile.dsaModeEnabled && (
+                    <div className="grid gap-3 border-t border-[#b4f416]/20 pt-3.5 sm:grid-cols-2 items-center">
+                      <label className="block space-y-1.5">
+                        <span className="text-xs font-semibold text-[#b4f416]">
+                          Preferred Programming Language
+                        </span>
+                        <select
+                          value={normalizeProgrammingLanguage(
+                            draftProfile.preferredLanguage
+                          )}
+                          onChange={(e) =>
+                            setDraftProfile((p) => ({
+                              ...p,
+                              preferredLanguage: e.target
+                                .value as ProgrammingLanguage,
+                            }))
+                          }
+                          className="w-full rounded-lg border border-[#b4f416]/45 bg-[#0a0a0a] px-3 py-2 text-sm font-semibold text-white focus:border-[#b4f416] focus:outline-none"
+                        >
+                          {PROGRAMMING_LANGUAGES.map((lang) => (
+                            <option key={lang} value={lang}>
+                              {lang}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <p className="text-xs leading-relaxed text-zinc-300">
+                        All brute-force snippets, optimal solutions, OA code fixes, and live voice follow-ups will strictly generate clean, bug-free{" "}
+                        <strong className="text-[#b4f416]">
+                          {normalizeProgrammingLanguage(
+                            draftProfile.preferredLanguage
+                          )}
+                        </strong>{" "}
+                        code.
+                      </p>
+                    </div>
+                  )}
+                </div>
               </div>
 
               <div className="grid gap-5 lg:grid-cols-2">
                 {/* Resume Upload */}
-                <div className="rounded-2xl border border-white/[0.08] bg-[#0c1015] p-5 space-y-3">
-                  <div className="flex items-center justify-between gap-2">
+                <div className="rounded-2xl border border-white/[0.08] bg-[#111111] p-5 space-y-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
                     <div className="flex items-center gap-2">
-                      <FileText className="h-4 w-4 text-[#c6f527]" />
+                      <FileText className="h-4 w-4 text-[#b4f416]" />
                       <h2 className="text-sm font-bold text-white">
                         Candidate Resume
                       </h2>
                     </div>
-                    <label className="inline-flex items-center gap-1.5 rounded-lg border border-white/15 bg-[#121820] px-3 py-1.5 text-xs font-medium text-zinc-100 hover:bg-white/[0.08] transition-colors cursor-pointer">
-                      <Upload className="h-3.5 w-3.5 text-[#c6f527]" />
-                      <span>
-                        {extractingResume
-                          ? "Extracting..."
-                          : "Upload PDF / TXT"}
-                      </span>
-                      <input
-                        type="file"
-                        accept=".pdf,.txt,.md,.doc,.docx"
-                        className="hidden"
-                        onChange={(e) =>
-                          void handleUploadDoc(e.target.files?.[0], "resume")
-                        }
-                      />
-                    </label>
+                    <div className="flex items-center gap-2">
+                      <label className="inline-flex items-center gap-1.5 rounded-lg border border-white/15 bg-[#121820] px-3 py-1.5 text-xs font-medium text-zinc-100 hover:bg-white/[0.08] transition-colors cursor-pointer">
+                        <Upload className="h-3.5 w-3.5 text-[#b4f416]" />
+                        <span>
+                          {extractingResume
+                            ? "Extracting..."
+                            : "Upload PDF / TXT"}
+                        </span>
+                        <input
+                          ref={resumeInputRef}
+                          type="file"
+                          accept=".pdf,.txt,.md,.doc,.docx"
+                          className="hidden"
+                          onChange={(e) =>
+                            void handleUploadDoc(e.target.files?.[0], "resume")
+                          }
+                        />
+                      </label>
+                      {(draftProfile.resumeFileName ||
+                        draftProfile.resumeText.trim().length > 0) && (
+                        <button
+                          type="button"
+                          onClick={() => handleRemoveDoc("resume")}
+                          title="Remove uploaded resume"
+                          aria-label="Remove uploaded resume"
+                          className="inline-flex items-center gap-1 rounded-lg border border-rose-500/35 bg-rose-500/10 px-2.5 py-1.5 text-xs font-medium text-rose-300 hover:border-rose-400/60 hover:bg-rose-500/20 hover:text-rose-100 transition-colors cursor-pointer"
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                          <span>Remove</span>
+                        </button>
+                      )}
+                    </div>
                   </div>
                   {draftProfile.resumeFileName && (
-                    <p className="font-mono text-[11px] text-[#c6f527]">
-                      File: {draftProfile.resumeFileName}
-                    </p>
+                    <div className="flex items-center justify-between gap-2 rounded-lg border border-[#b4f416]/25 bg-[#b4f416]/10 px-3 py-1.5">
+                      <span className="truncate font-mono text-[11px] text-[#b4f416]">
+                        File: {draftProfile.resumeFileName}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => handleRemoveDoc("resume")}
+                        title="Remove resume file"
+                        aria-label="Remove resume file"
+                        className="rounded p-0.5 text-zinc-300 hover:bg-rose-500/25 hover:text-rose-200 transition-colors cursor-pointer shrink-0"
+                      >
+                        <X className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
                   )}
                   <textarea
                     rows={8}
@@ -969,38 +1348,65 @@ export function Dashboard({
                       }))
                     }
                     placeholder="Upload your Resume PDF/TXT or paste your experience, projects, and metrics here..."
-                    className="w-full rounded-lg border border-white/10 bg-[#070a0e] p-3 text-xs leading-relaxed text-zinc-200 placeholder-zinc-500 focus:border-[#c6f527] focus:outline-none"
+                    className="w-full rounded-lg border border-white/10 bg-[#070a0e] p-3 text-xs leading-relaxed text-zinc-200 placeholder-zinc-500 focus:border-[#b4f416] focus:outline-none"
                   />
                 </div>
 
                 {/* JD Upload */}
-                <div className="rounded-2xl border border-white/[0.08] bg-[#0c1015] p-5 space-y-3">
-                  <div className="flex items-center justify-between gap-2">
+                <div className="rounded-2xl border border-white/[0.08] bg-[#111111] p-5 space-y-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
                     <div className="flex items-center gap-2">
-                      <FileText className="h-4 w-4 text-[#c6f527]" />
+                      <FileText className="h-4 w-4 text-[#b4f416]" />
                       <h2 className="text-sm font-bold text-white">
                         Job Description (JD)
                       </h2>
                     </div>
-                    <label className="inline-flex items-center gap-1.5 rounded-lg border border-white/15 bg-[#121820] px-3 py-1.5 text-xs font-medium text-zinc-100 hover:bg-white/[0.08] transition-colors cursor-pointer">
-                      <Upload className="h-3.5 w-3.5 text-[#c6f527]" />
-                      <span>
-                        {extractingJd ? "Extracting..." : "Upload PDF / TXT"}
-                      </span>
-                      <input
-                        type="file"
-                        accept=".pdf,.txt,.md,.doc,.docx"
-                        className="hidden"
-                        onChange={(e) =>
-                          void handleUploadDoc(e.target.files?.[0], "jd")
-                        }
-                      />
-                    </label>
+                    <div className="flex items-center gap-2">
+                      <label className="inline-flex items-center gap-1.5 rounded-lg border border-white/15 bg-[#121820] px-3 py-1.5 text-xs font-medium text-zinc-100 hover:bg-white/[0.08] transition-colors cursor-pointer">
+                        <Upload className="h-3.5 w-3.5 text-[#b4f416]" />
+                        <span>
+                          {extractingJd ? "Extracting..." : "Upload PDF / TXT"}
+                        </span>
+                        <input
+                          ref={jdInputRef}
+                          type="file"
+                          accept=".pdf,.txt,.md,.doc,.docx"
+                          className="hidden"
+                          onChange={(e) =>
+                            void handleUploadDoc(e.target.files?.[0], "jd")
+                          }
+                        />
+                      </label>
+                      {(draftProfile.jdFileName ||
+                        draftProfile.jdText.trim().length > 0) && (
+                        <button
+                          type="button"
+                          onClick={() => handleRemoveDoc("jd")}
+                          title="Remove job description"
+                          aria-label="Remove job description"
+                          className="inline-flex items-center gap-1 rounded-lg border border-rose-500/35 bg-rose-500/10 px-2.5 py-1.5 text-xs font-medium text-rose-300 hover:border-rose-400/60 hover:bg-rose-500/20 hover:text-rose-100 transition-colors cursor-pointer"
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                          <span>Remove</span>
+                        </button>
+                      )}
+                    </div>
                   </div>
                   {draftProfile.jdFileName && (
-                    <p className="font-mono text-[11px] text-[#c6f527]">
-                      File: {draftProfile.jdFileName}
-                    </p>
+                    <div className="flex items-center justify-between gap-2 rounded-lg border border-[#b4f416]/25 bg-[#b4f416]/10 px-3 py-1.5">
+                      <span className="truncate font-mono text-[11px] text-[#b4f416]">
+                        File: {draftProfile.jdFileName}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => handleRemoveDoc("jd")}
+                        title="Remove JD file"
+                        aria-label="Remove JD file"
+                        className="rounded p-0.5 text-zinc-300 hover:bg-rose-500/25 hover:text-rose-200 transition-colors cursor-pointer shrink-0"
+                      >
+                        <X className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
                   )}
                   <textarea
                     rows={8}
@@ -1009,9 +1415,35 @@ export function Dashboard({
                       setDraftProfile((p) => ({ ...p, jdText: e.target.value }))
                     }
                     placeholder="Upload the Job Description PDF/TXT or paste role responsibilities and requirements here..."
-                    className="w-full rounded-lg border border-white/10 bg-[#070a0e] p-3 text-xs leading-relaxed text-zinc-200 placeholder-zinc-500 focus:border-[#c6f527] focus:outline-none"
+                    className="w-full rounded-lg border border-white/10 bg-[#070a0e] p-3 text-xs leading-relaxed text-zinc-200 placeholder-zinc-500 focus:border-[#b4f416] focus:outline-none"
                   />
                 </div>
+              </div>
+
+              {/* Bottom Save Target Profile Bar */}
+              <div className="flex flex-wrap items-center justify-between gap-4 rounded-2xl border border-white/[0.08] bg-[#111111] px-6 py-4">
+                <div className="min-w-0 flex-1">
+                  {profileNotice ? (
+                    <p className="text-xs font-medium text-emerald-300">
+                      {profileNotice}
+                    </p>
+                  ) : (
+                    <p className="text-xs text-zinc-400">
+                      Save your Target Profile to sync Role, Experience, Core
+                      Skills, Resume, JD, and DSA settings with Crackpilot.
+                    </p>
+                  )}
+                </div>
+                <button
+                  type="submit"
+                  disabled={savingProfile}
+                  className="inline-flex items-center gap-2 rounded-full bg-[#b4f416] px-6 py-2.5 text-xs font-bold text-[#0a0a0a] hover:bg-[#c6f527] transition-colors cursor-pointer disabled:opacity-60 shrink-0"
+                >
+                  <Save className="h-3.5 w-3.5" />
+                  <span>
+                    {savingProfile ? "Saving..." : "Save Target Profile"}
+                  </span>
+                </button>
               </div>
             </form>
           )}
@@ -1032,6 +1464,9 @@ export function Dashboard({
 
               {/* Real-Time Ultra-Low-Latency Dual-Pipeline Live Audio Q&A Engine */}
               <LiveAudioQAEngine />
+
+              {/* Natural Human-Spoken Answer Styles + DSA Coding & OA Teleprompter Simulator */}
+              <DsaPracticeLab profile={profile} />
 
               {/* 1. Cross-Tab Always-On-Top */}
               <div className="rounded-2xl border border-white/[0.08] bg-[#0c1015] p-6 space-y-4">

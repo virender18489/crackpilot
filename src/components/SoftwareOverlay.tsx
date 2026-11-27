@@ -3,22 +3,24 @@ import {
   Camera,
   Check,
   CheckCircle2,
+  Code2,
   Copy,
   ExternalLink,
   Eye,
   EyeOff,
   Headphones,
   KeyRound,
-  Layers,
   LayoutDashboard,
   Mic,
   Minus,
   MoreHorizontal,
+  MousePointerClick,
   Play,
   Plus,
   Power,
   RefreshCw,
   ScrollText,
+  Smartphone,
   Square,
   Type as TypeIcon,
   Video,
@@ -29,9 +31,17 @@ import {
   Zap,
 } from "lucide-react";
 import { AnswerView } from "./AnswerView";
+import { DsaTeleprompterView } from "./DsaTeleprompterView";
 import { LiveAudioQAEngine } from "./LiveAudioQAEngine";
 import { SAMPLE_INTERVIEW_QUESTIONS } from "../data/crackpilotPackages";
 import {
+  ANSWER_STYLES,
+  PROGRAMMING_LANGUAGES,
+  normalizeAnswerStyle,
+  normalizeProgrammingLanguage,
+} from "../data/roleSkills";
+import {
+  DEFAULT_PRODUCTION_API_URL,
   apiUrl,
   getApiBaseUrl,
   hasConfiguredBackend,
@@ -39,17 +49,24 @@ import {
   setApiBaseUrl,
 } from "../lib/api";
 import {
+  clearActiveProblemContextClient,
+  fetchTokenQuota,
   probeBackendHealth,
   resetBackendHealthCache,
   saveTargetProfile,
   startLiveSession,
   stopLiveSession,
   subscribeLocalSync,
+  syncTokenElapsedSeconds,
   verifySessionToken,
 } from "../lib/clientStore";
 import type {
+  AccountQuotaSnapshot,
+  ActiveProblemContext,
   AnswerLanguage,
   AnswerStyle,
+  DsaTeleprompterData,
+  ProgrammingLanguage,
   QAItem,
   SessionTokenState,
   TargetProfile,
@@ -85,11 +102,7 @@ interface SpeechRecognitionLike {
   stop: () => void;
 }
 
-const LAYER_OPACITIES = [
-  { label: "92%", bg: "bg-[#1a2c44]/88", nativeOpacity: 0.96 },
-  { label: "76%", bg: "bg-[#1a2c44]/68", nativeOpacity: 0.84 },
-  { label: "58%", bg: "bg-[#1a2c44]/48", nativeOpacity: 0.68 },
-];
+const DEFAULT_OVERLAY_BG = "bg-[#1a2c44]/88";
 
 function formatNow(): string {
   return new Date().toLocaleTimeString([], {
@@ -150,11 +163,13 @@ export function SoftwareOverlay({
   const [isHidden, setIsHidden] = useState(false);
   const [isCompact, setIsCompact] = useState(false);
   const [isMaximized, setIsMaximized] = useState(false);
-  const [layerIdx, setLayerIdx] = useState(0);
+  const [isBehindMode, setIsBehindMode] = useState(false);
   const [fontSizePx, setFontSizePx] = useState<number>(15);
 
-  // Master Start / Stop toggle for all software functionality (default stopped -> shows "Start")
-  const [isEngineRunning, setIsEngineRunning] = useState(false);
+  // Master Start / Stop session gate — ALWAYS starts false so timer never auto-counts down on launch
+  const [isSessionRunning, setIsSessionRunning] = useState(false);
+  const isEngineRunning = isSessionRunning;
+  const setIsEngineRunning = setIsSessionRunning;
 
   // Live session connection, glitch, video scan & audio states
   const [isConnected, setIsConnected] = useState(true);
@@ -165,6 +180,12 @@ export function SoftwareOverlay({
 
   const [isListening, setIsListening] = useState(false);
   const [listenMode, setListenMode] = useState<"mic" | "tab" | null>(null);
+  const [audioInputs, setAudioInputs] = useState<
+    Array<{ deviceId: string; label: string }>
+  >([]);
+  const [selectedAudioInput, setSelectedAudioInput] = useState<string>(() =>
+    isDesktopApp() ? "call-both" : "default"
+  );
   const [hasSharedScreen, setHasSharedScreen] = useState(false);
   const [monitorAudio, setMonitorAudio] = useState(false);
   const [isTranscribing, setIsTranscribing] = useState(false);
@@ -172,23 +193,59 @@ export function SoftwareOverlay({
   const [statusNotice, setStatusNotice] = useState<string | null>(null);
   const [audioLevel, setAudioLevel] = useState(0);
 
-  // Session counters
-  const [secondsLeft, setSecondsLeft] = useState(240 * 60);
-  const [promptsUsed, setPromptsUsed] = useState(0);
-  const maxPrompts = 80;
+  // Session counters & live Admin quota state
+  const [secondsLeft, setSecondsLeft] = useState(
+    () => tokenState?.quota?.remainingSeconds ?? 240 * 60
+  );
+  const [promptsUsed, setPromptsUsed] = useState(
+    () => tokenState?.quota?.promptsUsed ?? 0
+  );
+  const [maxPrompts, setMaxPrompts] = useState(
+    () => tokenState?.quota?.promptLimit ?? 80
+  );
+  const [capturesUsed, setCapturesUsed] = useState(
+    () => tokenState?.quota?.capturesUsed ?? 0
+  );
+  const [captureLimit, setCaptureLimit] = useState(
+    () => tokenState?.quota?.captureLimit ?? 80
+  );
+  const [quotaBlockedReason, setQuotaBlockedReason] = useState<string | null>(
+    () => tokenState?.quota?.blockedReason ?? null
+  );
 
   const [questionInput, setQuestionInput] = useState("");
+  const [activeProblemContext, setActiveProblemContext] =
+    useState<ActiveProblemContext | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
-  const [copiedUrl, setCopiedUrl] = useState(false);
   const [speakingId, setSpeakingId] = useState<string | null>(null);
+  const [serverDiag, setServerDiag] = useState<{
+    checked: boolean;
+    reachable: boolean;
+    groq: boolean;
+    deepgram: boolean;
+    llmReady: boolean;
+    sttReady: boolean;
+    error: string | null;
+  }>({
+    checked: false,
+    reachable: false,
+    groq: false,
+    deepgram: false,
+    llmReady: false,
+    sttReady: false,
+    error: null,
+  });
+  const [micDiagError, setMicDiagError] = useState<string | null>(null);
+  const [liveApiError, setLiveApiError] = useState<string | null>(null);
 
   const [qaList, setQaList] = useState<QAItem[]>([
     {
       id: "system-init",
       timestamp: formatNow(),
-      question: "System Initialized",
-      answer: "Live Stream Active. Waiting for questions...",
-      engine: "Live",
+      question: "Session Ready (Standby)",
+      answer:
+        "Timer is paused. Click Start below to begin listening and start your session timer, or type any question in the box below and click Send.",
+      engine: "Standby",
       isStreaming: false,
     },
   ]);
@@ -198,15 +255,18 @@ export function SoftwareOverlay({
   const hiddenVideoRef = useRef<HTMLVideoElement | null>(null);
   const screenStreamRef = useRef<MediaStream | null>(null);
   const audioStreamRef = useRef<MediaStream | null>(null);
+  const extraAudioStreamsRef = useRef<MediaStream[]>([]);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const recordedChunksRef = useRef<Blob[]>([]);
   const chunkTimerRef = useRef<number | null>(null);
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
+  const mixAudioCtxRef = useRef<AudioContext | null>(null);
   const monitorGainRef = useRef<GainNode | null>(null);
   const rafLevelRef = useRef<number | null>(null);
   const sseRef = useRef<EventSource | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const countdownTimerRef = useRef<number | null>(null);
   const glitchTimerRef = useRef<number | null>(null);
   const videoScanTimerRef = useRef<number | null>(null);
   const videoFrameIntervalRef = useRef<number | null>(null);
@@ -221,6 +281,18 @@ export function SoftwareOverlay({
   const videoDurationRef = useRef(videoDurationSec);
   const glitchDurationRef = useRef(glitchDurationSec);
   const sessionActiveRef = useRef(Boolean(tokenState?.sessionActive));
+  const tokenStateRef = useRef<SessionTokenState | null>(tokenState);
+  const quotaBlockedReasonRef = useRef<string | null>(quotaBlockedReason);
+  const activeProblemContextRef = useRef<ActiveProblemContext | null>(
+    activeProblemContext
+  );
+  const selectedAudioInputRef = useRef<string>(selectedAudioInput);
+  const speechActiveRef = useRef<boolean>(false);
+  const lastSpeechAtRef = useRef<number>(0);
+  const chunkStartedAtRef = useRef<number>(0);
+  const recognitionWorkingRef = useRef<boolean>(false);
+  const lastAskedRef = useRef<{ text: string; at: number }>({ text: "", at: 0 });
+  const unsyncedSecondsRef = useRef<number>(0);
 
   profileRef.current = profile;
   qaListRef.current = qaList;
@@ -230,13 +302,99 @@ export function SoftwareOverlay({
   videoDurationRef.current = videoDurationSec;
   glitchDurationRef.current = glitchDurationSec;
   sessionActiveRef.current = Boolean(tokenState?.sessionActive);
+  tokenStateRef.current = tokenState;
+  quotaBlockedReasonRef.current = quotaBlockedReason;
+  activeProblemContextRef.current = activeProblemContext;
+  selectedAudioInputRef.current = selectedAudioInput;
+
+  const applyQuotaSnapshot = useCallback(
+    (quota: AccountQuotaSnapshot) => {
+      setSecondsLeft(quota.remainingSeconds);
+      setPromptsUsed(quota.promptsUsed);
+      setMaxPrompts(quota.promptLimit);
+      setCapturesUsed(quota.capturesUsed);
+      setCaptureLimit(quota.captureLimit);
+      setQuotaBlockedReason(quota.blockedReason);
+      if (quota.blockedReason) {
+        setStatusNotice(quota.blockedReason);
+      }
+      const curTok = tokenStateRef.current;
+      if (
+        curTok &&
+        (!curTok.quota ||
+          curTok.quota.remainingSeconds !== quota.remainingSeconds ||
+          curTok.quota.capturesUsed !== quota.capturesUsed ||
+          curTok.quota.promptsUsed !== quota.promptsUsed ||
+          curTok.quota.status !== quota.status)
+      ) {
+        onTokenChange({ ...curTok, quota });
+      }
+    },
+    [onTokenChange]
+  );
+
+  useEffect(() => {
+    if (tokenState?.quota) {
+      setSecondsLeft(tokenState.quota.remainingSeconds);
+      setPromptsUsed(tokenState.quota.promptsUsed);
+      setMaxPrompts(tokenState.quota.promptLimit);
+      setCapturesUsed(tokenState.quota.capturesUsed);
+      setCaptureLimit(tokenState.quota.captureLimit);
+      setQuotaBlockedReason(tokenState.quota.blockedReason);
+    }
+  }, [tokenState?.quota]);
+
+  // Enumerate available microphone input devices for the Audio Input Selector
+  const refreshAudioInputDevices = useCallback(async () => {
+    if (
+      typeof navigator === "undefined" ||
+      !navigator.mediaDevices?.enumerateDevices
+    ) {
+      return;
+    }
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const mics = devices
+        .filter((d) => d.kind === "audioinput")
+        .map((d, idx) => ({
+          deviceId: d.deviceId || `mic-${idx}`,
+          label: d.label?.trim() || `Microphone ${idx + 1}`,
+        }))
+        .filter(
+          (d, idx, arr) =>
+            d.deviceId !== "default" &&
+            d.deviceId !== "communications" &&
+            arr.findIndex((x) => x.deviceId === d.deviceId) === idx
+        );
+      setAudioInputs(mics);
+    } catch {
+      // Ignore enumerateDevices errors in restricted contexts
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshAudioInputDevices();
+    if (
+      typeof navigator === "undefined" ||
+      !navigator.mediaDevices?.addEventListener
+    ) {
+      return;
+    }
+    const onChange = () => void refreshAudioInputDevices();
+    navigator.mediaDevices.addEventListener("devicechange", onChange);
+    return () => {
+      navigator.mediaDevices.removeEventListener("devicechange", onChange);
+    };
+  }, [refreshAudioInputDevices]);
 
   const desktopMode = isDesktopApp();
   const serverDisplayUrl =
     getApiBaseUrl() ||
-    (typeof window !== "undefined" && window.location.origin !== "null"
+    (typeof window !== "undefined" &&
+    (window.location.protocol === "http:" ||
+      window.location.protocol === "https:")
       ? window.location.origin
-      : "http://localhost:3000");
+      : DEFAULT_PRODUCTION_API_URL);
 
   const isAuthenticated = Boolean(tokenState?.authenticated);
   const isSessionLive = Boolean(tokenState?.authenticated && tokenState?.sessionActive);
@@ -270,6 +428,13 @@ export function SoftwareOverlay({
     setStartingSession(true);
     try {
       const data = await startLiveSession();
+      // Always land on the live HUD in PAUSED standby — timer MUST stay frozen until user clicks ▶ Start
+      if (countdownTimerRef.current !== null) {
+        window.clearInterval(countdownTimerRef.current);
+        countdownTimerRef.current = null;
+      }
+      isEngineRunningRef.current = false;
+      setIsEngineRunning(false);
       onTokenChange(data.token);
       if (data.profile) onProfileChange(data.profile);
       setIsConnected(true);
@@ -283,10 +448,30 @@ export function SoftwareOverlay({
     }
   };
 
+  const flushElapsedSeconds = useCallback(() => {
+    const currentTok = tokenStateRef.current?.token;
+    const elapsed = unsyncedSecondsRef.current;
+    if (!currentTok || elapsed <= 0) return;
+    unsyncedSecondsRef.current = 0;
+    void syncTokenElapsedSeconds(currentTok, elapsed).then((res) => {
+      if (res.ok) {
+        applyQuotaSnapshot(res.quota);
+      }
+    });
+  }, [applyQuotaSnapshot]);
+
+  const pauseSessionAndTimerRef = useRef<(reason?: string) => void>(() => {});
+  const disconnectSessionRef = useRef<() => void>(() => {});
+
   const handleMinimizeWindow = () => {
+    // Minimizing ALWAYS pauses the active session and stops the timer immediately
+    pauseSessionAndTimerRef.current(
+      "Minimized — session and timer paused. Click Start to resume."
+    );
+
     const bridge = window.crackpilotDesktop;
     if (bridge?.isElectron) {
-      console.log("[Crackpilot Overlay] Minimize button clicked -> IPC crackpilot:minimize");
+      console.log("[Crackpilot Overlay] Minimize button clicked -> timer paused + IPC crackpilot:minimize");
       void bridge
         .minimizeWindow()
         .catch((err) => {
@@ -294,7 +479,7 @@ export function SoftwareOverlay({
           if (bridge.minimizeWindowSync) {
             const ok = bridge.minimizeWindowSync();
             if (!ok) {
-              setStatusNotice("Could not minimize window — press Alt+H to hide.");
+              setStatusNotice("Could not minimize window — timer is paused.");
             }
           }
         });
@@ -328,17 +513,19 @@ export function SoftwareOverlay({
     setIsMaximized((m) => !m);
   };
 
-  const handleHideWindow = () => {
+  const handleCloseAndDisconnect = () => {
+    // Clicking the Cross (×) icon ALWAYS disconnects the session cleanly
+    disconnectSessionRef.current();
     const bridge = window.crackpilotDesktop;
-    if (bridge?.isElectron) {
-      console.log("[Crackpilot Overlay] Hide/Close button clicked -> IPC crackpilot:hide");
-      void bridge.hideWindow().catch((err) => {
-        console.error("[Crackpilot Overlay] hideWindow IPC failed:", err);
-        setIsHidden(true);
-      });
+    if (bridge?.isElectron && bridge.closeWindow) {
+      console.log("[Crackpilot Overlay] Cross (×) clicked -> session disconnected + IPC crackpilot:close");
+      window.setTimeout(() => {
+        void bridge.closeWindow?.().catch((err) => {
+          console.error("[Crackpilot Overlay] closeWindow IPC failed:", err);
+        });
+      }, 120);
       return;
     }
-    setIsHidden(true);
   };
 
   // Document Picture-in-Picture Always-On-Top Float Across Browser Tabs
@@ -408,14 +595,159 @@ export function SoftwareOverlay({
     window.addEventListener("mouseup", onMouseUp);
   };
 
-  // Session countdown timer
+  // Hydrate exact remaining balance from backend on session launch without starting countdown
   useEffect(() => {
-    if (!isSessionLive || !isConnected || glitchCountdown > 0) return;
-    const timer = window.setInterval(() => {
-      setSecondsLeft((prev) => (prev > 0 ? prev - 1 : 0));
+    if (!isSessionLive || !tokenState?.token) return;
+    void fetchTokenQuota(tokenState.token).then((res) => {
+      if (res.ok) {
+        applyQuotaSnapshot(res.quota);
+      }
+    });
+  }, [isSessionLive, tokenState?.token, applyQuotaSnapshot]);
+
+  // Real-time Server & AI Key Diagnostics (/api/health -> boolean readiness flags)
+  const checkServerDiagnostics = useCallback(async () => {
+    try {
+      const resp = await fetch(apiUrl("/api/health"), {
+        method: "GET",
+        cache: "no-store",
+      });
+      const ct = (resp.headers.get("content-type") || "").toLowerCase();
+      if (!resp.ok || !ct.includes("application/json")) {
+        setServerDiag({
+          checked: true,
+          reachable: false,
+          groq: false,
+          deepgram: false,
+          llmReady: false,
+          sttReady: false,
+          error: `Server unreachable (${resp.status})`,
+        });
+        return;
+      }
+      const data = (await resp.json()) as {
+        ok?: boolean;
+        engines?: {
+          groq?: boolean;
+          deepgram?: boolean;
+          llmReady?: boolean;
+          sttReady?: boolean;
+        };
+      };
+      const eng = data.engines;
+      const llmReady = Boolean(eng?.llmReady ?? true);
+      const sttReady = Boolean(eng?.sttReady ?? true);
+      let diagErr: string | null = null;
+      if (eng && !llmReady && !sttReady) {
+        diagErr = "Missing GROQ_API_KEY & DEEPGRAM_API_KEY";
+      } else if (eng && !llmReady) {
+        diagErr = "Missing GROQ_API_KEY on Server";
+      } else if (eng && !sttReady) {
+        diagErr = "Missing DEEPGRAM_API_KEY on Server";
+      }
+      setServerDiag({
+        checked: true,
+        reachable: Boolean(data.ok),
+        groq: Boolean(eng?.groq),
+        deepgram: Boolean(eng?.deepgram),
+        llmReady,
+        sttReady,
+        error: diagErr,
+      });
+    } catch {
+      setServerDiag({
+        checked: true,
+        reachable: false,
+        groq: false,
+        deepgram: false,
+        llmReady: false,
+        sttReady: false,
+        error: "Server Unreachable — check internet / Server URL",
+      });
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!isSessionLive) return;
+    void checkServerDiagnostics();
+  }, [isSessionLive, checkServerDiagnostics]);
+
+  // Session countdown timer — STRICTLY frozen whenever isSessionRunning === false (never ticks on app launch)
+  useEffect(() => {
+    if (countdownTimerRef.current !== null) {
+      window.clearInterval(countdownTimerRef.current);
+      countdownTimerRef.current = null;
+    }
+    if (
+      !isSessionLive ||
+      !isConnected ||
+      !isSessionRunning ||
+      isHidden ||
+      glitchCountdown > 0
+    ) {
+      return;
+    }
+    countdownTimerRef.current = window.setInterval(() => {
+      if (!isEngineRunningRef.current) {
+        if (countdownTimerRef.current !== null) {
+          window.clearInterval(countdownTimerRef.current);
+          countdownTimerRef.current = null;
+        }
+        return;
+      }
+      unsyncedSecondsRef.current += 1;
+      setSecondsLeft((prev) => {
+        const next = prev > 0 ? prev - 1 : 0;
+        if (next === 0) {
+          if (countdownTimerRef.current !== null) {
+            window.clearInterval(countdownTimerRef.current);
+            countdownTimerRef.current = null;
+          }
+          setQuotaBlockedReason(
+            "Remaining time is 0 minutes. Ask the admin to add extra time, then click Reconnect."
+          );
+          isEngineRunningRef.current = false;
+          setIsEngineRunning(false);
+        }
+        return next;
+      });
     }, 1000);
-    return () => window.clearInterval(timer);
-  }, [isSessionLive, isConnected, glitchCountdown]);
+    return () => {
+      if (countdownTimerRef.current !== null) {
+        window.clearInterval(countdownTimerRef.current);
+        countdownTimerRef.current = null;
+      }
+    };
+  }, [isSessionLive, isConnected, isSessionRunning, isHidden, glitchCountdown]);
+
+  // Background 20s quota sync with AdminStore (ONLY deducts elapsed seconds when Start actually ran)
+  useEffect(() => {
+    if (!isSessionLive || !tokenState?.token) return;
+    const intervalId = window.setInterval(() => {
+      const currentTok = tokenStateRef.current?.token;
+      if (!currentTok) return;
+      const elapsed = unsyncedSecondsRef.current;
+      unsyncedSecondsRef.current = 0;
+
+      const syncPromise =
+        elapsed > 0
+          ? syncTokenElapsedSeconds(currentTok, elapsed)
+          : fetchTokenQuota(currentTok);
+
+      void syncPromise.then((res) => {
+        if (res.ok) {
+          applyQuotaSnapshot(res.quota);
+        } else if (res.revoked) {
+          setQuotaBlockedReason(
+            res.error || "This token has been revoked by the administrator."
+          );
+          setIsEngineRunning(false);
+          isEngineRunningRef.current = false;
+        }
+      });
+    }, 20000);
+    return () => window.clearInterval(intervalId);
+  }, [isSessionLive, tokenState?.token, applyQuotaSnapshot]);
 
   // Smooth auto-scroll when Scroll: ON
   useEffect(() => {
@@ -441,28 +773,40 @@ export function SoftwareOverlay({
 
   useEffect(() => {
     if (monitorGainRef.current) {
-      monitorGainRef.current.gain.value = monitorAudio ? 1.0 : 0.0;
+      // Only pass audio back to speakers for muted browser tab captures;
+      // in Electron WASAPI loopback and physical Mic mode, keep gain 0 to avoid echo/howling while Monitor: ON tracks live voice.
+      const shouldPassToSpeakers =
+        monitorAudio && listenMode === "tab" && !isDesktopApp();
+      monitorGainRef.current.gain.value = shouldPassToSpeakers ? 1.0 : 0.0;
     }
-  }, [monitorAudio]);
+  }, [monitorAudio, listenMode]);
 
   const streamAnswerFromEndpoint = useCallback(
     async (
       qaId: string,
       endpoint: "/api/answer" | "/api/analyze-screen" | "/api/analyze-video",
-      body: Record<string, unknown>
+      body: Record<string, unknown>,
+      allowWhenPaused = false
     ) => {
-      if (!isEngineRunningRef.current || !isConnectedRef.current || glitchActiveRef.current) {
+      if (
+        quotaBlockedReasonRef.current ||
+        (!allowWhenPaused && !isEngineRunningRef.current) ||
+        !isConnectedRef.current ||
+        glitchActiveRef.current
+      ) {
         setQaList((prev) =>
           prev.map((q) =>
             q.id === qaId
               ? {
                   ...q,
                   isStreaming: false,
-                  error: !isEngineRunningRef.current
-                    ? "Software is paused. Click Start to resume AI answers and live listening."
-                    : glitchActiveRef.current
-                      ? "Network paused (Glitch active). Waiting to restore..."
-                      : "Session disconnected. Click Reconnect (Alt+R).",
+                  error: quotaBlockedReasonRef.current
+                    ? quotaBlockedReasonRef.current
+                    : !allowWhenPaused && !isEngineRunningRef.current
+                      ? "Software is paused. Click Start to resume AI answers and live listening."
+                      : glitchActiveRef.current
+                        ? "Network paused (Glitch active). Waiting to restore..."
+                        : "Session disconnected. Click Reconnect (Alt+R).",
                 }
               : q
           )
@@ -500,6 +844,19 @@ export function SoftwareOverlay({
         const contentType = (resp.headers.get("content-type") || "").toLowerCase();
         if (!resp.ok || !resp.body || !contentType.includes("text/event-stream")) {
           const errText = await resp.text();
+          if (resp.status === 403 && contentType.includes("application/json")) {
+            try {
+              const parsed = JSON.parse(errText) as {
+                error?: string;
+                quota?: AccountQuotaSnapshot;
+              };
+              if (parsed.quota) applyQuotaSnapshot(parsed.quota);
+              if (parsed.error) setQuotaBlockedReason(parsed.error);
+              throw new Error(parsed.error || "Account quota exhausted or suspended.");
+            } catch (quotaErr) {
+              if (quotaErr instanceof Error) throw quotaErr;
+            }
+          }
           const preview = errText.trim().slice(0, 160).replace(/\s+/g, " ");
           console.error(
             `[Crackpilot AI] Invalid response from ${targetUrl} (status=${resp.status}, content-type="${contentType || "none"}", preview="${preview}")`
@@ -539,11 +896,34 @@ export function SoftwareOverlay({
                 done?: boolean;
                 error?: string;
                 meta?: { engine?: string };
+                dsaData?: DsaTeleprompterData;
               };
               if (payload.meta?.engine) {
-                const eng = payload.meta.engine === "openai" ? "OpenAI" : "AI";
+                const eng =
+                  payload.meta.engine === "groq"
+                    ? "Groq"
+                    : payload.meta.engine === "openai"
+                      ? "OpenAI"
+                      : "AI";
+                setLiveApiError(null);
                 setQaList((prev) =>
                   prev.map((q) => (q.id === qaId ? { ...q, engine: eng } : q))
+                );
+              }
+              if (payload.dsaData) {
+                const dsaPayload = payload.dsaData;
+                setActiveProblemContext(dsaPayload.problemContext);
+                activeProblemContextRef.current = dsaPayload.problemContext;
+                setQaList((prev) =>
+                  prev.map((q) =>
+                    q.id === qaId
+                      ? {
+                          ...q,
+                          question: `${dsaPayload.problemContext.title} (${dsaPayload.problemContext.preferredLanguage})`,
+                          dsaData: dsaPayload,
+                        }
+                      : q
+                  )
                 );
               }
               if (payload.chunk) {
@@ -554,6 +934,7 @@ export function SoftwareOverlay({
                 );
               }
               if (payload.error) {
+                setLiveApiError(payload.error);
                 setQaList((prev) =>
                   prev.map((q) =>
                     q.id === qaId
@@ -597,9 +978,19 @@ export function SoftwareOverlay({
   );
 
   const askQuestion = useCallback(
-    async (questionText: string, fastMode = false) => {
+    async (questionText: string, fastMode = false, allowWhenPaused = false) => {
       const cleaned = questionText.trim();
       if (!cleaned) return;
+      if (quotaBlockedReasonRef.current) {
+        setStatusNotice(quotaBlockedReasonRef.current);
+        return;
+      }
+      if (!allowWhenPaused && !isEngineRunningRef.current) {
+        setStatusNotice(
+          "Session is stopped — click Start first to start your timer and live audio listening."
+        );
+        return;
+      }
       if (!isConnectedRef.current) {
         setStatusNotice("Session is Disconnected. Press Reconnect (Alt+R) first.");
         return;
@@ -608,6 +999,18 @@ export function SoftwareOverlay({
         setStatusNotice("Glitch pause active — internet temporarily off.");
         return;
       }
+
+      // Prevent duplicate triggers from overlapping speech recognition / VAD chunks
+      const now = Date.now();
+      const norm = cleaned.toLowerCase();
+      if (
+        !allowWhenPaused &&
+        lastAskedRef.current.text === norm &&
+        now - lastAskedRef.current.at < 4000
+      ) {
+        return;
+      }
+      lastAskedRef.current = { text: norm, at: now };
 
       setPromptsUsed((c) => Math.min(maxPrompts, c + 1));
 
@@ -630,23 +1033,29 @@ export function SoftwareOverlay({
         .slice(-3)
         .map((q) => ({ question: q.question, answer: q.answer }));
 
-      const promptWithMode = fastMode
-        ? `${cleaned}\n\n[FAST MODE: Give the quickest possible direct 3-bullet spoken answer.]`
-        : cleaned;
-
-      await streamAnswerFromEndpoint(qaId, "/api/answer", {
-        question: promptWithMode,
-        role: cur.role,
-        experience: cur.experience,
-        skills: cur.skills,
-        resumeText: cur.resumeText,
-        jdText: cur.jdText,
-        answerLanguage: cur.answerLanguage,
-        answerStyle: cur.answerStyle,
-        history: recentHistory,
-      });
+      await streamAnswerFromEndpoint(
+        qaId,
+        "/api/answer",
+        {
+          token: tokenStateRef.current?.token,
+          question: cleaned,
+          fastMode,
+          role: cur.role,
+          experience: cur.experience,
+          skills: cur.skills,
+          resumeText: cur.resumeText,
+          jdText: cur.jdText,
+          answerLanguage: cur.answerLanguage,
+          answerStyle: normalizeAnswerStyle(cur.answerStyle),
+          dsaModeEnabled: Boolean(cur.dsaModeEnabled),
+          preferredLanguage: normalizeProgrammingLanguage(cur.preferredLanguage),
+          activeProblemContext: activeProblemContextRef.current,
+          history: recentHistory,
+        },
+        allowWhenPaused
+      );
     },
-    [streamAnswerFromEndpoint]
+    [maxPrompts, streamAnswerFromEndpoint]
   );
 
   // Sync live events (Dashboard Start Session, Target Profile updates, Python loopback audio)
@@ -675,7 +1084,10 @@ export function SoftwareOverlay({
             type?: string;
             question?: string;
             token?: SessionTokenState | null;
+            tokenValue?: string;
+            quota?: AccountQuotaSnapshot;
             profile?: TargetProfile;
+            activeProblemContext?: ActiveProblemContext | null;
           };
           // Keep fresh Desktop .exe launch at Gate 1 (do not auto-skip from initial "connected" snapshot)
           if (
@@ -683,6 +1095,37 @@ export function SoftwareOverlay({
             !(isDesktopApp() && data.type === "connected")
           ) {
             onTokenChange(data.token);
+          }
+          if (data.type === "dsa_problem_updated" && data.activeProblemContext) {
+            setActiveProblemContext(data.activeProblemContext);
+            activeProblemContextRef.current = data.activeProblemContext;
+          } else if (data.type === "dsa_problem_cleared") {
+            setActiveProblemContext(null);
+            activeProblemContextRef.current = null;
+          } else if (
+            data.type === "connected" &&
+            data.activeProblemContext !== undefined
+          ) {
+            setActiveProblemContext(data.activeProblemContext);
+            activeProblemContextRef.current = data.activeProblemContext;
+          }
+          if (
+            data.type === "quota_updated" &&
+            data.quota &&
+            (!data.tokenValue || data.tokenValue === tokenStateRef.current?.token)
+          ) {
+            applyQuotaSnapshot(data.quota);
+          }
+          if (
+            data.type === "account_revoked" &&
+            data.tokenValue &&
+            data.tokenValue === tokenStateRef.current?.token
+          ) {
+            setQuotaBlockedReason(
+              "Your token has been revoked by the administrator."
+            );
+            setIsEngineRunning(false);
+            isEngineRunningRef.current = false;
           }
           if (data.profile) {
             onProfileChange(data.profile);
@@ -755,6 +1198,7 @@ export function SoftwareOverlay({
     isListeningRef.current = false;
     setIsListening(false);
     setListenMode(null);
+    setMonitorAudio(false);
     setInterimText("");
     setAudioLevel(0);
 
@@ -792,9 +1236,19 @@ export function SoftwareOverlay({
       audioCtxRef.current = null;
       monitorGainRef.current = null;
     }
+    if (mixAudioCtxRef.current) {
+      void mixAudioCtxRef.current.close();
+      mixAudioCtxRef.current = null;
+    }
     if (audioStreamRef.current) {
       audioStreamRef.current.getTracks().forEach((t) => t.stop());
       audioStreamRef.current = null;
+    }
+    if (extraAudioStreamsRef.current.length > 0) {
+      extraAudioStreamsRef.current.forEach((s) =>
+        s.getTracks().forEach((t) => t.stop())
+      );
+      extraAudioStreamsRef.current = [];
     }
   }, []);
 
@@ -821,16 +1275,24 @@ export function SoftwareOverlay({
   }, []);
 
   const attachAudioMeter = useCallback(
-    (audioStream: MediaStream, monitor: boolean) => {
+    (
+      audioStream: MediaStream,
+      monitor: boolean,
+      onVadFlush?: () => void
+    ) => {
       try {
         const AudioCtx =
           window.AudioContext ||
           (window as unknown as { webkitAudioContext: typeof AudioContext })
             .webkitAudioContext;
         const ctx = new AudioCtx();
+        if (ctx.state === "suspended") {
+          void ctx.resume().catch(() => {});
+        }
         const source = ctx.createMediaStreamSource(audioStream);
         const analyser = ctx.createAnalyser();
-        analyser.fftSize = 256;
+        analyser.fftSize = 512;
+        analyser.smoothingTimeConstant = 0.65;
         const gain = ctx.createGain();
         gain.gain.value = monitor ? 1.0 : 0.0;
 
@@ -841,9 +1303,18 @@ export function SoftwareOverlay({
         audioCtxRef.current = ctx;
         monitorGainRef.current = gain;
 
+        speechActiveRef.current = false;
+        lastSpeechAtRef.current = 0;
+        chunkStartedAtRef.current = Date.now();
+
         const data = new Uint8Array(analyser.fftSize);
+        let smoothedLevel = 0;
+
         const tick = () => {
           if (!isListeningRef.current) return;
+          if (ctx.state === "suspended") {
+            void ctx.resume().catch(() => {});
+          }
           analyser.getByteTimeDomainData(data);
           let sum = 0;
           for (let i = 0; i < data.length; i++) {
@@ -851,12 +1322,46 @@ export function SoftwareOverlay({
             sum += v * v;
           }
           const rms = Math.sqrt(sum / data.length);
-          setAudioLevel(Math.min(100, Math.round(rms * 320)));
+          const targetLevel = Math.min(100, Math.round(rms * 520));
+          smoothedLevel =
+            targetLevel > smoothedLevel
+              ? targetLevel
+              : Math.max(0, Math.round(smoothedLevel * 0.82 + targetLevel * 0.18));
+          setAudioLevel(smoothedLevel);
+
+          // Real-time VAD endpointing: flush completed speech immediately after ~0.85s pause for 1-2s AI replies
+          const now = Date.now();
+          if (rms > 0.014) {
+            if (!speechActiveRef.current) {
+              speechActiveRef.current = true;
+              chunkStartedAtRef.current = now;
+            }
+            lastSpeechAtRef.current = now;
+          } else if (speechActiveRef.current) {
+            const silenceMs = now - lastSpeechAtRef.current;
+            const utteranceMs = now - chunkStartedAtRef.current;
+            if (silenceMs >= 850 || utteranceMs >= 5500) {
+              speechActiveRef.current = false;
+              chunkStartedAtRef.current = now;
+              onVadFlush?.();
+            }
+          } else if (now - chunkStartedAtRef.current >= 6500) {
+            // Reset idle buffer periodically so chunks stay compact and fresh
+            chunkStartedAtRef.current = now;
+            if (
+              mediaRecorderRef.current &&
+              mediaRecorderRef.current.state === "recording" &&
+              !speechActiveRef.current
+            ) {
+              recordedChunksRef.current = [];
+            }
+          }
+
           rafLevelRef.current = requestAnimationFrame(tick);
         };
         rafLevelRef.current = requestAnimationFrame(tick);
-      } catch {
-        // Ignore AudioContext error
+      } catch (err) {
+        console.warn("[Crackpilot Audio] Web Audio AnalyserNode init warning:", err);
       }
     },
     []
@@ -864,7 +1369,14 @@ export function SoftwareOverlay({
 
   const transcribeRecordedChunks = useCallback(
     async (fastMode = false) => {
-      if (!isConnectedRef.current || glitchActiveRef.current) return;
+      if (
+        !isConnectedRef.current ||
+        !isEngineRunningRef.current ||
+        glitchActiveRef.current
+      ) {
+        recordedChunksRef.current = [];
+        return;
+      }
       const chunks = recordedChunksRef.current.splice(0);
       if (chunks.length === 0) return;
 
@@ -874,7 +1386,7 @@ export function SoftwareOverlay({
 
       if (!hasConfiguredBackend()) {
         setStatusNotice(
-          "Configure a Crackpilot Node.js Server URL in ••• Settings to transcribe captured system audio."
+          "Configure a Crackpilot Server URL in ••• Settings to transcribe captured audio."
         );
         return;
       }
@@ -883,6 +1395,7 @@ export function SoftwareOverlay({
       const transcribeUrl = apiUrl("/api/transcribe");
       try {
         const audioBase64 = await blobToBase64(blob);
+        const curProfile = profileRef.current;
         const resp = await fetch(transcribeUrl, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -890,7 +1403,11 @@ export function SoftwareOverlay({
             audioBase64,
             mimeType,
             language:
-              profileRef.current.answerLanguage === "Hindi" ? "hi" : "auto",
+              curProfile.answerLanguage === "Hindi" ? "hi" : "auto",
+            role: curProfile.role,
+            experience: curProfile.experience,
+            skills: curProfile.skills,
+            jdText: curProfile.jdText,
           }),
         });
         const contentType = (resp.headers.get("content-type") || "").toLowerCase();
@@ -917,14 +1434,18 @@ export function SoftwareOverlay({
         if (!resp.ok) {
           throw new Error(data.error || "Transcription failed.");
         }
-        if (data.text && data.text.trim().length > 2) {
-          void askQuestion(data.text.trim(), fastMode);
+        const cleanedTranscript = (data.text || "").trim();
+        setLiveApiError(null);
+        if (cleanedTranscript.length > 2) {
+          setInterimText("");
+          void askQuestion(cleanedTranscript, fastMode);
         }
       } catch (err) {
         console.error("[Crackpilot Transcribe] Error:", err);
-        setStatusNotice(
-          err instanceof Error ? err.message : "Audio transcription error."
-        );
+        const errMsg =
+          err instanceof Error ? err.message : "Audio transcription error.";
+        setLiveApiError(errMsg);
+        setStatusNotice(errMsg);
       } finally {
         setIsTranscribing(false);
       }
@@ -942,22 +1463,47 @@ export function SoftwareOverlay({
           ? "audio/webm"
           : "";
 
+      let skipNextStopTranscribe = false;
+
       const spinRecorder = () => {
         if (!isListeningRef.current) return;
-        const rec = preferredMime
-          ? new MediaRecorder(audioStream, { mimeType: preferredMime })
-          : new MediaRecorder(audioStream);
-        recordedChunksRef.current = [];
-        rec.ondataavailable = (ev) => {
-          if (ev.data && ev.data.size > 0) {
-            recordedChunksRef.current.push(ev.data);
-          }
-        };
-        rec.onstop = () => {
-          void transcribeRecordedChunks(false);
-        };
-        mediaRecorderRef.current = rec;
-        rec.start();
+        try {
+          const rec = preferredMime
+            ? new MediaRecorder(audioStream, { mimeType: preferredMime })
+            : new MediaRecorder(audioStream);
+          recordedChunksRef.current = [];
+          rec.ondataavailable = (ev) => {
+            if (ev.data && ev.data.size > 0) {
+              recordedChunksRef.current.push(ev.data);
+            }
+          };
+          rec.onstop = () => {
+            if (skipNextStopTranscribe) {
+              skipNextStopTranscribe = false;
+              recordedChunksRef.current = [];
+              return;
+            }
+            if (!recognitionWorkingRef.current) {
+              void transcribeRecordedChunks(false);
+            } else {
+              recordedChunksRef.current = [];
+            }
+          };
+          mediaRecorderRef.current = rec;
+          rec.start(250);
+        } catch (err) {
+          console.warn("[Crackpilot Audio] MediaRecorder start failed:", err);
+        }
+      };
+
+      const flushNow = () => {
+        if (!isListeningRef.current) return;
+        const activeRec = mediaRecorderRef.current;
+        if (activeRec && activeRec.state === "recording") {
+          skipNextStopTranscribe = false;
+          activeRec.stop();
+          spinRecorder();
+        }
       };
 
       spinRecorder();
@@ -966,28 +1512,222 @@ export function SoftwareOverlay({
         if (!isListeningRef.current) return;
         const activeRec = mediaRecorderRef.current;
         if (activeRec && activeRec.state === "recording") {
+          // Only transcribe on fallback timer if speech was actually detected
+          skipNextStopTranscribe = !speechActiveRef.current;
+          speechActiveRef.current = false;
           activeRec.stop();
           spinRecorder();
         }
       }, intervalSeconds * 1000);
+
+      return flushNow;
     },
     [transcribeRecordedChunks]
   );
 
-  // Capture Tab / System / WhatsApp Web / Meet Audio (works even on headphones!)
+  // Capture Microphone audio (captures nearby speaker / interviewer laptop voice & works out of the box in Electron + Browser)
+  const startMicrophoneAudio = useCallback(
+    async (deviceId?: string) => {
+      if (!isEngineRunningRef.current) {
+        setStatusNotice(
+          "Click Start first to begin your session and capture audio."
+        );
+        return;
+      }
+      if (!isConnectedRef.current) {
+        setStatusNotice("Session is Disconnected. Press Reconnect (Alt+R) first.");
+        return;
+      }
+      setStatusNotice(null);
+      stopAudioListening();
+      recognitionWorkingRef.current = false;
+
+      try {
+        const audioConstraint: MediaTrackConstraints = {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        };
+        if (deviceId && deviceId !== "default" && deviceId !== "system-loopback") {
+          audioConstraint.deviceId = { exact: deviceId };
+        }
+
+        let micStream: MediaStream;
+        try {
+          micStream = await navigator.mediaDevices.getUserMedia({
+            audio: audioConstraint,
+          });
+        } catch {
+          micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        }
+
+        if (!isEngineRunningRef.current) {
+          micStream.getTracks().forEach((t) => t.stop());
+          return;
+        }
+
+        // Refresh device labels now that microphone permission is granted
+        void refreshAudioInputDevices();
+
+        audioStreamRef.current = micStream;
+        isListeningRef.current = true;
+        setIsListening(true);
+        setListenMode("mic");
+        setMonitorAudio(true);
+
+        const flushRecorder = startChunkedRecorder(micStream, 4);
+        attachAudioMeter(micStream, false, flushRecorder);
+
+        // Start real-time Web Speech Recognition when supported (instant live Q streaming in Chrome/Edge)
+        // Automatically falls back to VAD + /api/transcribe in Electron if Web Speech API errors
+        const SpeechRecCtor =
+          (
+            window as unknown as {
+              SpeechRecognition?: new () => SpeechRecognitionLike;
+              webkitSpeechRecognition?: new () => SpeechRecognitionLike;
+            }
+          ).SpeechRecognition ||
+          (
+            window as unknown as {
+              webkitSpeechRecognition?: new () => SpeechRecognitionLike;
+            }
+          ).webkitSpeechRecognition;
+
+        if (SpeechRecCtor && !isDesktopApp()) {
+          try {
+            const rec = new SpeechRecCtor();
+            rec.continuous = true;
+            rec.interimResults = true;
+            rec.lang =
+              profileRef.current.answerLanguage === "Hindi" ? "hi-IN" : "en-US";
+
+            rec.onresult = (event) => {
+              recognitionWorkingRef.current = true;
+              let interim = "";
+              let finalChunk = "";
+              for (let i = event.resultIndex; i < event.results.length; i++) {
+                const text = event.results[i][0]?.transcript || "";
+                if (event.results[i].isFinal) {
+                  finalChunk += `${text} `;
+                } else {
+                  interim += text;
+                }
+              }
+              setInterimText(interim.trim());
+              const cleanedFinal = finalChunk.trim();
+              if (cleanedFinal.length > 2) {
+                setInterimText("");
+                void askQuestion(cleanedFinal, false);
+              }
+            };
+
+            rec.onerror = (ev) => {
+              if (
+                ev.error === "network" ||
+                ev.error === "service-not-allowed" ||
+                ev.error === "not-allowed"
+              ) {
+                recognitionWorkingRef.current = false;
+                try {
+                  rec.onend = null;
+                  rec.stop();
+                } catch {
+                  // Ignore
+                }
+              }
+            };
+
+            rec.onend = () => {
+              if (isListeningRef.current && isEngineRunningRef.current) {
+                try {
+                  rec.start();
+                } catch {
+                  recognitionWorkingRef.current = false;
+                }
+              }
+            };
+
+            recognitionRef.current = rec;
+            rec.start();
+          } catch {
+            recognitionWorkingRef.current = false;
+          }
+        }
+
+        setMicDiagError(null);
+        setStatusNotice(
+          "Mic Live — listening for spoken questions. Answers will stream automatically."
+        );
+      } catch (err) {
+        console.error("[Crackpilot Audio] Microphone capture error:", err);
+        const errName = err instanceof Error ? err.name : "";
+        const errMsg = err instanceof Error ? err.message : "";
+        if (
+          errName === "NotAllowedError" ||
+          errName === "PermissionDeniedError" ||
+          /denied|permission/i.test(errMsg)
+        ) {
+          setMicDiagError("Mic Permission Denied");
+        } else if (errName === "NotFoundError") {
+          setMicDiagError("No Microphone Detected");
+        } else {
+          setMicDiagError(errMsg || "Mic Capture Error");
+        }
+        setStatusNotice(
+          err instanceof Error
+            ? `Microphone access failed (${err.message}). Select another Audio Input or check OS microphone permissions.`
+            : "Could not access microphone. Check OS microphone permissions."
+        );
+      }
+    },
+    [
+      askQuestion,
+      attachAudioMeter,
+      refreshAudioInputDevices,
+      startChunkedRecorder,
+      stopAudioListening,
+    ]
+  );
+
+  // Capture System / Loopback / Meeting Tab Audio (interviewer audio via display media loopback)
   const startTabSystemAudio = useCallback(async () => {
+    if (!isEngineRunningRef.current) {
+      setStatusNotice(
+        "Click Start first to begin your session and capture system audio."
+      );
+      return;
+    }
     if (!isConnectedRef.current) {
       setStatusNotice("Session is Disconnected. Press Reconnect (Alt+R) first.");
       return;
     }
     setStatusNotice(null);
     stopAudioListening();
+    recognitionWorkingRef.current = false;
 
     try {
-      const displayStream = await navigator.mediaDevices.getDisplayMedia({
-        video: true,
-        audio: true,
-      });
+      let displayStream: MediaStream;
+      try {
+        displayStream = await navigator.mediaDevices.getDisplayMedia({
+          video: true,
+          audio: {
+            echoCancellation: false,
+            noiseSuppression: true,
+            autoGainControl: true,
+            suppressLocalAudioPlayback: false,
+          } as MediaTrackConstraints,
+        });
+      } catch {
+        displayStream = await navigator.mediaDevices.getDisplayMedia({
+          video: true,
+          audio: true,
+        });
+      }
+
+      if (!isEngineRunningRef.current) {
+        displayStream.getTracks().forEach((t) => t.stop());
+        return;
+      }
 
       screenStreamRef.current = displayStream;
       setHasSharedScreen(true);
@@ -1004,7 +1744,7 @@ export function SoftwareOverlay({
       const audioTracks = displayStream.getAudioTracks();
       if (audioTracks.length === 0) {
         setStatusNotice(
-          'Screen linked, but no audio track shared. Check "Share tab audio" or "Share system audio" for headphone/WhatsApp/Meet calls.'
+          'Screen linked, but no system/tab audio was shared. Enable "Share system audio" or switch the Audio Input selector to Microphone.'
         );
         return;
       }
@@ -1014,100 +1754,166 @@ export function SoftwareOverlay({
       isListeningRef.current = true;
       setIsListening(true);
       setListenMode("tab");
-      setMonitorAudio(false);
-      attachAudioMeter(audioOnly, false);
-      startChunkedRecorder(audioOnly, 5);
+      setMonitorAudio(true);
+      setMicDiagError(null);
+      const flushRecorder = startChunkedRecorder(audioOnly, 4);
+      attachAudioMeter(audioOnly, false, flushRecorder);
       setStatusNotice(
-        "Tab / System Audio active — capturing interviewer voice (headphones supported)."
+        "Monitor ON — System / Zoom / Meet Call Audio Live. Listening for interviewer questions."
       );
     } catch (err) {
       setStatusNotice(
-        err instanceof Error ? err.message : "System audio capture cancelled."
+        err instanceof Error
+          ? `${err.message} — switching to Microphone or retry System Audio.`
+          : "System / Loopback audio capture cancelled."
       );
     }
   }, [attachAudioMeter, startChunkedRecorder, stopAudioListening, stopScreenStream]);
 
-  const startMicListening = useCallback(async () => {
+  // Dual Two-Laptop / Mobile Call Capture: mixes System Loopback (Zoom/Meet/Teams on Laptop A)
+  // + Physical Microphone (Laptop B / Mobile B external speaker audio) with zero feedback echo.
+  const startCallAndMicAudio = useCallback(async () => {
+    if (!isEngineRunningRef.current) {
+      setStatusNotice("Click Start first to begin your session and capture audio.");
+      return;
+    }
     if (!isConnectedRef.current) {
       setStatusNotice("Session is Disconnected. Press Reconnect (Alt+R) first.");
       return;
     }
     setStatusNotice(null);
     stopAudioListening();
+    recognitionWorkingRef.current = false;
 
+    const acquiredStreams: MediaStream[] = [];
+    let hasLoopback = false;
+    let hasMic = false;
+
+    // 1) Try Electron/Browser System Loopback Audio (Zoom / Google Meet / Teams incoming call audio)
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true },
+      const displayStream = await navigator.mediaDevices.getDisplayMedia({
+        video: true,
+        audio: true,
       });
-      audioStreamRef.current = stream;
-      isListeningRef.current = true;
-      setIsListening(true);
-      setListenMode("mic");
-      setMonitorAudio(false);
-      attachAudioMeter(stream, false);
-
-      const SpeechRecCtor =
-        (
-          window as unknown as {
-            SpeechRecognition?: new () => SpeechRecognitionLike;
-            webkitSpeechRecognition?: new () => SpeechRecognitionLike;
-          }
-        ).SpeechRecognition ||
-        (
-          window as unknown as {
-            webkitSpeechRecognition?: new () => SpeechRecognitionLike;
-          }
-        ).webkitSpeechRecognition;
-
-      if (SpeechRecCtor) {
-        const rec = new SpeechRecCtor();
-        rec.continuous = true;
-        rec.interimResults = true;
-        rec.lang =
-          profileRef.current.answerLanguage === "Hindi" ? "hi-IN" : "en-IN";
-
-        rec.onresult = (event) => {
-          let interim = "";
-          for (let i = event.resultIndex; i < event.results.length; i++) {
-            const res = event.results[i];
-            const transcript = res[0]?.transcript || "";
-            if (res.isFinal && transcript.trim()) {
-              void askQuestion(transcript.trim());
-            } else {
-              interim += transcript;
-            }
-          }
-          setInterimText(interim);
-        };
-
-        rec.onerror = (ev) => {
-          if (ev.error === "not-allowed" || ev.error === "service-not-allowed") {
-            startChunkedRecorder(stream, 5);
-          }
-        };
-
-        rec.onend = () => {
-          if (isListeningRef.current && recognitionRef.current === rec) {
-            try {
-              rec.start();
-            } catch {
-              // Ignore
-            }
-          }
-        };
-
-        recognitionRef.current = rec;
-        rec.start();
-      } else {
-        startChunkedRecorder(stream, 5);
+      if (!isEngineRunningRef.current) {
+        displayStream.getTracks().forEach((t) => t.stop());
+        return;
+      }
+      screenStreamRef.current = displayStream;
+      setHasSharedScreen(true);
+      const videoTrack = displayStream.getVideoTracks()[0];
+      if (videoTrack) {
+        videoTrack.onended = () => stopScreenStream();
+      }
+      if (hiddenVideoRef.current) {
+        hiddenVideoRef.current.srcObject = displayStream;
+        await hiddenVideoRef.current.play().catch(() => {});
+      }
+      const sysAudioTracks = displayStream.getAudioTracks();
+      if (sysAudioTracks.length > 0) {
+        acquiredStreams.push(new MediaStream(sysAudioTracks));
+        hasLoopback = true;
       }
     } catch (err) {
-      setStatusNotice(
-        err instanceof Error ? err.message : "Microphone permission denied."
-      );
-      stopAudioListening();
+      console.warn("[Crackpilot Audio] Loopback display capture unavailable, continuing with mic:", err);
     }
-  }, [askQuestion, attachAudioMeter, startChunkedRecorder, stopAudioListening]);
+
+    // 2) Also attach Physical Microphone so external Laptop B / Mobile B speaker audio is captured
+    try {
+      const micStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
+      if (!isEngineRunningRef.current) {
+        micStream.getTracks().forEach((t) => t.stop());
+        acquiredStreams.forEach((s) => s.getTracks().forEach((t) => t.stop()));
+        return;
+      }
+      void refreshAudioInputDevices();
+      acquiredStreams.push(micStream);
+      hasMic = true;
+      setMicDiagError(null);
+    } catch (err) {
+      console.warn("[Crackpilot Audio] Mic capture unavailable in dual mode:", err);
+      if (!hasLoopback) {
+        const errName = err instanceof Error ? err.name : "";
+        setMicDiagError(
+          errName === "NotAllowedError" ? "Mic Permission Denied" : "Audio Capture Unavailable"
+        );
+      }
+    }
+
+    if (acquiredStreams.length === 0) {
+      setStatusNotice(
+        "Could not capture System Loopback or Microphone audio. Check Windows audio permissions and try again."
+      );
+      return;
+    }
+
+    // Mix all acquired streams cleanly if both Loopback + Mic succeeded
+    let finalStream: MediaStream = acquiredStreams[0];
+    if (acquiredStreams.length > 1) {
+      try {
+        const AudioCtx =
+          window.AudioContext ||
+          (window as unknown as { webkitAudioContext: typeof AudioContext })
+            .webkitAudioContext;
+        const mixCtx = new AudioCtx();
+        mixAudioCtxRef.current = mixCtx;
+        if (mixCtx.state === "suspended") {
+          void mixCtx.resume().catch(() => {});
+        }
+        const dest = mixCtx.createMediaStreamDestination();
+        for (const s of acquiredStreams) {
+          const src = mixCtx.createMediaStreamSource(s);
+          src.connect(dest);
+        }
+        extraAudioStreamsRef.current = acquiredStreams;
+        finalStream = dest.stream;
+      } catch {
+        extraAudioStreamsRef.current = acquiredStreams.slice(1);
+        finalStream = acquiredStreams[0];
+      }
+    }
+
+    audioStreamRef.current = finalStream;
+    isListeningRef.current = true;
+    setIsListening(true);
+    setListenMode(hasLoopback ? "tab" : "mic");
+    setMonitorAudio(true);
+
+    const flushRecorder = startChunkedRecorder(finalStream, 4);
+    attachAudioMeter(finalStream, false, flushRecorder);
+    setStatusNotice(
+      hasLoopback && hasMic
+        ? "Monitor ON — Zoom/Meet Loopback + Mic Live. Answers stream in 1–2s."
+        : hasLoopback
+          ? "Monitor ON — System / Zoom / Meet Loopback Audio Live."
+          : "Monitor ON — Microphone Live (capturing external speaker / call voice)."
+    );
+  }, [
+    attachAudioMeter,
+    refreshAudioInputDevices,
+    startChunkedRecorder,
+    stopAudioListening,
+    stopScreenStream,
+  ]);
+
+  const startSelectedAudioSource = useCallback(
+    async (sourceId: string) => {
+      if (sourceId === "call-both") {
+        await startCallAndMicAudio();
+      } else if (sourceId === "system-loopback") {
+        await startTabSystemAudio();
+      } else {
+        await startMicrophoneAudio(sourceId);
+      }
+    },
+    [startCallAndMicAudio, startMicrophoneAudio, startTabSystemAudio]
+  );
 
   const ensureScreenStream = useCallback(async (): Promise<HTMLVideoElement> => {
     if (
@@ -1132,14 +1938,18 @@ export function SoftwareOverlay({
     }
 
     const audioTracks = displayStream.getAudioTracks();
-    if (audioTracks.length > 0 && !isListeningRef.current) {
+    if (
+      audioTracks.length > 0 &&
+      isEngineRunningRef.current &&
+      !isListeningRef.current
+    ) {
       const audioOnly = new MediaStream(audioTracks);
       audioStreamRef.current = audioOnly;
       isListeningRef.current = true;
       setIsListening(true);
       setListenMode("tab");
-      attachAudioMeter(audioOnly, false);
-      startChunkedRecorder(audioOnly, 5);
+      const flushRecorder = startChunkedRecorder(audioOnly, 6);
+      attachAudioMeter(audioOnly, false, flushRecorder);
     }
 
     const videoEl = hiddenVideoRef.current;
@@ -1163,53 +1973,77 @@ export function SoftwareOverlay({
     return canvas.toDataURL("image/jpeg", 0.8).split(",")[1] || null;
   };
 
-  // Capture (Alt+S)
-  const handleCaptureScreen = useCallback(async () => {
-    if (!isConnectedRef.current) {
-      setStatusNotice("Session is Disconnected. Press Reconnect (Alt+R) first.");
-      return;
-    }
-    if (glitchActiveRef.current) {
-      setStatusNotice("Glitch pause active — wait until connection resumes.");
-      return;
-    }
-    setStatusNotice(null);
-
-    try {
-      const videoEl = await ensureScreenStream();
-      const imageBase64 = snapshotVideoFrame(videoEl);
-      if (!imageBase64) {
-        throw new Error("Screen frame not ready yet. Please try Alt+S again.");
+  // Capture (Alt+S) or Mobile Companion Screen Tap
+  const handleCaptureScreen = useCallback(
+    async (captureSource: "alt_s" | "mobile_companion" = "alt_s") => {
+      if (quotaBlockedReasonRef.current) {
+        setStatusNotice(quotaBlockedReasonRef.current);
+        return;
       }
+      if (capturesUsed >= captureLimit) {
+        setStatusNotice(
+          `Screenshot capture limit exhausted (${capturesUsed}/${captureLimit}). Ask admin to add extra captures, then click Reconnect.`
+        );
+        return;
+      }
+      if (!isConnectedRef.current) {
+        setStatusNotice("Session is Disconnected. Press Reconnect (Alt+R) first.");
+        return;
+      }
+      if (glitchActiveRef.current) {
+        setStatusNotice("Glitch pause active — wait until connection resumes.");
+        return;
+      }
+      setStatusNotice(null);
 
-      setPromptsUsed((c) => Math.min(maxPrompts, c + 1));
+      try {
+        const videoEl = await ensureScreenStream();
+        const imageBase64 = snapshotVideoFrame(videoEl);
+        if (!imageBase64) {
+          throw new Error("Screen frame not ready yet. Please try Alt+S again.");
+        }
 
-      const qaId = `cap-${Date.now()}`;
-      setQaList((prev) => [
-        ...prev,
-        {
-          id: qaId,
-          timestamp: formatNow(),
-          question: "Screen Capture (Alt+S) — Reading Question & Chat Box",
-          answer: "",
-          engine: "Vision",
-          isStreaming: true,
-        },
-      ]);
+        setCapturesUsed((c) => Math.min(captureLimit, c + 1));
+        setPromptsUsed((c) => Math.min(maxPrompts, c + 1));
 
-      await streamAnswerFromEndpoint(qaId, "/api/analyze-screen", {
-        imageBase64,
-        mimeType: "image/jpeg",
-        role: profileRef.current.role,
-        answerLanguage: profileRef.current.answerLanguage,
-        answerStyle: profileRef.current.answerStyle,
-      });
-    } catch (err) {
-      setStatusNotice(
-        err instanceof Error ? err.message : "Screen capture cancelled."
-      );
-    }
-  }, [ensureScreenStream, streamAnswerFromEndpoint]);
+        const cur = profileRef.current;
+        const isDsa = Boolean(cur.dsaModeEnabled);
+        const qaId = `cap-${Date.now()}`;
+        setQaList((prev) => [
+          ...prev,
+          {
+            id: qaId,
+            timestamp: formatNow(),
+            question: isDsa
+              ? captureSource === "mobile_companion"
+                ? `Mobile Companion Screen Tap — Parsing DSA / OA Problem (${normalizeProgrammingLanguage(cur.preferredLanguage)})`
+                : `Screen Capture (Alt+S) — Parsing DSA / OA Problem (${normalizeProgrammingLanguage(cur.preferredLanguage)})`
+              : "Screen Capture (Alt+S) — Reading Question & Chat Box",
+            answer: "",
+            engine: isDsa ? "DSA Vision" : "Vision",
+            isStreaming: true,
+          },
+        ]);
+
+        await streamAnswerFromEndpoint(qaId, "/api/analyze-screen", {
+          token: tokenStateRef.current?.token,
+          imageBase64,
+          mimeType: "image/jpeg",
+          role: cur.role,
+          answerLanguage: cur.answerLanguage,
+          answerStyle: normalizeAnswerStyle(cur.answerStyle),
+          dsaModeEnabled: isDsa,
+          preferredLanguage: normalizeProgrammingLanguage(cur.preferredLanguage),
+          source: captureSource,
+        });
+      } catch (err) {
+        setStatusNotice(
+          err instanceof Error ? err.message : "Screen capture cancelled."
+        );
+      }
+    },
+    [captureLimit, capturesUsed, ensureScreenStream, maxPrompts, streamAnswerFromEndpoint]
+  );
 
   // Video (Alt+V): 4s / 6s / 8s / 10s multi-frame page question scan
   const handleVideoPageScan = useCallback(async () => {
@@ -1276,6 +2110,7 @@ export function SoftwareOverlay({
             return;
           }
 
+          setCapturesUsed((c) => Math.min(captureLimit, c + 1));
           setPromptsUsed((c) => Math.min(maxPrompts, c + 1));
 
           const qaId = `vid-${Date.now()}`;
@@ -1292,12 +2127,17 @@ export function SoftwareOverlay({
           ]);
 
           void streamAnswerFromEndpoint(qaId, "/api/analyze-video", {
+            token: tokenStateRef.current?.token,
             frames: framesToSend,
             mimeType: "image/jpeg",
             durationSec: duration,
             role: profileRef.current.role,
             answerLanguage: profileRef.current.answerLanguage,
-            answerStyle: profileRef.current.answerStyle,
+            answerStyle: normalizeAnswerStyle(profileRef.current.answerStyle),
+            dsaModeEnabled: Boolean(profileRef.current.dsaModeEnabled),
+            preferredLanguage: normalizeProgrammingLanguage(
+              profileRef.current.preferredLanguage
+            ),
           });
         }
       }, 1000);
@@ -1307,7 +2147,7 @@ export function SoftwareOverlay({
         err instanceof Error ? err.message : "Video page scan cancelled."
       );
     }
-  }, [ensureScreenStream, streamAnswerFromEndpoint]);
+  }, [captureLimit, ensureScreenStream, maxPrompts, streamAnswerFromEndpoint]);
 
   // Fast (Alt+X)
   const handleFastTrigger = useCallback(async () => {
@@ -1355,18 +2195,18 @@ export function SoftwareOverlay({
     }
 
     if (!isListeningRef.current) {
-      await startMicListening();
+      await startSelectedAudioSource(selectedAudioInputRef.current);
     }
   }, [
     askQuestion,
     interimText,
     questionInput,
     startChunkedRecorder,
-    startMicListening,
+    startSelectedAudioSource,
     transcribeRecordedChunks,
   ]);
 
-  // Reconnect (Alt+R)
+  // Reconnect (Alt+R) — sync remaining quota & pull the latest live Vercel deployment cleanly
   const handleReconnect = useCallback(async () => {
     if (glitchTimerRef.current !== null) {
       window.clearInterval(glitchTimerRef.current);
@@ -1374,29 +2214,33 @@ export function SoftwareOverlay({
     }
     setGlitchCountdown(0);
     setIsReconnecting(true);
-    setStatusNotice("Reconnecting...");
+    setStatusNotice("Syncing & reloading latest live Crackpilot build...");
 
     try {
-      resetBackendHealthCache();
-      const connected = await connectEventStream(true);
-      setIsConnected(true);
-      if (connected) {
-        setStatusNotice("Reconnected — Live Stream Active.");
-      } else {
-        setStatusNotice(
-          "Local session active (no remote Node.js backend connected). Set Server URL in ••• Settings for live AI streaming."
-        );
+      // Flush any unsynced elapsed seconds before reloading so zero time is lost
+      if (tokenStateRef.current?.token) {
+        const elapsed = unsyncedSecondsRef.current;
+        unsyncedSecondsRef.current = 0;
+        if (elapsed > 0) {
+          await syncTokenElapsedSeconds(tokenStateRef.current.token, elapsed).catch(
+            () => {}
+          );
+        }
       }
-      setTimeout(() => setStatusNotice(null), 2600);
+      resetBackendHealthCache();
+      setLiveApiError(null);
+      if (window.crackpilotDesktop?.reloadLiveApp) {
+        await window.crackpilotDesktop.reloadLiveApp();
+        return;
+      }
+      window.location.reload();
     } catch (err) {
-      console.error("[Crackpilot Overlay] Reconnect failed:", err);
-      setStatusNotice(
-        "Reconnect failed — check your internet or Server URL and press Alt+R again."
-      );
+      console.error("[Crackpilot Overlay] Reconnect reload failed:", err);
+      window.location.reload();
     } finally {
       setIsReconnecting(false);
     }
-  }, [connectEventStream]);
+  }, []);
 
   // Glitch (4s / 6s / 8s / 10s)
   const handleGlitchTrigger = useCallback(() => {
@@ -1435,11 +2279,16 @@ export function SoftwareOverlay({
     }, 1000);
   }, [connectEventStream]);
 
-  // Master Start / Stop Toggle: starts or cleanly pauses all audio capture, live stream, shortcuts, and AI processing
-  const handleToggleEngineStartStop = useCallback(async () => {
-    if (isEngineRunningRef.current) {
+  // Cleanly pause/stop active session & freeze timer (used by Stop button, Minimize, Hide, and OS minimize)
+  const pauseEngineSession = useCallback(
+    (notice?: string) => {
+      if (countdownTimerRef.current !== null) {
+        window.clearInterval(countdownTimerRef.current);
+        countdownTimerRef.current = null;
+      }
       isEngineRunningRef.current = false;
       setIsEngineRunning(false);
+      flushElapsedSeconds();
 
       if (glitchTimerRef.current !== null) {
         window.clearInterval(glitchTimerRef.current);
@@ -1467,17 +2316,63 @@ export function SoftwareOverlay({
         abortRef.current = null;
       }
       setQaList((prev) =>
-        prev.map((q) => (q.isStreaming ? { ...q, isStreaming: false } : q))
+        prev.map((q) => {
+          if (q.id === "system-init") {
+            return {
+              ...q,
+              question: "Session Paused",
+              answer:
+                "Timer is stopped. Click Start below to resume your session and capture interviewer audio.",
+              engine: "Paused",
+              isStreaming: false,
+            };
+          }
+          return q.isStreaming ? { ...q, isStreaming: false } : q;
+        })
       );
-      setStatusNotice("Stopped — audio listening, live stream, and AI processing paused.");
+      if (notice) {
+        setStatusNotice(notice);
+      }
+    },
+    [flushElapsedSeconds, stopAudioListening]
+  );
+
+  pauseSessionAndTimerRef.current = pauseEngineSession;
+
+  // Master Start / Stop Toggle: starts or cleanly pauses timer, audio capture, live stream, shortcuts, and AI processing
+  const handleToggleEngineStartStop = useCallback(async () => {
+    if (isEngineRunningRef.current) {
+      pauseEngineSession(
+        "Stopped — timer frozen, audio listening stopped, and remaining time synced."
+      );
       return;
     }
 
-    // Start core functionality immediately
+    if (quotaBlockedReasonRef.current) {
+      setStatusNotice(quotaBlockedReasonRef.current);
+      return;
+    }
+
+    // Start session & countdown timer immediately
     isEngineRunningRef.current = true;
     setIsEngineRunning(true);
     setIsConnected(true);
-    setStatusNotice("Started — live stream & audio listening active.");
+    setQaList((prev) =>
+      prev.map((q) =>
+        q.id === "system-init"
+          ? {
+              ...q,
+              question: "Session Active — Listening for Questions",
+              answer:
+                "Timer running and audio capture active. Spoken questions appear live in Q and stream answers in A automatically.",
+              engine: "Live",
+            }
+          : q
+      )
+    );
+    setStatusNotice(
+      "Started — timer active & listening for audio questions."
+    );
 
     try {
       resetBackendHealthCache();
@@ -1487,35 +2382,113 @@ export function SoftwareOverlay({
     }
 
     if (isEngineRunningRef.current && !isListeningRef.current) {
-      void startMicListening();
+      await startSelectedAudioSource(selectedAudioInputRef.current);
     }
-    setTimeout(() => {
-      setStatusNotice((curr) =>
-        curr === "Started — live stream & audio listening active." ? null : curr
-      );
-    }, 2400);
-  }, [connectEventStream, startMicListening, stopAudioListening]);
+  }, [connectEventStream, pauseEngineSession, startSelectedAudioSource]);
 
-  // Disconnect (Alt+D)
+  // Disconnect (Disconnect button, Cross × icon, or Alt+D)
   const handleDisconnect = useCallback(() => {
-    isEngineRunningRef.current = false;
-    setIsEngineRunning(false);
-    if (glitchTimerRef.current !== null) {
-      window.clearInterval(glitchTimerRef.current);
-      glitchTimerRef.current = null;
-    }
-    setGlitchCountdown(0);
-    stopAudioListening();
+    pauseEngineSession("Session Disconnected.");
     stopScreenStream();
-    if (sseRef.current) {
-      sseRef.current.close();
-      sseRef.current = null;
-    }
-    if (abortRef.current) abortRef.current.abort();
     setIsConnected(false);
+    const currentTok = tokenStateRef.current;
+    if (currentTok) {
+      onTokenChange({ ...currentTok, sessionActive: false });
+    }
     void stopLiveSession();
-    setStatusNotice("Session Disconnected. Press Reconnect (Alt+R) to resume.");
-  }, [stopAudioListening, stopScreenStream]);
+  }, [onTokenChange, pauseEngineSession, stopScreenStream]);
+
+  disconnectSessionRef.current = handleDisconnect;
+
+  // Pause timer whenever Electron minimizes/hides the window or browser tab is minimized/hidden
+  useEffect(() => {
+    const onVisibilityChange = () => {
+      if (document.hidden && isEngineRunningRef.current) {
+        pauseEngineSession(
+          "Window minimized — timer paused. Click Start to resume."
+        );
+      }
+    };
+    const onBeforeUnload = () => {
+      flushElapsedSeconds();
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    window.addEventListener("beforeunload", onBeforeUnload);
+
+    const unsubMin = window.crackpilotDesktop?.onWindowMinimized?.(() => {
+      if (isEngineRunningRef.current) {
+        pauseEngineSession(
+          "Minimized — session and timer paused. Click Start to resume."
+        );
+      }
+    });
+    const unsubClose = window.crackpilotDesktop?.onWindowClosing?.(() => {
+      disconnectSessionRef.current();
+    });
+
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      window.removeEventListener("beforeunload", onBeforeUnload);
+      unsubMin?.();
+      unsubClose?.();
+    };
+  }, [flushElapsedSeconds, pauseEngineSession]);
+
+  const handleToggleBehindMode = useCallback(() => {
+    const bridge = window.crackpilotDesktop;
+    if (bridge?.isElectron && bridge.toggleBehindMode) {
+      void bridge
+        .toggleBehindMode()
+        .then((nextState) => {
+          const enabled = Boolean(nextState);
+          setIsBehindMode(enabled);
+          setStatusNotice(
+            enabled
+              ? "Behind Mode ON — clicks & typing pass through to the app behind Crackpilot. Press Alt+M anytime to return."
+              : "Behind Mode OFF — Crackpilot window is interactive again."
+          );
+        })
+        .catch((err) => {
+          console.error("[Crackpilot Overlay] toggleBehindMode IPC failed:", err);
+        });
+      return;
+    }
+
+    // Graceful web preview fallback outside Electron
+    setIsBehindMode((prev) => {
+      const next = !prev;
+      setStatusNotice(
+        next
+          ? "Behind Mode ON (Web Preview) — in the Windows/macOS Desktop app, clicks and typing pass directly to the app behind Crackpilot. Press Alt+M to toggle OFF."
+          : "Behind Mode OFF — Crackpilot window is interactive."
+      );
+      return next;
+    });
+  }, []);
+
+  // Sync Behind (Alt+M) state from Electron globalShortcut IPC events
+  useEffect(() => {
+    const bridge = window.crackpilotDesktop;
+    if (!bridge?.isElectron) return;
+    if (bridge.getBehindMode) {
+      void bridge
+        .getBehindMode()
+        .then((enabled) => setIsBehindMode(Boolean(enabled)))
+        .catch(() => {});
+    }
+    const unsubBehind = bridge.onBehindModeChanged?.((enabled) => {
+      const next = Boolean(enabled);
+      setIsBehindMode(next);
+      setStatusNotice(
+        next
+          ? "Behind Mode ON — clicks & typing pass through to the app behind Crackpilot. Press Alt+M anytime to return."
+          : "Behind Mode OFF — Crackpilot window is interactive again."
+      );
+    });
+    return () => {
+      unsubBehind?.();
+    };
+  }, []);
 
   const handleFontIncreaseCycle = useCallback(() => {
     setFontSizePx((prev) => (prev >= 26 ? 12 : prev + 2));
@@ -1559,6 +2532,12 @@ export function SoftwareOverlay({
       //   return;
       // }
       // ============================================================================
+
+      if (key === "m" && !window.crackpilotDesktop?.isElectron) {
+        e.preventDefault();
+        handleToggleBehindMode();
+        return;
+      }
 
       if (key === "f") {
         e.preventDefault();
@@ -1608,6 +2587,7 @@ export function SoftwareOverlay({
     handleFontIncreaseCycle,
     handleReconnect,
     handleToggleAutoScroll,
+    handleToggleBehindMode,
     handleVideoPageScan,
   ]);
 
@@ -1663,7 +2643,7 @@ export function SoftwareOverlay({
     if (!questionInput.trim()) return;
     const text = questionInput.trim();
     setQuestionInput("");
-    void askQuestion(text);
+    void askQuestion(text, false, true);
   };
 
   const updateInlineProfile = (patch: Partial<TargetProfile>) => {
@@ -1672,7 +2652,6 @@ export function SoftwareOverlay({
     void saveTargetProfile(next);
   };
 
-  const currentLayer = LAYER_OPACITIES[layerIdx];
   const questionFontPx = Math.min(30, fontSizePx + 1);
 
   // Hidden state (Alt+H brings back immediately)
@@ -1710,9 +2689,11 @@ export function SoftwareOverlay({
             ? undefined
             : { width: `min(100%, ${hudWidthPx}px)` }
         }
-        className={`relative flex flex-col overflow-hidden rounded-xl border border-slate-500/35 shadow-2xl transition-colors ${
+        className={`relative flex flex-col overflow-hidden rounded-xl border ${
+          isBehindMode ? "border-[#b4f416]/60" : "border-slate-500/35"
+        } shadow-2xl transition-colors ${
           desktopMode ? "" : "backdrop-blur-md"
-        } ${currentLayer.bg} ${
+        } ${DEFAULT_OVERLAY_BG} ${
           desktopMode
             ? "h-full w-full"
             : isMaximized
@@ -1754,6 +2735,17 @@ export function SoftwareOverlay({
             <span className="text-xs font-semibold tracking-tight text-slate-100 whitespace-nowrap shrink-0">
               Crackpilot
             </span>
+            <span className="rounded bg-slate-800/90 border border-slate-700/70 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-[#b4f416] whitespace-nowrap shrink-0">
+              v1.0.7
+            </span>
+            {profile.dsaModeEnabled && (
+              <span className="hidden sm:inline-flex items-center gap-1 rounded border border-[#b4f416]/50 bg-[#b4f416]/15 px-1.5 py-0.5 font-mono text-[10px] font-bold text-[#b4f416] whitespace-nowrap">
+                <Code2 className="h-3 w-3" />
+                <span>
+                  DSA · {normalizeProgrammingLanguage(profile.preferredLanguage)}
+                </span>
+              </span>
+            )}
           </div>
 
           {/* Center: Classic "..." Handle + Live A/B Engine Toggle (Siblings outside app-drag) */}
@@ -1803,7 +2795,7 @@ export function SoftwareOverlay({
             <button
               type="button"
               onClick={handleMinimizeWindow}
-              title={desktopMode ? "Minimize / Hide (Alt+H to restore)" : "Compact / Normal height"}
+              title="Minimize window & pause timer"
               className="app-no-drag rounded p-1.5 hover:bg-slate-800 hover:text-white transition-colors cursor-pointer"
             >
               <Minus className="h-3.5 w-3.5" />
@@ -1818,8 +2810,8 @@ export function SoftwareOverlay({
             </button>
             <button
               type="button"
-              onClick={handleHideWindow}
-              title="Hide Overlay (Alt+H)"
+              onClick={handleCloseAndDisconnect}
+              title="Close & Disconnect Session"
               className="app-no-drag rounded p-1.5 hover:bg-rose-500/80 hover:text-white transition-colors cursor-pointer"
             >
               <X className="h-3.5 w-3.5" />
@@ -1849,7 +2841,7 @@ export function SoftwareOverlay({
                 />
               </div>
 
-              <div className="flex items-center gap-3">
+              <div className="flex flex-wrap items-center gap-2">
                 <select
                   value={profile.answerLanguage}
                   onChange={(e) =>
@@ -1865,7 +2857,7 @@ export function SoftwareOverlay({
                 </select>
 
                 <select
-                  value={profile.answerStyle}
+                  value={normalizeAnswerStyle(profile.answerStyle)}
                   onChange={(e) =>
                     updateInlineProfile({
                       answerStyle: e.target.value as AnswerStyle,
@@ -1873,10 +2865,50 @@ export function SoftwareOverlay({
                   }
                   className="rounded-md border border-slate-700 bg-[#131d33] px-2.5 py-1 text-xs text-slate-100"
                 >
-                  <option value="Concise Bullets">Concise Bullets</option>
-                  <option value="STAR Method">STAR Method</option>
-                  <option value="Technical + Code">Technical + Code</option>
+                  {ANSWER_STYLES.map((st) => (
+                    <option key={st} value={st}>
+                      {st}
+                    </option>
+                  ))}
                 </select>
+
+                <button
+                  type="button"
+                  onClick={() =>
+                    updateInlineProfile({
+                      dsaModeEnabled: !profile.dsaModeEnabled,
+                      preferredLanguage: normalizeProgrammingLanguage(
+                        profile.preferredLanguage
+                      ),
+                    })
+                  }
+                  className={`inline-flex items-center gap-1 rounded-md border px-2.5 py-1 text-xs font-semibold transition-colors cursor-pointer ${
+                    profile.dsaModeEnabled
+                      ? "border-[#b4f416]/60 bg-[#b4f416]/15 text-[#b4f416]"
+                      : "border-slate-700 bg-[#131d33] text-slate-300 hover:text-white"
+                  }`}
+                >
+                  <Code2 className="h-3.5 w-3.5" />
+                  <span>DSA: {profile.dsaModeEnabled ? "ON" : "OFF"}</span>
+                </button>
+
+                {profile.dsaModeEnabled && (
+                  <select
+                    value={normalizeProgrammingLanguage(profile.preferredLanguage)}
+                    onChange={(e) =>
+                      updateInlineProfile({
+                        preferredLanguage: e.target.value as ProgrammingLanguage,
+                      })
+                    }
+                    className="rounded-md border border-[#b4f416]/45 bg-[#131d33] px-2 py-1 text-xs font-semibold text-[#b4f416]"
+                  >
+                    {PROGRAMMING_LANGUAGES.map((lang) => (
+                      <option key={lang} value={lang}>
+                        {lang}
+                      </option>
+                    ))}
+                  </select>
+                )}
 
                 <button
                   type="button"
@@ -1993,8 +3025,8 @@ export function SoftwareOverlay({
                     <h2 className="text-base font-semibold text-white">
                       Authenticate Crackpilot
                     </h2>
-                    <span className="rounded bg-slate-800 px-1.5 py-0.5 font-mono text-[10px] text-sky-300">
-                      v1.0.4
+                    <span className="rounded bg-slate-800 px-1.5 py-0.5 font-mono text-[10px] text-[#b4f416]">
+                      v1.0.7
                     </span>
                   </div>
                   <p className="text-xs text-slate-400">
@@ -2198,6 +3230,11 @@ export function SoftwareOverlay({
                     <div className="flex-1 min-w-0">
                       {item.error ? (
                         <p className="text-xs text-rose-300">{item.error}</p>
+                      ) : item.dsaData ? (
+                        <DsaTeleprompterView
+                          data={item.dsaData}
+                          fontSizePx={fontSizePx}
+                        />
                       ) : item.answer ? (
                         <AnswerView
                           markdown={item.answer}
@@ -2206,7 +3243,9 @@ export function SoftwareOverlay({
                         />
                       ) : (
                         <p className="text-xs text-slate-400">
-                          Generating personalized answer...
+                          {profile.dsaModeEnabled
+                            ? "Parsing problem & preparing structured DSA teleprompter..."
+                            : "Generating personalized human answer..."}
                         </p>
                       )}
                     </div>
@@ -2214,14 +3253,28 @@ export function SoftwareOverlay({
                 </article>
               ))}
 
-              {/* Live Interim Speech Preview */}
-              {(interimText || isTranscribing) && (
-                <div className="rounded-xl border border-sky-500/35 bg-[#0f192d]/90 px-4 py-2.5 text-xs text-sky-200 flex items-center justify-between gap-3">
-                  <span className="truncate">
-                    {interimText
-                      ? `Listening: "${interimText}"`
-                      : "Transcribing captured interviewer audio..."}
-                  </span>
+              {/* Real-Time Live Transcribed Q Preview */}
+              {(interimText || isTranscribing || (isListening && audioLevel >= 14)) && (
+                <div className="rounded-xl border border-sky-400/45 bg-[#0f192d]/95 px-4 py-3 text-xs text-sky-100 flex items-center justify-between gap-3">
+                  <div className="flex items-start gap-2.5 min-w-0">
+                    <span className="mt-0.5 font-mono text-sm font-bold text-sky-400 shrink-0">
+                      Q
+                    </span>
+                    <div className="min-w-0">
+                      <p className="font-medium text-sky-100 break-words">
+                        {interimText
+                          ? interimText
+                          : isTranscribing
+                            ? "Transcribing spoken question..."
+                            : "Speech detected — listening to question..."}
+                      </p>
+                      <p className="mt-0.5 text-[10px] font-mono text-sky-300/75">
+                        {isTranscribing
+                          ? "Finalizing transcript and triggering AI answer..."
+                          : "Pause briefly when finished to stream the answer in A automatically"}
+                      </p>
+                    </div>
+                  </div>
                   {interimText && (
                     <button
                       type="button"
@@ -2232,7 +3285,7 @@ export function SoftwareOverlay({
                       }}
                       className="shrink-0 rounded bg-emerald-500/20 px-2.5 py-1 text-[11px] font-semibold text-emerald-300 hover:bg-emerald-500/30 cursor-pointer"
                     >
-                      Fast Answer (Alt+X)
+                      Answer Now (Alt+X)
                     </button>
                   )}
                 </div>
@@ -2348,6 +3401,37 @@ export function SoftwareOverlay({
                 </div>
               )}
 
+              {/* Persistent Active DSA Problem Context Pill (No Re-Capture Needed for Follow-Ups) */}
+              {profile.dsaModeEnabled && activeProblemContext && (
+                <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-[#b4f416]/40 bg-[#141c0b] px-3 py-1.5 text-[11px]">
+                  <div className="flex flex-wrap items-center gap-2 min-w-0">
+                    <span className="inline-flex items-center gap-1 rounded bg-[#b4f416] px-1.5 py-0.5 font-mono text-[10px] font-bold text-[#0a0a0a]">
+                      <Code2 className="h-3 w-3" />
+                      ACTIVE PROBLEM
+                    </span>
+                    <span className="truncate font-semibold text-white">
+                      {activeProblemContext.title}
+                    </span>
+                    <span className="font-mono text-[10px] text-[#b4f416]">
+                      {activeProblemContext.topicPattern} ·{" "}
+                      {normalizeProgrammingLanguage(profile.preferredLanguage)}
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setActiveProblemContext(null);
+                      activeProblemContextRef.current = null;
+                      void clearActiveProblemContextClient();
+                    }}
+                    className="inline-flex items-center gap-1 rounded border border-white/10 bg-black/40 px-2 py-0.5 text-[10px] font-medium text-zinc-300 hover:border-rose-400/40 hover:text-rose-200 cursor-pointer shrink-0"
+                  >
+                    <X className="h-3 w-3" />
+                    <span>Clear</span>
+                  </button>
+                </div>
+              )}
+
               {/* Input Row */}
               <form
                 onSubmit={handleSendSubmit}
@@ -2357,7 +3441,11 @@ export function SoftwareOverlay({
                   type="text"
                   value={questionInput}
                   onChange={(e) => setQuestionInput(e.target.value)}
-                  placeholder="Type question here..."
+                  placeholder={
+                    profile.dsaModeEnabled && activeProblemContext
+                      ? `Ask follow-up on "${activeProblemContext.title}" (e.g., optimize to O(1) space)...`
+                      : "Type question here..."
+                  }
                   className="flex-1 rounded-lg border border-slate-500/40 bg-[#1a2940]/85 px-3.5 py-2.5 text-sm text-white placeholder-slate-400 focus:border-sky-400/70 focus:outline-none"
                 />
                 <button
@@ -2369,13 +3457,47 @@ export function SoftwareOverlay({
                 </button>
               </form>
 
+              {quotaBlockedReason && (
+                <div className="rounded-lg border border-rose-500/45 bg-rose-950/75 px-3.5 py-2 text-xs text-rose-200 flex items-center justify-between gap-2">
+                  <span>{quotaBlockedReason}</span>
+                  <button
+                    type="button"
+                    onClick={() => void handleReconnect()}
+                    className="shrink-0 rounded bg-rose-500/25 px-2.5 py-1 text-[11px] font-semibold text-white hover:bg-rose-500/40 cursor-pointer"
+                  >
+                    Sync Quota (Alt+R)
+                  </button>
+                </div>
+              )}
+
               {/* Compact Status Line */}
               <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-300">
                 <div className="flex flex-wrap items-center gap-2.5">
-                  <span className="tabular-nums">
-                    Time:{" "}
+                  <span className="inline-flex items-center gap-1.5 tabular-nums">
+                    <span
+                      className={`h-1.5 w-1.5 rounded-full ${
+                        isEngineRunning
+                          ? "bg-[#b4f416] animate-pulse"
+                          : "bg-amber-400/80"
+                      }`}
+                    />
+                    <span>Time:</span>
                     <strong className="font-semibold text-white">
                       {formatTimer(secondsLeft)}
+                    </strong>
+                    <span
+                      className={`font-mono text-[10px] uppercase tracking-wider ${
+                        isEngineRunning ? "text-[#b4f416]" : "text-amber-300"
+                      }`}
+                    >
+                      {isEngineRunning ? "Running" : "Paused"}
+                    </span>
+                  </span>
+                  <span className="text-slate-500">·</span>
+                  <span className="tabular-nums">
+                    Captures:{" "}
+                    <strong className="font-semibold text-white">
+                      {capturesUsed}/{captureLimit}
                     </strong>
                   </span>
                   <span className="text-slate-500">·</span>
@@ -2383,76 +3505,195 @@ export function SoftwareOverlay({
                     Prompts:{" "}
                     <strong className="font-semibold text-white">
                       {promptsUsed}/{maxPrompts}
-                    </strong>{" "}
-                    Used
+                    </strong>
                   </span>
 
-                  <button
-                    type="button"
-                    onClick={async () => {
-                      try {
-                        await navigator.clipboard.writeText(
-                          `${serverDisplayUrl}/api/incoming-question`
-                        );
-                        setCopiedUrl(true);
-                        setTimeout(() => setCopiedUrl(false), 1400);
-                      } catch {
-                        // Ignore
-                      }
-                    }}
-                    title="Copy Python Headphone Loopback Bridge URL"
-                    className="inline-flex items-center gap-1.5 rounded bg-[#0c1424]/90 border border-slate-700/80 px-2 py-0.5 font-mono text-[11px] text-slate-200 hover:border-sky-400/50 transition-colors cursor-pointer"
-                  >
-                    <span>
-                      {copiedUrl
-                        ? "Copied Bridge URL!"
-                        : `${serverDisplayUrl}/api/incoming-question`}
-                    </span>
-                  </button>
+                  {/* Real-Time Diagnostic Indicator (replaces legacy file:///api URL) */}
+                  {(() => {
+                    const activeDiagError =
+                      micDiagError || liveApiError || serverDiag.error;
+                    const isHealthy =
+                      !activeDiagError &&
+                      serverDiag.checked &&
+                      serverDiag.reachable &&
+                      serverDiag.llmReady &&
+                      serverDiag.sttReady;
+                    const readyLabel =
+                      serverDiag.groq && serverDiag.deepgram
+                        ? "Connected: Vercel + Mic Ready (Groq/Deepgram)"
+                        : "Connected: Vercel + Mic Ready";
+                    return (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setLiveApiError(null);
+                          void checkServerDiagnostics();
+                        }}
+                        title={`Server: ${serverDisplayUrl} — Click to re-check Mic & Server diagnostics`}
+                        className={`inline-flex max-w-[260px] items-center gap-1.5 rounded border px-2 py-0.5 text-[11px] font-medium transition-colors cursor-pointer ${
+                          activeDiagError
+                            ? "border-rose-500/60 bg-rose-950/60 text-rose-200 hover:border-rose-400"
+                            : isHealthy
+                              ? "border-emerald-500/50 bg-emerald-950/45 text-emerald-300 hover:border-emerald-400"
+                              : "border-slate-700/80 bg-[#0c1424]/90 text-slate-300 hover:border-sky-400/50"
+                        }`}
+                      >
+                        <span
+                          className={`h-1.5 w-1.5 shrink-0 rounded-full ${
+                            activeDiagError
+                              ? "bg-rose-400 animate-pulse"
+                              : isHealthy
+                                ? "bg-[#b4f416]"
+                                : "bg-amber-400 animate-pulse"
+                          }`}
+                        />
+                        <span className="truncate">
+                          {activeDiagError
+                            ? activeDiagError
+                            : isHealthy
+                              ? readyLabel
+                              : "Checking Server..."}
+                        </span>
+                      </button>
+                    );
+                  })()}
                 </div>
 
-                <div className="flex items-center gap-3">
-                  {/* Tab / WhatsApp / Meet Audio quick toggle (works with headphones) */}
-                  <button
-                    type="button"
-                    onClick={() =>
-                      listenMode === "tab"
-                        ? stopAudioListening()
-                        : void startTabSystemAudio()
-                    }
-                    title="Capture Meet / Zoom / Teams / WhatsApp Web audio (works with headphones)"
-                    className={`inline-flex items-center gap-1.5 text-[11px] transition-colors cursor-pointer ${
-                      listenMode === "tab"
-                        ? "text-emerald-300 font-medium"
-                        : "text-sky-300 hover:text-sky-200"
-                    }`}
-                  >
-                    <Headphones className="h-3.5 w-3.5" />
-                    <span>
-                      {listenMode === "tab"
-                        ? "System Audio: ON"
-                        : "Headphone / Tab Audio"}
-                    </span>
-                  </button>
+                <div className="flex flex-wrap items-center gap-2">
+                  {/* Explicit Audio Source Switcher: Call + Mic (Zoom/Meet Loopback + Mic), Microphone, or System / Tab Audio */}
+                  <div className="inline-flex items-center overflow-hidden rounded-md border border-slate-700/80 bg-[#0c1424]/90 p-0.5 text-[11px]">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setSelectedAudioInput("call-both");
+                        selectedAudioInputRef.current = "call-both";
+                        if (isEngineRunningRef.current) {
+                          void startSelectedAudioSource("call-both");
+                        }
+                      }}
+                      title="Capture both Zoom/Meet/Teams System Loopback Audio AND Physical Microphone (best for 2-laptop / mobile calls)"
+                      className={`inline-flex items-center gap-1 rounded px-2 py-0.5 font-medium transition-colors cursor-pointer ${
+                        selectedAudioInput === "call-both"
+                          ? "bg-[#b4f416]/20 text-[#d9ff66]"
+                          : "text-slate-400 hover:text-slate-200"
+                      }`}
+                    >
+                      <Headphones className="h-3 w-3" />
+                      <span>Call + Mic</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const targetMic =
+                          selectedAudioInput === "system-loopback" ||
+                          selectedAudioInput === "call-both"
+                            ? "default"
+                            : selectedAudioInput;
+                        setSelectedAudioInput(targetMic);
+                        selectedAudioInputRef.current = targetMic;
+                        if (isEngineRunningRef.current) {
+                          void startSelectedAudioSource(targetMic);
+                        }
+                      }}
+                      title="Use Physical Microphone only (for external Laptop B / Mobile B speaker audio)"
+                      className={`inline-flex items-center gap-1 rounded px-2 py-0.5 font-medium transition-colors cursor-pointer ${
+                        selectedAudioInput !== "system-loopback" &&
+                        selectedAudioInput !== "call-both"
+                          ? "bg-[#b4f416]/20 text-[#d9ff66]"
+                          : "text-slate-400 hover:text-slate-200"
+                      }`}
+                    >
+                      <Mic className="h-3 w-3" />
+                      <span>Mic</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setSelectedAudioInput("system-loopback");
+                        selectedAudioInputRef.current = "system-loopback";
+                        if (isEngineRunningRef.current) {
+                          void startSelectedAudioSource("system-loopback");
+                        }
+                      }}
+                      title="Capture Zoom / Google Meet / Teams System Loopback Audio only"
+                      className={`inline-flex items-center gap-1 rounded px-2 py-0.5 font-medium transition-colors cursor-pointer ${
+                        selectedAudioInput === "system-loopback"
+                          ? "bg-sky-500/25 text-sky-200"
+                          : "text-slate-400 hover:text-slate-200"
+                      }`}
+                    >
+                      <Headphones className="h-3 w-3" />
+                      <span>System</span>
+                    </button>
+                  </div>
 
-                  {isListening && (
-                    <span className="inline-flex items-center gap-1.5 text-[11px] text-emerald-300">
-                      <span className="inline-block h-1.5 w-10 overflow-hidden rounded-full bg-slate-800">
-                        <span
-                          className="block h-full bg-emerald-400 transition-all duration-75"
-                          style={{ width: `${Math.max(12, audioLevel)}%` }}
-                        />
-                      </span>
+                  {/* Live Mic / Audio Level Meter + Hardware Mic Selector */}
+                  <div className="inline-flex items-center gap-2 rounded-md border border-slate-700/80 bg-[#0c1424]/90 px-2 py-0.5">
+                    <span
+                      className={`inline-flex items-center gap-1 text-[11px] font-medium ${
+                        isListening ? "text-[#c6f527]" : "text-slate-400"
+                      }`}
+                    >
                       <span>
-                        {listenMode === "tab" ? "Tab Audio" : "Mic Live"}
+                        {isListening
+                          ? selectedAudioInput === "call-both"
+                            ? "Call + Mic Live"
+                            : listenMode === "tab"
+                              ? "Loopback Live"
+                              : "Mic Live"
+                          : "Audio Standby"}
                       </span>
                     </span>
-                  )}
+                    <span
+                      aria-label="Live audio input level"
+                      className="inline-block h-1.5 w-12 overflow-hidden rounded-full bg-slate-800"
+                    >
+                      <span
+                        className={`block h-full transition-all duration-75 ${
+                          audioLevel > 12 ? "bg-[#b4f416]" : "bg-emerald-400/60"
+                        }`}
+                        style={{
+                          width: isListening
+                            ? `${Math.max(6, audioLevel)}%`
+                            : "0%",
+                        }}
+                      />
+                    </span>
+                    {selectedAudioInput !== "system-loopback" &&
+                      selectedAudioInput !== "call-both" && (
+                        <select
+                          aria-label="Select Microphone Input Device"
+                          value={selectedAudioInput}
+                          onChange={(e) => {
+                            const nextId = e.target.value;
+                            setSelectedAudioInput(nextId);
+                            selectedAudioInputRef.current = nextId;
+                            if (isEngineRunningRef.current) {
+                              void startSelectedAudioSource(nextId);
+                            }
+                          }}
+                          className="max-w-[140px] truncate bg-transparent text-[11px] text-slate-200 focus:outline-none cursor-pointer"
+                        >
+                          <option value="default" className="bg-[#0d1424] text-slate-100">
+                            Default Mic
+                          </option>
+                          {audioInputs.map((dev) => (
+                            <option
+                              key={dev.deviceId}
+                              value={dev.deviceId}
+                              className="bg-[#0d1424] text-slate-100"
+                            >
+                              {dev.label}
+                            </option>
+                          ))}
+                        </select>
+                      )}
+                  </div>
 
                   <button
                     type="button"
                     onClick={() => setMonitorAudio((v) => !v)}
-                    title="Hear interviewer audio through speakers/headphones"
+                    title="Hear captured audio through speakers/headphones"
                     className="inline-flex items-center gap-1 text-[11px] text-slate-300 hover:text-white cursor-pointer"
                   >
                     {monitorAudio ? (
@@ -2522,14 +3763,24 @@ export function SoftwareOverlay({
 
                 <button
                   type="button"
-                  onClick={() => void handleCaptureScreen()}
-                  title="Capture screen / chat box question (Alt+S)"
+                  onClick={() => void handleCaptureScreen("alt_s")}
+                  title="Capture screen / chat box / DSA problem (Alt+S)"
                   className="inline-flex items-center gap-1.5 rounded-lg bg-[#405fe8] px-3 py-1.5 text-xs font-semibold text-white hover:bg-[#3552d6] transition-colors cursor-pointer"
                 >
                   <Camera className="h-3.5 w-3.5" />
                   <span>
                     {hasSharedScreen ? "Capture (Alt+S)" : "Capture (Alt+S)"}
                   </span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => void handleCaptureScreen("mobile_companion")}
+                  title="Mobile Companion Screen Tap — capture & parse visible problem"
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-slate-600/50 bg-[#1f293f]/95 px-2.5 py-1.5 text-xs font-medium text-slate-100 hover:border-[#b4f416]/50 hover:text-[#b4f416] transition-colors cursor-pointer"
+                >
+                  <Smartphone className="h-3.5 w-3.5 text-[#b4f416]" />
+                  <span>Screen</span>
                 </button>
 
                 {/* Video 4s / 6s / 8s / 10s Page Scan */}
@@ -2564,28 +3815,6 @@ export function SoftwareOverlay({
                     <option value={10}>10s</option>
                   </select>
                 </div>
-
-                {/* Listen Audio / Stop */}
-                <button
-                  type="button"
-                  onClick={() =>
-                    isListening
-                      ? stopAudioListening()
-                      : void startMicListening()
-                  }
-                  className={`inline-flex items-center gap-1.5 rounded-lg px-3.5 py-1.5 text-xs font-semibold transition-colors cursor-pointer ${
-                    isListening
-                      ? "bg-[#9e5370] text-white hover:bg-[#8d4561]"
-                      : "bg-[#253754] text-slate-100 hover:bg-[#2f4568]"
-                  }`}
-                >
-                  {isListening ? (
-                    <Square className="h-3 w-3 fill-current" />
-                  ) : (
-                    <Mic className="h-3.5 w-3.5 text-sky-300" />
-                  )}
-                  <span>{isListening ? "Stop" : "Listen Audio"}</span>
-                </button>
 
                 {/* Reconnect (Alt+R) */}
                 <button
@@ -2639,42 +3868,66 @@ export function SoftwareOverlay({
                   </select>
                 </div>
 
-                {/* Hide (Alt+H) */}
+                {/* Hide (pauses timer & hides overlay) */}
                 <button
                   type="button"
                   onClick={() => {
+                    pauseEngineSession(
+                      "Overlay hidden — timer paused. Click Start to resume."
+                    );
                     if (window.crackpilotDesktop?.isElectron) {
                       void window.crackpilotDesktop.hideWindow();
                     } else {
                       setIsHidden(true);
                     }
                   }}
-                  title="Hide Software (Alt+H)"
+                  title="Hide Software & pause timer"
                   className="inline-flex items-center gap-1.5 rounded-lg border border-slate-600/50 bg-[#1f293f]/95 px-3 py-1.5 text-xs font-medium text-slate-200 hover:bg-slate-700/70 transition-colors cursor-pointer"
                 >
                   <EyeOff className="h-3.5 w-3.5 text-slate-300" />
                   <span>Hide</span>
                 </button>
 
-                {/* Layer */}
+                {/* Behind / Write (Alt+M) Click-Through Mode Toggle with Smart Hover Restore */}
                 <button
                   type="button"
-                  onClick={() => {
-                    setLayerIdx((i) => {
-                      const next = (i + 1) % LAYER_OPACITIES.length;
-                      if (window.crackpilotDesktop?.isElectron) {
-                        void window.crackpilotDesktop.setOpacity(
-                          LAYER_OPACITIES[next].nativeOpacity
-                        );
-                      }
-                      return next;
-                    });
+                  onClick={handleToggleBehindMode}
+                  onMouseEnter={() => {
+                    if (isBehindMode && window.crackpilotDesktop?.setBehindHoverInteractive) {
+                      void window.crackpilotDesktop
+                        .setBehindHoverInteractive(true)
+                        .catch(() => {});
+                    }
                   }}
-                  title={`Opacity: ${currentLayer.label}`}
-                  className="inline-flex items-center gap-1.5 rounded-lg border border-slate-600/50 bg-[#1f293f]/95 px-3 py-1.5 text-xs font-medium text-slate-200 hover:bg-slate-700/70 transition-colors cursor-pointer"
+                  onMouseLeave={() => {
+                    if (isBehindMode && window.crackpilotDesktop?.setBehindHoverInteractive) {
+                      void window.crackpilotDesktop
+                        .setBehindHoverInteractive(false)
+                        .catch(() => {});
+                    }
+                  }}
+                  aria-pressed={isBehindMode}
+                  title={
+                    isBehindMode
+                      ? "Click-through active: clicks & typing pass to the window behind Crackpilot. Click this button or press Alt+M to turn OFF."
+                      : "Enable Behind / Write Mode (Alt+M): keep overlay visible on top while clicking & typing directly behind it."
+                  }
+                  className={`inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium transition-all cursor-pointer ${
+                    isBehindMode
+                      ? "border-[#b4f416] bg-[#b4f416]/15 text-[#d9ff66] shadow-[0_0_12px_rgba(180,244,22,0.22)]"
+                      : "border-slate-600/50 bg-[#1a2234] text-slate-200 hover:bg-slate-700/70"
+                  }`}
                 >
-                  <Layers className="h-3.5 w-3.5 text-sky-300" />
-                  <span>Layer</span>
+                  {isBehindMode ? (
+                    <span className="h-2 w-2 rounded-full bg-[#b4f416] animate-pulse" />
+                  ) : (
+                    <MousePointerClick className="h-3.5 w-3.5 text-sky-300" />
+                  )}
+                  <span>
+                    {isBehindMode
+                      ? "Behind: ON (Alt+M)"
+                      : "Behind / Write (Alt+M)"}
+                  </span>
                 </button>
 
                 {/* Font (Alt+F + Custom Popover Slider) */}

@@ -1,0 +1,43 @@
+{
+  "adminCredential": null,
+  "accounts": [
+    {
+      "id": "acc-776e7c0d",
+      "token": "CP-B173D2-42A59F-6FFA",
+      "label": "Candidate Session",
+      "email": "",
+      "accountType": "REGULAR",
+      "planType": "Starter",
+      "paymentStatus": "Pending",
+      "status": "Active",
+      "remainingSeconds": 14400,
+      "totalMinutesGranted": 240,
+      "capturesUsed": 0,
+      "captureLimit": 80,
+      "promptsUsed": 3,
+      "promptLimit": 80,
+      "createdAt": "2026-11-27T05:22:38.431Z",
+      "expiresAt": "2026-11-29T05:22:38.431Z",
+      "lastActiveAt": "2026-11-27T05:22:56.475Z"
+    },
+    {
+      "id": "acc-433b5c33",
+      "token": "CP-81D162-A3FA17-2B5F",
+      "label": "Candidate Session",
+      "email": "",
+      "accountType": "REGULAR",
+      "planType": "Starter",
+      "paymentStatus": "Pending",
+      "status": "Active",
+      "remainingSeconds": 14353,
+      "totalMinutesGranted": 240,
+      "capturesUsed": 0,
+      "captureLimit": 80,
+      "promptsUsed": 1,
+      "promptLimit": 80,
+      "createdAt": "2026-11-27T03:36:08.362Z",
+      "expiresAt": "2026-11-29T03:36:08.362Z",
+      "lastActiveAt": "2026-11-27T03:36:08.412Z"
+    }
+  ]
+}

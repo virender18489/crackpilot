@@ -1,5 +1,13 @@
 import type { IncomingMessage, ServerResponse } from "http";
-import { GoogleGenAI, ThinkingLevel } from "@google/genai";
+import { ThinkingLevel } from "@google/genai";
+import {
+  buildDsaFollowUpSystemPrompt,
+  buildHumanInterviewSystemPrompt,
+  generateContentStreamResilient,
+  isCodeCreationRequest,
+  normalizeProgrammingLanguage,
+} from "../server/dsaEngine.ts";
+import type { ActiveProblemContext } from "../src/types.ts";
 
 interface AnswerBody {
   question?: string;
@@ -11,6 +19,16 @@ interface AnswerBody {
   answerLanguage?: string;
   answerStyle?: string;
   fastMode?: boolean;
+  dsaModeEnabled?: boolean;
+  preferredLanguage?: string;
+  activeProblemContext?: ActiveProblemContext | null;
+  history?: Array<{ question: string; answer: string }>;
+}
+
+function readCleanKey(name: string): string {
+  const raw = (process.env[name] || "").trim().replace(/^['"]|['"]$/g, "");
+  if (!raw || /your_|placeholder/i.test(raw)) return "";
+  return raw;
 }
 
 async function readJsonBody<T>(req: IncomingMessage): Promise<T> {
@@ -24,6 +42,73 @@ async function readJsonBody<T>(req: IncomingMessage): Promise<T> {
   }
   const raw = Buffer.concat(chunks).toString("utf8").trim();
   return raw ? (JSON.parse(raw) as T) : ({} as T);
+}
+
+async function streamOpenAICompatible(params: {
+  url: string;
+  apiKey: string;
+  model: string;
+  engineLabel: string;
+  systemPrompt: string;
+  userPrompt: string;
+  sendEvent: (payload: Record<string, unknown>) => void;
+}): Promise<void> {
+  const upstream = await fetch(params.url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${params.apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: params.model,
+      stream: true,
+      temperature: 0.35,
+      max_tokens: 1400,
+      messages: [
+        { role: "system", content: params.systemPrompt },
+        { role: "user", content: params.userPrompt },
+      ],
+    }),
+  });
+
+  if (!upstream.ok || !upstream.body) {
+    const errText = await upstream.text().catch(() => "");
+    throw new Error(
+      `${params.engineLabel} API error (${upstream.status}): ${errText.slice(0, 180) || "Check API key"}`
+    );
+  }
+
+  params.sendEvent({ meta: { engine: params.engineLabel.toLowerCase(), model: params.model } });
+
+  const reader = upstream.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    const lines = buf.split("\n");
+    buf = lines.pop() || "";
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith("data:")) continue;
+      const raw = trimmed.slice(5).trim();
+      if (!raw || raw === "[DONE]") continue;
+      try {
+        const parsed = JSON.parse(raw) as {
+          choices?: Array<{ delta?: { content?: string } }>;
+        };
+        const text = parsed.choices?.[0]?.delta?.content;
+        if (text) {
+          params.sendEvent({ chunk: text, text });
+        }
+      } catch {
+        // Ignore partial SSE JSON chunk
+      }
+    }
+  }
 }
 
 export default async function handler(
@@ -47,8 +132,17 @@ export default async function handler(
     return;
   }
 
-  const body = await readJsonBody<AnswerBody>(req);
-  const cleanQuestion = (body.question || "").trim();
+  let body: AnswerBody;
+  try {
+    body = await readJsonBody<AnswerBody>(req);
+  } catch {
+    res.statusCode = 400;
+    res.setHeader("Content-Type", "application/json");
+    res.end(JSON.stringify({ error: "Invalid JSON payload." }));
+    return;
+  }
+
+  const cleanQuestion = typeof body.question === "string" ? body.question.trim() : "";
   if (!cleanQuestion) {
     res.statusCode = 400;
     res.setHeader("Content-Type", "application/json");
@@ -56,106 +150,120 @@ export default async function handler(
     return;
   }
 
-  res.setHeader("Content-Type", "text/event-stream");
-  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
   res.setHeader("Connection", "keep-alive");
 
   const sendEvent = (payload: Record<string, unknown>) => {
     res.write(`data: ${JSON.stringify(payload)}\n\n`);
   };
 
+  const role = body.role || "Frontend Development (React, Next.js, Vue, Web)";
+  const experience = body.experience || "Junior (1-3 Years)";
   const lang = body.answerLanguage || "English";
-  const style = body.answerStyle || "Concise Bullets";
-  const systemPrompt = [
-    "You are Crackpilot, a real-time AI interview copilot.",
-    `Target Role: ${body.role || "Software Engineer"}`,
-    `Experience: ${body.experience || "3 years"}`,
-    body.skills ? `Skills: ${body.skills}` : "",
-    body.resumeText ? `Resume Context:\n${body.resumeText.slice(0, 4000)}` : "",
-    body.jdText ? `Job Description:\n${body.jdText.slice(0, 3000)}` : "",
-    `Language: ${lang}. Style: ${style}.`,
-    body.fastMode
-      ? "FAST MODE: Reply in 3 crisp, immediately speakable bullet points."
-      : "Give a clear, confident, interview-ready answer in scannable markdown.",
-  ]
-    .filter(Boolean)
-    .join("\n\n");
+  const preferredLanguage = normalizeProgrammingLanguage(body.preferredLanguage);
+  const useDsaFollowUp = Boolean(body.dsaModeEnabled && body.activeProblemContext);
+  const isCodeReq = !useDsaFollowUp && isCodeCreationRequest(cleanQuestion);
+
+  const systemPrompt =
+    useDsaFollowUp && body.activeProblemContext
+      ? buildDsaFollowUpSystemPrompt({
+          problemContext: body.activeProblemContext,
+          preferredLanguage,
+          answerLanguage: lang,
+          role,
+          experience,
+        })
+      : buildHumanInterviewSystemPrompt({
+          role,
+          experience,
+          skills: body.skills || "",
+          resumeText: body.resumeText || "",
+          jdText: body.jdText || "",
+          answerLanguage: lang,
+          answerStyle: body.answerStyle,
+          fastMode: body.fastMode,
+          question: cleanQuestion,
+        });
+
+  const recentContext =
+    Array.isArray(body.history) && body.history.length > 0
+      ? body.history
+          .slice(-3)
+          .map(
+            (item, idx) =>
+              `Previous Q${idx + 1}: ${item.question}\nPrevious A${idx + 1}: ${String(item.answer || "").slice(0, 350)}`
+          )
+          .join("\n\n")
+      : "";
+
+  const userPrompt = isCodeReq
+    ? recentContext
+      ? `Recent interview context:\n${recentContext}\n\nInterviewer just asked:\n"${cleanQuestion}"\n\nRespond strictly in two parts: (1) one crisp 3-4 sentence first-person developer summary paragraph with backticked identifiers and zero AI filler, immediately followed by (2) one complete runnable fenced code block with the exact language tag. Output zero text after the code block.`
+      : `Interviewer just asked:\n"${cleanQuestion}"\n\nRespond strictly in two parts: (1) one crisp 3-4 sentence first-person developer summary paragraph with backticked identifiers and zero AI filler, immediately followed by (2) one complete runnable fenced code block with the exact language tag. Output zero text after the code block.`
+    : recentContext
+      ? `Recent interview context:\n${recentContext}\n\nInterviewer just asked:\n"${cleanQuestion}"\n\nAnswer directly in natural human spoken language.`
+      : cleanQuestion;
+
+  const groqKey = readCleanKey("GROQ_API_KEY");
+  const openaiKey = readCleanKey("OPENAI_API_KEY");
+  const geminiKey = readCleanKey("GEMINI_API_KEY");
 
   try {
-    const openaiKey = process.env.OPENAI_API_KEY?.trim();
-    if (openaiKey && openaiKey.startsWith("sk-")) {
-      sendEvent({ meta: { engine: "openai", model: "gpt-4o-mini" } });
-      const upstream = await fetch("https://api.openai.com/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${openaiKey}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          model: "gpt-4o-mini",
-          stream: true,
-          temperature: 0.35,
-          messages: [
-            { role: "system", content: systemPrompt },
-            { role: "user", content: cleanQuestion },
-          ],
-        }),
+    // Priority 1: Groq Llama 3.3 70B Versatile (ultra-low-latency streaming)
+    if (groqKey) {
+      await streamOpenAICompatible({
+        url: "https://api.groq.com/openai/v1/chat/completions",
+        apiKey: groqKey,
+        model: "llama-3.3-70b-versatile",
+        engineLabel: "Groq",
+        systemPrompt,
+        userPrompt,
+        sendEvent,
       });
-      if (!upstream.ok || !upstream.body) {
-        throw new Error(`OpenAI API error (${upstream.status})`);
-      }
-      const reader = upstream.body.getReader();
-      const decoder = new TextDecoder();
-      let buf = "";
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buf += decoder.decode(value, { stream: true });
-        const lines = buf.split("\n");
-        buf = lines.pop() || "";
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed.startsWith("data:")) continue;
-          const raw = trimmed.slice(5).trim();
-          if (raw === "[DONE]") continue;
-          try {
-            const parsed = JSON.parse(raw) as {
-              choices?: Array<{ delta?: { content?: string } }>;
-            };
-            const text = parsed.choices?.[0]?.delta?.content;
-            if (text) sendEvent({ text });
-          } catch {
-            // Ignore partial chunk
-          }
-        }
+      sendEvent({ done: true });
+      res.end();
+      return;
+    }
+
+    // Priority 2: OpenAI
+    if (openaiKey && openaiKey.startsWith("sk-")) {
+      await streamOpenAICompatible({
+        url: "https://api.openai.com/v1/chat/completions",
+        apiKey: openaiKey,
+        model: "gpt-4o-mini",
+        engineLabel: "OpenAI",
+        systemPrompt,
+        userPrompt,
+        sendEvent,
+      });
+      sendEvent({ done: true });
+      res.end();
+      return;
+    }
+
+    // Priority 3: Gemini fallback
+    if (geminiKey) {
+      const { model, stream } = await generateContentStreamResilient({
+        contents: userPrompt,
+        config: {
+          systemInstruction: systemPrompt,
+          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+        },
+      });
+      sendEvent({ meta: { engine: "gemini", model } });
+      for await (const chunk of stream) {
+        if (chunk.text) sendEvent({ chunk: chunk.text, text: chunk.text });
       }
       sendEvent({ done: true });
       res.end();
       return;
     }
 
-    const geminiKey = process.env.GEMINI_API_KEY?.trim();
-    if (!geminiKey) {
-      throw new Error(
-        "Configure GEMINI_API_KEY or OPENAI_API_KEY in your Vercel Environment Variables for live AI answers."
-      );
-    }
-
-    sendEvent({ meta: { engine: "gemini", model: "gemini-4-hydrogen" } });
-    const ai = new GoogleGenAI({ apiKey: geminiKey });
-    const stream = await ai.models.generateContentStream({
-      model: "gemini-4-hydrogen",
-      contents: cleanQuestion,
-      config: {
-        systemInstruction: systemPrompt,
-        temperature: 0.35,
-        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-      },
+    sendEvent({
+      error:
+        "Missing GROQ_API_KEY on server. Add GROQ_API_KEY in Vercel Environment Variables and redeploy.",
     });
-    for await (const chunk of stream) {
-      if (chunk.text) sendEvent({ text: chunk.text });
-    }
-    sendEvent({ done: true });
     res.end();
   } catch (err) {
     sendEvent({

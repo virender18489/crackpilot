@@ -13,7 +13,7 @@ import {
   FileText,
   Headphones,
   Laptop,
-  Layers,
+  LayoutGrid,
   MessageCircle,
   Mic,
   Monitor,
@@ -234,9 +234,9 @@ const SHORTCUT_CARDS = [
     desc: "Toggle the teleprompter window visibility instantly without breaking focus.",
   },
   {
-    keys: ["Alt", "U"],
-    title: "Toggle layer",
-    desc: "Switch between compact bullet-cue mode and full detailed answer layout.",
+    keys: ["Alt", "M"],
+    title: "Behind / Write click-through",
+    desc: "Keep the overlay visible on top while clicking and typing directly into the app behind it.",
   },
   {
     keys: ["Alt", "J"],
@@ -440,10 +440,10 @@ export function LandingPage({
             </button>
             <button
               type="button"
-              onClick={isLoggedIn ? onGoDashboard : onGoLogin}
+              onClick={onGoLogin}
               className="rounded-full bg-[#c6f527] px-5 py-1.5 text-[13px] font-semibold text-[#050709] hover:bg-[#b5e41c] transition-colors cursor-pointer"
             >
-              {isLoggedIn ? "Dashboard" : "Login"}
+              Login
             </button>
           </div>
         </div>
@@ -836,7 +836,7 @@ export function LandingPage({
           <div className="grid gap-5 md:grid-cols-3">
             {[
               {
-                icon: Layers,
+                icon: LayoutGrid,
                 title: "Voice + screen context",
                 desc: "Combine spoken follow-ups with 1-click screen captures (Alt+S) for live SQL, LeetCode, case charts, and system diagrams.",
               },

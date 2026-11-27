@@ -17,6 +17,7 @@ import {
 } from "lucide-react";
 import { hasConfiguredBackend, wsUrl } from "../lib/api";
 import { tryApiJson } from "../lib/clientStore";
+import { AnswerView } from "./AnswerView";
 import {
   type LiveQaAudioSource,
   type LiveQaPipeline,
@@ -57,7 +58,7 @@ function formatClock(): string {
 
 export function LiveAudioQAEngine({ compact = false }: LiveAudioQAEngineProps) {
   const [pipeline, setPipeline] = useState<LiveQaPipeline>("gemini-live");
-  const [audioSource, setAudioSource] = useState<LiveQaAudioSource>("mic");
+  const [audioSource, setAudioSource] = useState<LiveQaAudioSource>("system");
   const [isRunning, setIsRunning] = useState(false);
   const [isConnecting, setIsConnecting] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
@@ -783,20 +784,19 @@ export function LiveAudioQAEngine({ compact = false }: LiveAudioQAEngineProps) {
           <span className="font-mono text-[10px] uppercase tracking-wider text-[#c6f527]/80">
             Live Spoken Answer
           </span>
-          <p className="text-sm sm:text-[15px] leading-relaxed text-white whitespace-pre-wrap min-h-[64px]">
+          <div className="min-h-[64px]">
             {activeTurn?.answer ? (
-              <>
-                {activeTurn.answer}
-                {!activeTurn.completed && (
-                  <span className="ml-1 inline-block h-3.5 w-1.5 align-middle bg-[#c6f527] animate-pulse" />
-                )}
-              </>
+              <AnswerView
+                markdown={activeTurn.answer}
+                isStreaming={!activeTurn.completed}
+                fontSizePx={14}
+              />
             ) : (
               <span className="text-slate-500 text-xs">
                 Waiting for end of speech...
               </span>
             )}
-          </p>
+          </div>
         </div>
       </div>
 
@@ -884,9 +884,11 @@ export function LiveAudioQAEngine({ compact = false }: LiveAudioQAEngineProps) {
                 <p className="text-[11px] text-slate-400 italic line-clamp-1">
                   {turn.transcript}
                 </p>
-                <p className="text-xs text-slate-100 leading-relaxed">
-                  {turn.answer}
-                </p>
+                <AnswerView
+                  markdown={turn.answer}
+                  isStreaming={false}
+                  fontSizePx={13}
+                />
               </div>
             ))}
           </div>

@@ -7,6 +7,8 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 export type AccountType = "REGULAR" | "DEMO";
+export type PlanType = "Demo" | "Starter" | "Pro Plan" | "Unlimited";
+export type PaymentStatus = "Pending" | "Paid";
 export type AccountStatus = "Active" | "Suspended" | "Expired";
 
 export interface AdminAccountRecord {
@@ -15,6 +17,8 @@ export interface AdminAccountRecord {
   label: string;
   email: string;
   accountType: AccountType;
+  planType: PlanType;
+  paymentStatus: PaymentStatus;
   status: AccountStatus;
   remainingSeconds: number;
   totalMinutesGranted: number;
@@ -28,10 +32,18 @@ export interface AdminAccountRecord {
   notes?: string;
 }
 
+interface StoredAccountInternal extends AdminAccountRecord {
+  passwordSalt?: string;
+  passwordHash?: string;
+}
+
 export interface AccountQuotaSnapshot {
   token: string;
   label: string;
+  email: string;
   accountType: AccountType;
+  planType: PlanType;
+  paymentStatus: PaymentStatus;
   status: AccountStatus;
   remainingSeconds: number;
   remainingMinutes: number;
@@ -52,18 +64,50 @@ interface StoredAdminCredential {
 
 interface PersistedAdminDb {
   adminCredential: StoredAdminCredential | null;
-  accounts: AdminAccountRecord[];
+  accounts: StoredAccountInternal[];
 }
 
 const DATA_DIR = path.resolve(__dirname, "data");
 const STORE_PATH = path.resolve(DATA_DIR, "admin-store.json");
 
-// Ephemeral fallback signing key when ADMIN_SESSION_SECRET is not set in env
+// Authorized default owner admin email (password is NEVER hardcoded — configured via env or first-run scrypt claim)
+export const OWNER_ADMIN_EMAIL = "virender18489@gmail.com";
+
 const FALLBACK_SESSION_SECRET = crypto.randomBytes(32).toString("hex");
 const ADMIN_SESSION_COOKIE_NAME = "crackpilot_admin_session";
 const ADMIN_SESSION_TTL_SEC = 12 * 60 * 60; // 12 hours
 
 let dbCache: PersistedAdminDb | null = null;
+
+function sanitizePublicAccount(acc: StoredAccountInternal): AdminAccountRecord {
+  return {
+    id: acc.id,
+    token: acc.token,
+    label: acc.label,
+    email: acc.email,
+    accountType: acc.accountType,
+    planType: acc.planType || (acc.accountType === "DEMO" ? "Demo" : "Starter"),
+    paymentStatus: acc.paymentStatus || (acc.accountType === "DEMO" ? "Pending" : "Pending"),
+    status: acc.status,
+    remainingSeconds: acc.remainingSeconds,
+    totalMinutesGranted: acc.totalMinutesGranted,
+    capturesUsed: acc.capturesUsed,
+    captureLimit: acc.captureLimit,
+    promptsUsed: acc.promptsUsed,
+    promptLimit: acc.promptLimit,
+    createdAt: acc.createdAt,
+    expiresAt: acc.expiresAt,
+    lastActiveAt: acc.lastActiveAt,
+    notes: acc.notes,
+  };
+}
+
+function generateCrackpilotToken(): string {
+  const seg1 = crypto.randomBytes(3).toString("hex").toUpperCase();
+  const seg2 = crypto.randomBytes(3).toString("hex").toUpperCase();
+  const seg3 = crypto.randomBytes(2).toString("hex").toUpperCase();
+  return `CP-${seg1}-${seg2}-${seg3}`;
+}
 
 function ensureStoreLoaded(): PersistedAdminDb {
   if (dbCache) return dbCache;
@@ -71,9 +115,14 @@ function ensureStoreLoaded(): PersistedAdminDb {
     if (fs.existsSync(STORE_PATH)) {
       const raw = fs.readFileSync(STORE_PATH, "utf-8");
       const parsed = JSON.parse(raw) as Partial<PersistedAdminDb>;
+      const rawAccounts = Array.isArray(parsed.accounts) ? parsed.accounts : [];
       dbCache = {
         adminCredential: parsed.adminCredential ?? null,
-        accounts: Array.isArray(parsed.accounts) ? parsed.accounts : [],
+        accounts: rawAccounts.map((acc) => ({
+          ...acc,
+          planType: acc.planType || (acc.accountType === "DEMO" ? "Demo" : "Starter"),
+          paymentStatus: acc.paymentStatus || "Pending",
+        })),
       };
       return dbCache;
     }
@@ -127,11 +176,25 @@ function getEnvAdminCredentials(): {
   };
 }
 
+export function isAuthorizedAdminEmail(email?: string | null): boolean {
+  const clean = (email || "").trim().toLowerCase();
+  if (!clean) return false;
+  if (clean === OWNER_ADMIN_EMAIL.toLowerCase()) return true;
+  const envEmail = (process.env.ADMIN_EMAIL || "").trim().toLowerCase();
+  const envUser = (process.env.ADMIN_USERNAME || "").trim().toLowerCase();
+  if (envEmail && clean === envEmail) return true;
+  if (envUser && clean === envUser) return true;
+  const db = ensureStoreLoaded();
+  if (db.adminCredential && clean === db.adminCredential.email.toLowerCase()) return true;
+  return false;
+}
+
 export function getAdminAuthConfigStatus(): {
   envConfigured: boolean;
   claimedConfigured: boolean;
   setupRequired: boolean;
   configuredIdentifierHint: string | null;
+  suggestedOwnerEmail: string;
 } {
   const db = ensureStoreLoaded();
   const env = getEnvAdminCredentials();
@@ -158,6 +221,7 @@ export function getAdminAuthConfigStatus(): {
     claimedConfigured,
     setupRequired,
     configuredIdentifierHint: hint,
+    suggestedOwnerEmail: OWNER_ADMIN_EMAIL,
   };
 }
 
@@ -222,7 +286,6 @@ export function verifyAdminCredentials(
     return { valid: false, subject: "" };
   }
 
-  // Environment variables ALWAYS take strict precedence when configured
   const env = getEnvAdminCredentials();
   if (env.configured) {
     const emailEnv = (process.env.ADMIN_EMAIL || "").trim().toLowerCase();
@@ -251,7 +314,6 @@ export function verifyAdminCredentials(
   };
 }
 
-// Signed HS256 JWT (zero external dependency, Node crypto HMAC-SHA256)
 function base64UrlEncode(input: Buffer | string): string {
   const buf = typeof input === "string" ? Buffer.from(input, "utf-8") : input;
   return buf.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
@@ -357,7 +419,7 @@ export function buildAdminClearCookieHeader(): string {
 // User / License Token & Demo ID Store + Quota Enforcement
 // =========================================================================
 
-function syncAccountExpiry(account: AdminAccountRecord): boolean {
+function syncAccountExpiry(account: StoredAccountInternal): boolean {
   let changed = false;
   if (
     account.status === "Active" &&
@@ -371,36 +433,42 @@ function syncAccountExpiry(account: AdminAccountRecord): boolean {
 }
 
 export function buildQuotaSnapshot(account: AdminAccountRecord): AccountQuotaSnapshot {
-  if (syncAccountExpiry(account)) {
+  const db = ensureStoreLoaded();
+  const internal = db.accounts.find((a) => a.token === account.token);
+  if (internal && syncAccountExpiry(internal)) {
     persistStore();
   }
+  const src = internal || account;
 
   let blockedReason: string | null = null;
-  if (account.status === "Suspended") {
+  if (src.status === "Suspended") {
     blockedReason =
       "Your account has been suspended by the administrator. Contact support to restore access.";
-  } else if (account.status === "Expired") {
+  } else if (src.status === "Expired") {
     blockedReason =
-      account.accountType === "DEMO"
+      src.accountType === "DEMO"
         ? "This Demo ID has expired. Request an extension or new Demo ID from the admin."
         : "Your session license has expired. Request extra time from the admin.";
-  } else if (account.remainingSeconds <= 0) {
+  } else if (src.remainingSeconds <= 0) {
     blockedReason =
       "Remaining time is 0 minutes. Ask the admin to add extra time, then click Reconnect.";
   }
 
   return {
-    token: account.token,
-    label: account.label,
-    accountType: account.accountType,
-    status: account.status,
-    remainingSeconds: Math.max(0, Math.round(account.remainingSeconds)),
-    remainingMinutes: Math.max(0, Math.ceil(account.remainingSeconds / 60)),
-    capturesUsed: account.capturesUsed,
-    captureLimit: account.captureLimit,
-    promptsUsed: account.promptsUsed,
-    promptLimit: account.promptLimit,
-    expiresAt: account.expiresAt,
+    token: src.token,
+    label: src.label,
+    email: src.email,
+    accountType: src.accountType,
+    planType: src.planType || (src.accountType === "DEMO" ? "Demo" : "Starter"),
+    paymentStatus: src.paymentStatus || "Pending",
+    status: src.status,
+    remainingSeconds: Math.max(0, Math.round(src.remainingSeconds)),
+    remainingMinutes: Math.max(0, Math.ceil(src.remainingSeconds / 60)),
+    capturesUsed: src.capturesUsed,
+    captureLimit: src.captureLimit,
+    promptsUsed: src.promptsUsed,
+    promptLimit: src.promptLimit,
+    expiresAt: src.expiresAt,
     blockedReason,
   };
 }
@@ -412,6 +480,8 @@ export function registerRegularToken(params: {
   minutes?: number;
   captureLimit?: number;
   promptLimit?: number;
+  planType?: PlanType;
+  paymentStatus?: PaymentStatus;
 }): AdminAccountRecord {
   const db = ensureStoreLoaded();
   const existing = db.accounts.find((a) => a.token === params.token);
@@ -419,19 +489,21 @@ export function registerRegularToken(params: {
     if (params.label) existing.label = params.label;
     if (params.email) existing.email = params.email;
     persistStore();
-    return existing;
+    return sanitizePublicAccount(existing);
   }
 
-  const minutes = Math.max(1, Math.min(10080, Math.round(params.minutes ?? 240)));
-  const captureLimit = Math.max(1, Math.min(10000, Math.round(params.captureLimit ?? 80)));
-  const promptLimit = Math.max(1, Math.min(10000, Math.round(params.promptLimit ?? 80)));
+  const minutes = Math.max(1, Math.min(43200, Math.round(params.minutes ?? 240)));
+  const captureLimit = Math.max(1, Math.min(50000, Math.round(params.captureLimit ?? 80)));
+  const promptLimit = Math.max(1, Math.min(50000, Math.round(params.promptLimit ?? 80)));
 
-  const record: AdminAccountRecord = {
+  const record: StoredAccountInternal = {
     id: `acc-${crypto.randomBytes(4).toString("hex")}`,
     token: params.token,
     label: (params.label || "Candidate Session").trim().slice(0, 80),
     email: (params.email || "").trim().slice(0, 120),
     accountType: "REGULAR",
+    planType: params.planType ?? "Starter",
+    paymentStatus: params.paymentStatus ?? "Pending",
     status: "Active",
     remainingSeconds: minutes * 60,
     totalMinutesGranted: minutes,
@@ -446,42 +518,72 @@ export function registerRegularToken(params: {
 
   db.accounts.unshift(record);
   persistStore();
-  return record;
+  return sanitizePublicAccount(record);
 }
 
 export function createManagedAccount(params: {
   label: string;
   email?: string;
+  password?: string;
   accountType: AccountType;
+  planType?: PlanType;
+  paymentStatus?: PaymentStatus;
   minutes: number;
   captureLimit: number;
   promptLimit?: number;
   expiryHours: number | null;
   notes?: string;
-}): AdminAccountRecord {
+}): { account: AdminAccountRecord; generatedPassword?: string } {
   const db = ensureStoreLoaded();
-  const cleanLabel = params.label.trim().slice(0, 80) || (params.accountType === "DEMO" ? "Demo Agent" : "Regular User");
-  const cleanMinutes = Math.max(1, Math.min(43200, Math.round(params.minutes || 30)));
-  const cleanCaptureLimit = Math.max(1, Math.min(10000, Math.round(params.captureLimit || 15)));
+  const isDemo = params.accountType === "DEMO" || params.planType === "Demo";
+  const accountType: AccountType = isDemo ? "DEMO" : "REGULAR";
+  const planType: PlanType =
+    params.planType && ["Demo", "Starter", "Pro Plan", "Unlimited"].includes(params.planType)
+      ? params.planType
+      : isDemo
+        ? "Demo"
+        : "Starter";
+  const paymentStatus: PaymentStatus =
+    params.paymentStatus === "Paid" ? "Paid" : "Pending";
+
+  const cleanLabel =
+    params.label.trim().slice(0, 80) || (isDemo ? "Demo Agent" : "Regular User");
+  const cleanEmail =
+    (params.email || "").trim().toLowerCase().slice(0, 120) ||
+    (isDemo
+      ? `demo-${crypto.randomBytes(3).toString("hex")}@crackpilot.demo`
+      : `user-${crypto.randomBytes(3).toString("hex")}@crackpilot.app`);
+
+  const cleanMinutes = Math.max(1, Math.min(43200, Math.round(params.minutes || (isDemo ? 30 : 240))));
+  const cleanCaptureLimit = Math.max(
+    1,
+    Math.min(50000, Math.round(params.captureLimit || (isDemo ? 15 : 80)))
+  );
   const cleanPromptLimit = Math.max(
     cleanCaptureLimit,
-    Math.min(10000, Math.round(params.promptLimit ?? Math.max(cleanCaptureLimit * 2, 40)))
+    Math.min(50000, Math.round(params.promptLimit ?? cleanCaptureLimit))
   );
 
-  const prefix = params.accountType === "DEMO" ? "DEMO" : "CP";
-  const token = `${prefix}-${crypto.randomBytes(3).toString("hex").toUpperCase()}-${crypto.randomBytes(2).toString("hex").toUpperCase()}-${crypto.randomBytes(2).toString("hex").toUpperCase()}`;
+  const token = generateCrackpilotToken();
+  const rawPassword =
+    (params.password || "").trim() ||
+    `CP#${crypto.randomBytes(4).toString("hex").toUpperCase()}`;
+  const passwordSalt = crypto.randomBytes(16).toString("hex");
+  const passwordHash = hashPasswordScrypt(rawPassword, passwordSalt);
 
   const expiresAt =
     params.expiryHours && params.expiryHours > 0
       ? new Date(Date.now() + params.expiryHours * 60 * 60 * 1000).toISOString()
-      : null;
+      : new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString();
 
-  const record: AdminAccountRecord = {
+  const record: StoredAccountInternal = {
     id: `acc-${crypto.randomBytes(4).toString("hex")}`,
     token,
     label: cleanLabel,
-    email: (params.email || "").trim().slice(0, 120),
-    accountType: params.accountType,
+    email: cleanEmail,
+    accountType,
+    planType,
+    paymentStatus,
     status: "Active",
     remainingSeconds: cleanMinutes * 60,
     totalMinutesGranted: cleanMinutes,
@@ -493,11 +595,16 @@ export function createManagedAccount(params: {
     expiresAt,
     lastActiveAt: null,
     notes: params.notes?.trim().slice(0, 240),
+    passwordSalt,
+    passwordHash,
   };
 
   db.accounts.unshift(record);
   persistStore();
-  return record;
+  return {
+    account: sanitizePublicAccount(record),
+    generatedPassword: rawPassword,
+  };
 }
 
 export function findAccountByToken(token: string): AdminAccountRecord | null {
@@ -505,15 +612,28 @@ export function findAccountByToken(token: string): AdminAccountRecord | null {
   const clean = token.trim();
   if (!clean) return null;
   const found = db.accounts.find((a) => a.token === clean) ?? null;
-  if (found && syncAccountExpiry(found)) {
+  if (!found) return null;
+  if (syncAccountExpiry(found)) {
     persistStore();
   }
-  return found;
+  return sanitizePublicAccount(found);
+}
+
+export function findAccountByEmail(email: string): AdminAccountRecord | null {
+  const db = ensureStoreLoaded();
+  const clean = email.trim().toLowerCase();
+  if (!clean) return null;
+  const found = db.accounts.find((a) => a.email.toLowerCase() === clean) ?? null;
+  if (!found) return null;
+  if (syncAccountExpiry(found)) {
+    persistStore();
+  }
+  return sanitizePublicAccount(found);
 }
 
 export function listAllAccounts(opts?: {
   search?: string;
-  filter?: "all" | "active" | "demo" | "expired";
+  filter?: "all" | "paid" | "pending" | "active" | "demo" | "expired";
 }): AdminAccountRecord[] {
   const db = ensureStoreLoaded();
   let dirty = false;
@@ -525,18 +645,38 @@ export function listAllAccounts(opts?: {
   const q = (opts?.search || "").trim().toLowerCase();
   const filter = opts?.filter || "all";
 
-  return db.accounts.filter((acc) => {
-    if (filter === "active" && acc.status !== "Active") return false;
-    if (filter === "demo" && acc.accountType !== "DEMO") return false;
-    if (filter === "expired" && acc.status !== "Expired" && acc.status !== "Suspended") {
-      return false;
-    }
-    if (q) {
-      const hay = `${acc.token} ${acc.label} ${acc.email} ${acc.accountType} ${acc.status}`.toLowerCase();
-      if (!hay.includes(q)) return false;
-    }
-    return true;
-  });
+  return db.accounts
+    .filter((acc) => {
+      if (filter === "active" && acc.status !== "Active") return false;
+      if (filter === "paid" && acc.paymentStatus !== "Paid") return false;
+      if (filter === "pending" && acc.paymentStatus !== "Pending") return false;
+      if (filter === "demo" && acc.accountType !== "DEMO") return false;
+      if (filter === "expired" && acc.status !== "Expired" && acc.status !== "Suspended") {
+        return false;
+      }
+      if (q) {
+        const hay =
+          `${acc.token} ${acc.label} ${acc.email} ${acc.accountType} ${acc.planType} ${acc.paymentStatus} ${acc.status}`.toLowerCase();
+        if (!hay.includes(q)) return false;
+      }
+      return true;
+    })
+    .map(sanitizePublicAccount);
+}
+
+export function computeAdminStats(): {
+  totalUsers: number;
+  activeDemoIds: number;
+  totalPaidAccounts: number;
+  totalMinutesAllocated: number;
+} {
+  const all = listAllAccounts();
+  return {
+    totalUsers: all.length,
+    activeDemoIds: all.filter((a) => a.accountType === "DEMO" && a.status === "Active").length,
+    totalPaidAccounts: all.filter((a) => a.paymentStatus === "Paid").length,
+    totalMinutesAllocated: all.reduce((sum, a) => sum + Math.round(a.remainingSeconds / 60), 0),
+  };
 }
 
 export function updateAccountStatus(
@@ -550,9 +690,8 @@ export function updateAccountStatus(
 
   acc.status = status;
   if (status === "Active") {
-    // If re-activating an expired account whose expiry timestamp is in the past, extend expiry
     if (acc.expiresAt && Date.parse(acc.expiresAt) <= Date.now()) {
-      const addHours = extendHoursIfExpired && extendHoursIfExpired > 0 ? extendHoursIfExpired : 24;
+      const addHours = extendHoursIfExpired && extendHoursIfExpired > 0 ? extendHoursIfExpired : 48;
       acc.expiresAt = new Date(Date.now() + addHours * 60 * 60 * 1000).toISOString();
     }
     if (acc.remainingSeconds <= 0) {
@@ -561,7 +700,45 @@ export function updateAccountStatus(
     }
   }
   persistStore();
-  return acc;
+  return sanitizePublicAccount(acc);
+}
+
+export function updateAccountPaymentStatus(
+  token: string,
+  paymentStatus: PaymentStatus
+): AdminAccountRecord | null {
+  const db = ensureStoreLoaded();
+  const acc = db.accounts.find((a) => a.token === token.trim());
+  if (!acc) return null;
+
+  acc.paymentStatus = paymentStatus;
+  if (paymentStatus === "Paid") {
+    if (acc.planType === "Starter" || acc.planType === "Demo") {
+      acc.planType = "Pro Plan";
+    }
+    if (acc.accountType === "DEMO") {
+      acc.accountType = "REGULAR";
+    }
+    if (acc.status !== "Active") {
+      acc.status = "Active";
+      if (acc.expiresAt && Date.parse(acc.expiresAt) <= Date.now()) {
+        acc.expiresAt = new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString();
+      }
+    }
+    // Unlock generous Pro minimums if currently depleted
+    if (acc.remainingSeconds < 60 * 60) {
+      acc.remainingSeconds = Math.max(acc.remainingSeconds, 240 * 60);
+      acc.totalMinutesGranted = Math.max(acc.totalMinutesGranted, 240);
+    }
+    if (acc.captureLimit < 80) {
+      acc.captureLimit = 80;
+    }
+    if (acc.promptLimit < 80) {
+      acc.promptLimit = 80;
+    }
+  }
+  persistStore();
+  return sanitizePublicAccount(acc);
 }
 
 export function adjustAccountQuotas(
@@ -579,27 +756,30 @@ export function adjustAccountQuotas(
   if (!acc) return null;
 
   if (typeof patch.deltaMinutes === "number" && Number.isFinite(patch.deltaMinutes)) {
-    const deltaMin = Math.max(-10080, Math.min(10080, Math.round(patch.deltaMinutes)));
+    const deltaMin = Math.max(-43200, Math.min(43200, Math.round(patch.deltaMinutes)));
     acc.remainingSeconds = Math.max(0, acc.remainingSeconds + deltaMin * 60);
     if (deltaMin > 0) {
       acc.totalMinutesGranted += deltaMin;
-      // If admin explicitly adds time to an expired account (not suspended), reactivate smoothly
       if (acc.status === "Expired") {
         acc.status = "Active";
         if (acc.expiresAt && Date.parse(acc.expiresAt) <= Date.now()) {
-          acc.expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+          acc.expiresAt = new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString();
         }
       }
     }
   }
 
   if (typeof patch.deltaCaptures === "number" && Number.isFinite(patch.deltaCaptures)) {
-    const deltaCap = Math.max(-5000, Math.min(5000, Math.round(patch.deltaCaptures)));
+    const deltaCap = Math.max(-10000, Math.min(10000, Math.round(patch.deltaCaptures)));
     acc.captureLimit = Math.max(0, acc.captureLimit + deltaCap);
+    // Keep prompt limit synced upward when adding screenshots/prompts
+    if (deltaCap > 0 && patch.deltaPrompts === undefined) {
+      acc.promptLimit = Math.max(acc.captureLimit, acc.promptLimit + deltaCap);
+    }
   }
 
   if (typeof patch.deltaPrompts === "number" && Number.isFinite(patch.deltaPrompts)) {
-    const deltaPr = Math.max(-5000, Math.min(5000, Math.round(patch.deltaPrompts)));
+    const deltaPr = Math.max(-10000, Math.min(10000, Math.round(patch.deltaPrompts)));
     acc.promptLimit = Math.max(0, acc.promptLimit + deltaPr);
   }
 
@@ -626,7 +806,7 @@ export function adjustAccountQuotas(
   }
 
   persistStore();
-  return acc;
+  return sanitizePublicAccount(acc);
 }
 
 export function deleteAccountByToken(token: string): boolean {
@@ -683,9 +863,10 @@ export function consumeAccountUsage(
 export function checkQuotaForAction(
   token: string | undefined,
   action: "answer" | "capture"
-): { allowed: true; account?: AdminAccountRecord } | { allowed: false; reason: string; quota?: AccountQuotaSnapshot } {
+):
+  | { allowed: true; account?: AdminAccountRecord }
+  | { allowed: false; reason: string; quota?: AccountQuotaSnapshot } {
   if (!token || !token.trim()) {
-    // Allow unlinked local fallback only if no token submitted
     return { allowed: true };
   }
   const acc = findAccountByToken(token);

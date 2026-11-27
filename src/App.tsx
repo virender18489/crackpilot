@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { AdminPanel } from "./components/AdminPanel";
 import { Dashboard } from "./components/Dashboard";
 import { LandingPage } from "./components/LandingPage";
 import { LoginView } from "./components/LoginView";
@@ -11,6 +12,7 @@ import {
   subscribeLocalSync,
 } from "./lib/clientStore";
 import type {
+  AccountQuotaSnapshot,
   DashboardTab,
   RootView,
   SessionTokenState,
@@ -18,36 +20,65 @@ import type {
   UserAccount,
 } from "./types";
 
+import {
+  DEFAULT_ANSWER_STYLE,
+  normalizeAnswerStyle,
+  normalizeProgrammingLanguage,
+} from "./data/roleSkills";
+
 const DEFAULT_PROFILE: TargetProfile = {
-  role: "Frontend Developer (React & TypeScript)",
-  experience: "3 years",
-  skills:
-    "React, TypeScript, Next.js, Tailwind CSS, Node.js, REST APIs, System Design",
+  role: "Frontend Development (React, Next.js, Vue, Web)",
+  experience: "Junior (1-3 Years)",
+  skills: "",
   resumeFileName: "",
   resumeText: "",
   jdFileName: "",
   jdText: "",
   answerLanguage: "English",
-  answerStyle: "Concise Bullets",
+  answerStyle: DEFAULT_ANSWER_STYLE,
+  dsaModeEnabled: false,
+  preferredLanguage: "Python",
 };
 
-function getInitialView(): RootView {
+function sanitizeProfile(raw: TargetProfile): TargetProfile {
+  return {
+    ...DEFAULT_PROFILE,
+    ...raw,
+    answerStyle: normalizeAnswerStyle(raw.answerStyle),
+    dsaModeEnabled: Boolean(raw.dsaModeEnabled),
+    preferredLanguage: normalizeProgrammingLanguage(raw.preferredLanguage),
+  };
+}
+
+function getViewFromLocation(): RootView {
   if (typeof window === "undefined") return "landing";
+  const pathname = window.location.pathname.replace(/\/+$/, "").toLowerCase();
   const params = new URLSearchParams(window.location.search);
   const mode = params.get("mode");
-  if (mode === "software") return "software";
-  if (mode === "dashboard") return "dashboard";
-  if (mode === "login") return "login";
+
+  if (pathname === "/admin" || mode === "admin") return "admin";
+  if (pathname === "/overlay" || mode === "software") return "software";
+  if (pathname === "/dashboard" || mode === "dashboard") return "dashboard";
+  if (pathname === "/login" || mode === "login") return "login";
   if (isDesktopApp()) return "software";
   return "landing";
 }
 
 export default function App() {
-  const [view, setView] = useState<RootView>(getInitialView);
+  const [view, setView] = useState<RootView>(getViewFromLocation);
   const [dashboardTab, setDashboardTab] = useState<DashboardTab>("overview");
   const [user, setUser] = useState<UserAccount | null>(null);
   const [tokenState, setTokenState] = useState<SessionTokenState | null>(null);
   const [profile, setProfile] = useState<TargetProfile>(DEFAULT_PROFILE);
+
+  // Keep view synced with browser Back/Forward navigation
+  useEffect(() => {
+    const onPopState = () => {
+      setView(getViewFromLocation());
+    };
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, []);
 
   // Hydrate auth, token, and target profile safely from backend or local storage
   useEffect(() => {
@@ -59,7 +90,7 @@ export default function App() {
         if (!active) return;
         if (state.user) setUser(state.user);
         if (state.token) setTokenState(state.token);
-        if (state.profile) setProfile(state.profile);
+        if (state.profile) setProfile(sanitizeProfile(state.profile));
       })
       .catch((err) => {
         console.error("[Crackpilot App] Workspace hydration failed:", err);
@@ -67,7 +98,7 @@ export default function App() {
 
     const unsubLocal = subscribeLocalSync((msg) => {
       if (msg.token !== undefined) setTokenState(msg.token);
-      if (msg.profile) setProfile(msg.profile);
+      if (msg.profile) setProfile(sanitizeProfile(msg.profile));
     });
 
     // Only open SSE when /api/health confirms a real Express backend is running.
@@ -83,24 +114,51 @@ export default function App() {
             const msg = JSON.parse(ev.data) as {
               type?: string;
               token?: SessionTokenState | null;
+              tokenValue?: string;
+              quota?: AccountQuotaSnapshot;
               profile?: TargetProfile;
             };
             // On fresh Desktop .exe boot, never auto-skip Gate 1 from initial "connected" payload
-            if (msg.token !== undefined && !(desktop && msg.type === "connected")) {
+            if (
+              msg.token !== undefined &&
+              !(desktop && msg.type === "connected")
+            ) {
               setTokenState(msg.token);
             }
-            if (msg.profile) setProfile(msg.profile);
+            if (msg.type === "quota_updated" && msg.quota && msg.tokenValue) {
+              setTokenState((prev) =>
+                prev && prev.token === msg.tokenValue
+                  ? { ...prev, quota: msg.quota }
+                  : prev
+              );
+            }
+            if (msg.type === "account_revoked" && msg.tokenValue) {
+              setTokenState((prev) =>
+                prev && prev.token === msg.tokenValue ? null : prev
+              );
+            }
+            if (msg.profile) setProfile(sanitizeProfile(msg.profile));
           } catch (parseErr) {
-            console.warn("[Crackpilot App SSE] Malformed event payload:", parseErr);
+            console.warn(
+              "[Crackpilot App SSE] Malformed event payload:",
+              parseErr
+            );
           }
         };
         sse.onerror = () => {
-          console.warn("[Crackpilot App SSE] Stream error on", eventsUrl, "— closing.");
+          console.warn(
+            "[Crackpilot App SSE] Stream error on",
+            eventsUrl,
+            "— closing."
+          );
           sse?.close();
           sse = null;
         };
       } catch (err) {
-        console.error("[Crackpilot App SSE] Failed to initialize EventSource:", err);
+        console.error(
+          "[Crackpilot App SSE] Failed to initialize EventSource:",
+          err
+        );
         sse = null;
       }
     });
@@ -112,11 +170,35 @@ export default function App() {
     };
   }, []);
 
+  const navigateClean = (nextView: RootView, nextPath = "/") => {
+    if (
+      typeof window !== "undefined" &&
+      window.location.pathname !== nextPath &&
+      !isDesktopApp()
+    ) {
+      window.history.replaceState({}, "", nextPath);
+    }
+    setView(nextView);
+  };
+
   const handleLogout = async () => {
     await logoutAccount();
     setUser(null);
-    setView("landing");
+    navigateClean("landing", "/");
   };
+
+  if (view === "admin") {
+    return (
+      <AdminPanel
+        currentUser={user}
+        onRedirectDashboard={() => {
+          setDashboardTab("overview");
+          navigateClean("dashboard", "/");
+        }}
+        onGoHome={() => navigateClean("landing", "/")}
+      />
+    );
+  }
 
   if (view === "software") {
     return (
@@ -127,7 +209,7 @@ export default function App() {
         onProfileChange={setProfile}
         onGoDashboard={() => {
           setDashboardTab("overview");
-          setView("dashboard");
+          navigateClean("dashboard", "/");
         }}
       />
     );
@@ -136,11 +218,11 @@ export default function App() {
   if (view === "login") {
     return (
       <LoginView
-        onBackHome={() => setView("landing")}
+        onBackHome={() => navigateClean("landing", "/")}
         onLoginSuccess={(loggedInUser) => {
           setUser(loggedInUser);
           setDashboardTab("overview");
-          setView("dashboard");
+          navigateClean("dashboard", "/");
         }}
         onLaunchSoftware={() => setView("software")}
       />
@@ -159,7 +241,7 @@ export default function App() {
         onProfileChange={setProfile}
         onOpenSoftware={() => setView("software")}
         onLogout={() => void handleLogout()}
-        onGoHome={() => setView("landing")}
+        onGoHome={() => navigateClean("landing", "/")}
       />
     );
   }
@@ -170,11 +252,11 @@ export default function App() {
       onGoLogin={() => setView("login")}
       onGoDashboard={() => {
         setDashboardTab("overview");
-        setView("dashboard");
+        navigateClean("dashboard", "/");
       }}
       onOpenTestingLab={() => {
         setDashboardTab("testing");
-        setView("dashboard");
+        navigateClean("dashboard", "/");
       }}
       onOpenSoftware={() => setView("software")}
     />
