@@ -10,7 +10,7 @@ function invokeSafe(channel, ...args) {
 try {
   contextBridge.exposeInMainWorld("crackpilotDesktop", {
     isElectron: true,
-    version: "1.0.7",
+    version: "1.0.8",
     minimizeWindow: () => invokeSafe("crackpilot:minimize"),
     minimizeWindowSync: () => {
       try {
@@ -56,7 +56,7 @@ try {
       return () => ipcRenderer.removeListener("crackpilot:window-closing", handler);
     },
   });
-  console.log("[Crackpilot Preload] window.crackpilotDesktop bridge exposed (v1.0.7).");
+  console.log("[Crackpilot Preload] window.crackpilotDesktop bridge exposed (v1.0.8).");
 } catch (err) {
   console.error("[Crackpilot Preload] Failed to expose crackpilotDesktop bridge:", err);
 }

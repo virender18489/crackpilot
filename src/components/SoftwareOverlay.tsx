@@ -3189,7 +3189,7 @@ export function SoftwareOverlay({
               Crackpilot
             </span>
             <span className="inline-flex items-center gap-1 rounded bg-slate-800/90 border border-slate-700/70 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-[#b4f416] whitespace-nowrap shrink-0">
-              <span>v1.0.7</span>
+              <span>v1.0.8</span>
               <span className="text-slate-500">•</span>
               <span className="text-emerald-300 font-normal">live</span>
             </span>
@@ -3483,7 +3483,7 @@ export function SoftwareOverlay({
                       Authenticate Crackpilot
                     </h2>
                     <span className="inline-flex items-center gap-1 rounded bg-slate-800 px-1.5 py-0.5 font-mono text-[10px] text-[#b4f416]">
-                      <span>v1.0.7</span>
+                      <span>v1.0.8</span>
                       <span className="text-slate-500">•</span>
                       <span className="text-emerald-300">live</span>
                     </span>

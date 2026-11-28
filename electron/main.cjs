@@ -10,7 +10,7 @@ const {
 const fs = require("fs");
 const path = require("path");
 
-const APP_VERSION = "1.0.7";
+const APP_VERSION = "1.0.8";
 const PRODUCTION_OVERLAY_URL = "https://crackpilot.vercel.app/?mode=software";
 let mainWindow = null;
 let isBehindMode = false;
@@ -153,13 +153,25 @@ function createWindow() {
   mainWindow = win;
   enforceStealthWindowFlags(win);
 
-  win.once("ready-to-show", () => {
+  let didShow = false;
+  const revealWindow = (sourceLabel) => {
+    if (didShow || win.isDestroyed()) return;
+    didShow = true;
     enforceStealthWindowFlags(win);
     win.show();
     win.focus();
     enforceStealthWindowFlags(win);
-    logInfo("Window ready-to-show complete (skipTaskbar=true).");
+    logInfo(`Window shown via ${sourceLabel} (skipTaskbar=true).`);
+  };
+
+  win.once("ready-to-show", () => {
+    revealWindow("ready-to-show");
   });
+
+  // Safety guarantee: never stay invisible if transparent DWM delays ready-to-show
+  setTimeout(() => {
+    revealWindow("startup-timer");
+  }, 2000);
 
   // Windows 11 DWM can re-add a taskbar entry on show/focus/maximize/unmaximize — re-enforce skipTaskbar
   for (const evt of ["show", "focus", "restore", "maximize", "unmaximize"]) {
@@ -204,8 +216,30 @@ function createWindow() {
       : `${configuredUrl}?mode=software`;
 
   let retryCount = 0;
+  let mountCheckTimer = null;
+
+  const showOfflineRecovery = (reason) => {
+    if (win.isDestroyed()) return;
+    const safeReason = String(reason || "Unable to reach live Crackpilot server.")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+    const safeUrl = targetUrl
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+    const recoveryHtml = `<!doctype html><html><head><meta charset="utf-8"><title>Crackpilot Recovery</title></head><body style="margin:0;height:100vh;width:100vw;display:flex;align-items:center;justify-content:center;background:#080d18;color:#f1f5f9;font-family:system-ui,-apple-system,sans-serif;"><div style="max-width:420px;width:90%;background:#0d1424;border:1px solid rgba(100,116,139,0.4);border-radius:12px;padding:24px;box-sizing:border-box;"><div style="display:flex;align-items:center;gap:10px;margin-bottom:12px;"><span style="display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;border-radius:6px;background:#405fe8;color:#fff;font-weight:700;font-size:13px;">C</span><strong style="font-size:15px;">Crackpilot v${APP_VERSION}</strong></div><p style="margin:0 0 10px;font-size:13px;color:#cbd5e1;">Could not render the live overlay from Vercel.</p><p style="margin:0 0 16px;font-size:11px;font-family:monospace;color:#fda4af;background:rgba(244,63,94,0.12);border:1px solid rgba(244,63,94,0.35);border-radius:8px;padding:8px 10px;word-break:break-word;">${safeReason}</p><button onclick="window.crackpilotDesktop && window.crackpilotDesktop.reloadLiveApp ? window.crackpilotDesktop.reloadLiveApp() : (window.location.href='${safeUrl}')" style="width:100%;padding:10px 14px;border:none;border-radius:8px;background:#405fe8;color:#fff;font-size:13px;font-weight:600;cursor:pointer;">Retry Live Connection</button></div></body></html>`;
+    void win.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(recoveryHtml)}`);
+  };
+
   const loadLiveVercelUrl = async () => {
     if (win.isDestroyed()) return;
+    if (mountCheckTimer) {
+      clearTimeout(mountCheckTimer);
+      mountCheckTimer = null;
+    }
     try {
       await session.defaultSession.clearCache();
       await session.defaultSession.clearStorageData({
@@ -219,18 +253,64 @@ function createWindow() {
     try {
       await win.loadURL(targetUrl, {
         extraHeaders:
-          "pragma: no-cache\nCache-Control: no-cache, no-store, must-revalidate\n",
+          "Pragma: no-cache\r\nCache-Control: no-cache, no-store, must-revalidate\r\n",
       });
     } catch (err) {
-      logError("loadURL failed:", err?.message || String(err));
+      const errMsg = err?.message || String(err);
+      logError("loadURL failed:", errMsg);
       if (retryCount < 2 && !win.isDestroyed()) {
         retryCount += 1;
         setTimeout(() => {
           void loadLiveVercelUrl();
         }, 1500);
+      } else {
+        showOfflineRecovery(errMsg);
       }
     }
   };
+
+  win.webContents.on("console-message", (_event, level, message, line, sourceId) => {
+    if (level >= 2) {
+      logError(`Renderer console(${level}): ${message} (${sourceId}:${line})`);
+    }
+  });
+
+  win.webContents.on("did-finish-load", () => {
+    if (win.isDestroyed() || win.webContents.isDestroyed()) return;
+    const currentUrl = win.webContents.getURL() || "";
+    if (!/^https?:\/\//i.test(currentUrl)) return;
+
+    if (mountCheckTimer) clearTimeout(mountCheckTimer);
+    mountCheckTimer = setTimeout(async () => {
+      if (win.isDestroyed() || win.webContents.isDestroyed()) return;
+      try {
+        const status = await win.webContents.executeJavaScript(
+          `(() => {
+            const root = document.getElementById("root");
+            const shell = document.getElementById("cp-boot-shell");
+            return {
+              mounted: Boolean(window.__CRACKPILOT_MOUNTED__),
+              hasRoot: Boolean(root),
+              childCount: root ? root.childElementCount : 0,
+              onlyBootShell: Boolean(shell && root && root.childElementCount === 1 && root.firstElementChild === shell)
+            };
+          })()`
+        );
+        if (status && (status.mounted || (status.childCount > 0 && !status.onlyBootShell))) {
+          return;
+        }
+        logError("Watchdog detected empty/unmounted #root:", status);
+        if (retryCount < 2) {
+          retryCount += 1;
+          void loadLiveVercelUrl();
+        } else {
+          showOfflineRecovery("App bundle did not mount into #root. Check internet/Vercel deployment.");
+        }
+      } catch (checkErr) {
+        logError("Mount watchdog check failed:", checkErr);
+      }
+    }, 4000);
+  });
 
   win.webContents.on(
     "did-fail-load",
@@ -240,11 +320,15 @@ function createWindow() {
       logError(
         `did-fail-load (${errorCode}): ${errorDescription} | URL: ${validatedURL}`
       );
-      if (isMainFrame && retryCount < 2 && !win.isDestroyed()) {
-        retryCount += 1;
-        setTimeout(() => {
-          void loadLiveVercelUrl();
-        }, 1500);
+      if (isMainFrame && !win.isDestroyed()) {
+        if (retryCount < 2) {
+          retryCount += 1;
+          setTimeout(() => {
+            void loadLiveVercelUrl();
+          }, 1500);
+        } else {
+          showOfflineRecovery(`${errorDescription} (${errorCode})`);
+        }
       }
     }
   );

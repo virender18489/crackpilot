@@ -65,7 +65,8 @@ function getViewFromLocation(): RootView {
     const mode = params.get("mode");
 
     if (pathname === "/admin" || mode === "admin") return "admin";
-    if (pathname === "/overlay" || mode === "software") return "software";
+    if (pathname === "/overlay" || pathname === "/software" || mode === "software")
+      return "software";
     if (pathname === "/dashboard" || mode === "dashboard") return "dashboard";
     if (pathname === "/login" || mode === "login") return "login";
     if (isDesktopApp()) return "software";
