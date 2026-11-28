@@ -25,6 +25,8 @@ import {
 import { streamGroqChatCompletion } from "./server/groqHelper.ts";
 import { sanitizePhoneticQuestion } from "./server/phoneticSanitizer.ts";
 import {
+  buildDeepgramLiveWsUrl,
+  requestDeepgramShortLivedToken,
   transcribeWithDeepgramEnglish,
   transcribeWithGroqWhisperEnglish,
 } from "./server/sttConfig.ts";
@@ -1402,8 +1404,8 @@ async function startServer() {
             { role: "system", content: systemPrompt },
             { role: "user", content: userPrompt },
           ],
-          temperature: 0.2,
-          maxTokens: isCodeReq || isDsaFollowUp ? 1400 : 180,
+          temperature: 0.75,
+          maxTokens: isCodeReq || isDsaFollowUp ? 1400 : 220,
           onMeta: (model) => {
             sendEvent({ meta: { engine: "groq", model } });
           },
@@ -1520,8 +1522,8 @@ async function startServer() {
         contents: userPrompt,
         config: {
           systemInstruction: systemPrompt,
-          temperature: 0.2,
-          maxOutputTokens: isCodeReq || isDsaFollowUp ? 1400 : 220,
+          temperature: 0.75,
+          maxOutputTokens: isCodeReq || isDsaFollowUp ? 1400 : 240,
           thinkingConfig: { thinkingBudget: 0 },
         },
       });
@@ -1560,6 +1562,37 @@ async function startServer() {
       endpoint: "/api/incoming-question",
       streaming: true,
       ready: true,
+    });
+  });
+
+  // Live Deepgram Nova-3 WebSocket token / proxy discovery (zero 4-second chunking)
+  app.get("/api/deepgram-token", async (_req, res) => {
+    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+    const dgKey = (process.env.DEEPGRAM_API_KEY || "")
+      .trim()
+      .replace(/^['"]|['"]$/g, "");
+    const validDgKey = dgKey && !/your_|placeholder/i.test(dgKey) ? dgKey : "";
+    if (!validDgKey) {
+      res.json({ ok: false, mode: "fallback", reason: "DEEPGRAM_API_KEY not configured" });
+      return;
+    }
+    const grant = await requestDeepgramShortLivedToken(validDgKey, 60);
+    if (grant) {
+      res.json({
+        ok: true,
+        mode: "bearer",
+        token: grant.accessToken,
+        expiresIn: grant.expiresIn,
+        wsUrl: buildDeepgramLiveWsUrl("en-IN", true),
+        fallbackWsUrl: buildDeepgramLiveWsUrl("en", true),
+      });
+      return;
+    }
+    // Express server supports native /ws/deepgram proxy even when key lacks /v1/auth/grant scope
+    res.json({
+      ok: true,
+      mode: "proxy",
+      wsPath: "/ws/deepgram",
     });
   });
 

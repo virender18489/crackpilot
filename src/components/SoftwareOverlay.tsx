@@ -116,6 +116,44 @@ function formatNow(): string {
   });
 }
 
+function downsampleFloat32ToInt16(
+  input: Float32Array,
+  inputSampleRate: number,
+  targetSampleRate = 16000
+): Int16Array {
+  if (inputSampleRate === targetSampleRate) {
+    const out = new Int16Array(input.length);
+    for (let i = 0; i < input.length; i++) {
+      const s = Math.max(-1, Math.min(1, input[i]));
+      out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+    }
+    return out;
+  }
+  const ratio = inputSampleRate / targetSampleRate;
+  const outputLength = Math.max(1, Math.round(input.length / ratio));
+  const result = new Int16Array(outputLength);
+  let offsetResult = 0;
+  let offsetBuffer = 0;
+  while (offsetResult < result.length) {
+    const nextOffsetBuffer = Math.min(
+      input.length,
+      Math.round((offsetResult + 1) * ratio)
+    );
+    let accum = 0;
+    let count = 0;
+    for (let i = offsetBuffer; i < nextOffsetBuffer; i++) {
+      accum += input[i];
+      count++;
+    }
+    const sample = count > 0 ? accum / count : 0;
+    const clamped = Math.max(-1, Math.min(1, sample));
+    result[offsetResult] = clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff;
+    offsetResult++;
+    offsetBuffer = nextOffsetBuffer;
+  }
+  return result;
+}
+
 export function SoftwareOverlay({
   tokenState: _externalTokenState,
   profile,
@@ -273,6 +311,11 @@ export function SoftwareOverlay({
   const speechSessionStartedAtRef = useRef<number>(0);
   const liveTranscriptRef = useRef<string>("");
   const interimTextRef = useRef<string>("");
+  const liveQaCardIdRef = useRef<string | null>(null);
+  const dgWsRef = useRef<WebSocket | null>(null);
+  const dgWsActiveRef = useRef<boolean>(false);
+  const dgKeepAliveRef = useRef<number | null>(null);
+  const dgReconnectTimerRef = useRef<number | null>(null);
   const chunkSeqRef = useRef<number>(0);
   const orderedChunkTextsRef = useRef<Map<number, string>>(new Map());
   const inFlightChunksRef = useRef<number>(0);
@@ -740,13 +783,16 @@ export function SoftwareOverlay({
 
   useEffect(() => {
     if (monitorGainRef.current) {
-      // Only pass audio back to speakers for muted browser tab captures;
-      // in Electron WASAPI loopback and physical Mic mode, keep gain 0 to avoid echo/howling while Monitor: ON tracks live voice.
+      // Only pass audio back to speakers for muted browser tab-only captures (system-loopback);
+      // NEVER route mixed Call + Mic or physical Mic streams back to speakers (avoids echo/AEC muting the mic).
       const shouldPassToSpeakers =
-        monitorAudio && listenMode === "tab" && !isDesktopApp();
+        monitorAudio &&
+        listenMode === "tab" &&
+        selectedAudioInput === "system-loopback" &&
+        !isDesktopApp();
       monitorGainRef.current.gain.value = shouldPassToSpeakers ? 1.0 : 0.0;
     }
-  }, [monitorAudio, listenMode]);
+  }, [monitorAudio, listenMode, selectedAudioInput]);
 
   const streamAnswerFromEndpoint = useCallback(
     async (
@@ -978,8 +1024,55 @@ export function SoftwareOverlay({
     []
   );
 
+  const upsertLiveQuestionCard = useCallback((liveText: string) => {
+    const cleaned = liveText.replace(/\s+/g, " ").trim();
+    if (!cleaned) return;
+    if (!liveQaCardIdRef.current) {
+      const id = `qa-live-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+      liveQaCardIdRef.current = id;
+      setQaList((prev) => [
+        {
+          id,
+          timestamp: formatNow(),
+          question: cleaned,
+          answer: "",
+          engine: "AI",
+          isStreaming: false,
+        },
+        ...prev,
+      ]);
+      if (!isAtTopRef.current) {
+        setHasUnseenLatest(true);
+      }
+      return;
+    }
+    const targetId = liveQaCardIdRef.current;
+    setQaList((prev) => {
+      const exists = prev.some((q) => q.id === targetId);
+      if (!exists) {
+        return [
+          {
+            id: targetId,
+            timestamp: formatNow(),
+            question: cleaned,
+            answer: "",
+            engine: "AI",
+            isStreaming: false,
+          },
+          ...prev,
+        ];
+      }
+      return prev.map((q) => (q.id === targetId ? { ...q, question: cleaned } : q));
+    });
+  }, []);
+
   const askQuestion = useCallback(
-    async (questionText: string, fastMode = false, allowWhenPaused = false) => {
+    async (
+      questionText: string,
+      fastMode = false,
+      allowWhenPaused = false,
+      existingCardId?: string | null
+    ) => {
       const cleaned = questionText.trim();
       if (!cleaned) return;
       if (quotaBlockedReasonRef.current) {
@@ -1001,7 +1094,7 @@ export function SoftwareOverlay({
       if (
         !allowWhenPaused &&
         lastAskedRef.current.text === norm &&
-        now - lastAskedRef.current.at < 4000
+        now - lastAskedRef.current.at < 3500
       ) {
         return;
       }
@@ -1009,26 +1102,51 @@ export function SoftwareOverlay({
 
       setPromptsUsed((c) => Math.min(maxPrompts, c + 1));
 
-      const qaId = `qa-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-      // Newest-first reverse stack order: push latest Q&A to the very top
-      setQaList((prev) => [
-        {
-          id: qaId,
-          timestamp: formatNow(),
-          question: cleaned,
-          answer: "",
-          engine: "AI",
-          isStreaming: true,
-        },
-        ...prev,
-      ]);
+      const qaId =
+        existingCardId ||
+        `qa-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+
+      // Reuse the live top Q card in-place so words stream directly into Q and then answer streams directly into A
+      setQaList((prev) => {
+        if (existingCardId && prev.some((q) => q.id === existingCardId)) {
+          return prev.map((q) =>
+            q.id === existingCardId
+              ? {
+                  ...q,
+                  timestamp: formatNow(),
+                  question: cleaned,
+                  answer: "",
+                  error: undefined,
+                  isStreaming: true,
+                }
+              : q
+          );
+        }
+        return [
+          {
+            id: qaId,
+            timestamp: formatNow(),
+            question: cleaned,
+            answer: "",
+            engine: "AI",
+            isStreaming: true,
+          },
+          ...prev,
+        ];
+      });
       if (!isAtTopRef.current) {
         setHasUnseenLatest(true);
       }
 
       const cur = profileRef.current;
       const recentHistory = qaListRef.current
-        .filter((q) => q.id !== "system-init" && !q.isStreaming && q.answer)
+        .filter(
+          (q) =>
+            q.id !== "system-init" &&
+            q.id !== qaId &&
+            !q.isStreaming &&
+            q.answer
+        )
         .slice(0, 3)
         .reverse()
         .map((q) => ({ question: q.question, answer: q.answer }));
@@ -1186,6 +1304,7 @@ export function SoftwareOverlay({
     setMonitorAudio(false);
     interimTextRef.current = "";
     liveTranscriptRef.current = "";
+    liveQaCardIdRef.current = null;
     analyserRef.current = null;
 
     activeQuestionEpochRef.current += 1;
@@ -1194,6 +1313,30 @@ export function SoftwareOverlay({
     pendingFinalizeRef.current = null;
     speechSessionStartedAtRef.current = 0;
     speechActiveRef.current = false;
+
+    if (dgKeepAliveRef.current !== null) {
+      window.clearInterval(dgKeepAliveRef.current);
+      dgKeepAliveRef.current = null;
+    }
+    if (dgReconnectTimerRef.current !== null) {
+      window.clearTimeout(dgReconnectTimerRef.current);
+      dgReconnectTimerRef.current = null;
+    }
+    dgWsActiveRef.current = false;
+    if (dgWsRef.current) {
+      try {
+        if (dgWsRef.current.readyState === WebSocket.OPEN) {
+          dgWsRef.current.send(JSON.stringify({ type: "CloseStream" }));
+        }
+        dgWsRef.current.onclose = null;
+        dgWsRef.current.onerror = null;
+        dgWsRef.current.onmessage = null;
+        dgWsRef.current.close();
+      } catch {
+        // Ignore WebSocket close error
+      }
+      dgWsRef.current = null;
+    }
 
     if (chunkTimerRef.current !== null) {
       window.clearInterval(chunkTimerRef.current);
@@ -1330,6 +1473,8 @@ export function SoftwareOverlay({
       .replace(/\s+/g, " ")
       .trim();
 
+    const targetCardId = liveQaCardIdRef.current;
+    liveQaCardIdRef.current = null;
     activeQuestionEpochRef.current += 1;
     orderedChunkTextsRef.current.clear();
     chunkSeqRef.current = 0;
@@ -1339,8 +1484,8 @@ export function SoftwareOverlay({
     speechActiveRef.current = false;
 
     if (combined.length > 2) {
-      // Zero artificial delay: fire streaming SSE answer immediately
-      void askQuestion(combined, pending.fastMode);
+      // Zero artificial delay: stream AI answer directly into the live Q card's A section
+      void askQuestion(combined, pending.fastMode, false, targetCardId);
     }
   }, [askQuestion]);
 
@@ -1431,7 +1576,10 @@ export function SoftwareOverlay({
           const cleanedChunk = (data.text || "").trim();
           if (cleanedChunk.length > 0) {
             orderedChunkTextsRef.current.set(opts.seq, cleanedChunk);
-            rebuildLiveTranscript();
+            const merged = rebuildLiveTranscript();
+            if (merged) {
+              upsertLiveQuestionCard(merged);
+            }
           }
         }
       } catch (err) {
@@ -1446,7 +1594,7 @@ export function SoftwareOverlay({
         }
       }
     },
-    [commitPendingAnswerIfReady, rebuildLiveTranscript]
+    [commitPendingAnswerIfReady, rebuildLiveTranscript, upsertLiveQuestionCard]
   );
 
   // Instant flush trigger (Alt+X) — works anytime during a short or 4-10 minute explanation
@@ -1466,9 +1614,9 @@ export function SoftwareOverlay({
     [commitPendingAnswerIfReady]
   );
 
-  // Unified Web Audio API 16kHz Mono PCM Micro-Chunk Capture + Adaptive Noise Floor + 60fps AnalyserNode Meter
-  // Calibrates ambient noise floor during the first 300ms, slices continuous speech into strictly non-overlapping
-  // 3-second WAV micro-chunks (~94KB each) for instant live text, and triggers AI answer after an 850ms silence pause.
+  // Real-Time Continuous Deepgram Nova-3 WebSocket PCM Streaming (zero 4-second chunking lag)
+  // Streams 16kHz 16-bit mono PCM every ~100ms directly to Deepgram Nova-3 (interim_results=true, endpointing=500)
+  // so spoken words appear live in Q and stream the AI answer into A immediately after a 500ms pause.
   const attachAudioMeter = useCallback(
     (audioStream: MediaStream, monitor: boolean) => {
       try {
@@ -1499,8 +1647,9 @@ export function SoftwareOverlay({
         analyser.connect(gain);
         gain.connect(ctx.destination);
 
-        // Capture raw mono Float32 PCM frames for self-contained 16kHz WAV encoding
-        const processor = ctx.createScriptProcessor(4096, 1, 1);
+        // ~85-128ms low-latency PCM frames for continuous WebSocket streaming
+        const bufferSize = ctx.sampleRate >= 44100 ? 4096 : 2048;
+        const processor = ctx.createScriptProcessor(bufferSize, 1, 1);
         const silentSink = ctx.createGain();
         silentSink.gain.value = 0.0;
         source.connect(processor);
@@ -1519,21 +1668,205 @@ export function SoftwareOverlay({
         preRollPcmRef.current = [];
         speechPcmRef.current = [];
 
-        const ROLLING_CHUNK_MS = 3_500; // Strictly non-overlapping 3.5s max WAV micro-chunks
-        const PAUSE_TRIGGER_MS = 750; // Fast 750ms silence pause triggers sub-second AI streaming
+        // Open continuous Deepgram Nova-3 WebSocket (direct short-lived JWT or Express /ws/deepgram proxy)
+        const openDeepgramLiveSocket = async (attempt = 0) => {
+          if (!isListeningRef.current || !isEngineRunningRef.current) return;
+          if (!hasConfiguredBackend()) return;
+          try {
+            const tokenRes = await fetch(apiUrl("/api/deepgram-token"), {
+              method: "GET",
+              cache: "no-store",
+            });
+            if (!tokenRes.ok) return;
+            const cfg = (await tokenRes.json()) as {
+              ok?: boolean;
+              mode?: "bearer" | "proxy" | "fallback";
+              token?: string;
+              wsUrl?: string;
+              fallbackWsUrl?: string;
+              wsPath?: string;
+            };
+            if (!isListeningRef.current || !isEngineRunningRef.current) return;
+            if (!cfg.ok || cfg.mode === "fallback") return;
 
-        // Compact ~0.25s pre-roll ONLY prepended on silence -> speech transition (cleared immediately, zero overlap)
+            let ws: WebSocket | null = null;
+            if (cfg.mode === "bearer" && cfg.token && cfg.wsUrl) {
+              const targetWsUrl =
+                attempt > 0 && cfg.fallbackWsUrl ? cfg.fallbackWsUrl : cfg.wsUrl;
+              ws = new WebSocket(targetWsUrl, ["bearer", cfg.token]);
+            } else if (cfg.mode === "proxy" && cfg.wsPath) {
+              const httpBase = apiUrl(cfg.wsPath);
+              const absHttp = /^https?:\/\//i.test(httpBase)
+                ? httpBase
+                : `${window.location.origin}${httpBase.startsWith("/") ? httpBase : `/${httpBase}`}`;
+              const proxyWsUrl = absHttp.replace(/^http/i, "ws");
+              ws = new WebSocket(proxyWsUrl);
+            }
+
+            if (!ws) return;
+            ws.binaryType = "arraybuffer";
+            dgWsRef.current = ws;
+
+            ws.onopen = () => {
+              if (!isListeningRef.current || dgWsRef.current !== ws) {
+                ws?.close();
+                return;
+              }
+              dgWsActiveRef.current = true;
+              setLiveApiError(null);
+              // Stop Web Speech backup if running so Deepgram WS is single source of truth
+              if (recognitionRef.current) {
+                try {
+                  recognitionRef.current.onend = null;
+                  recognitionRef.current.stop();
+                } catch {
+                  // Ignore
+                }
+                recognitionRef.current = null;
+                recognitionWorkingRef.current = false;
+              }
+              if (dgKeepAliveRef.current !== null) {
+                window.clearInterval(dgKeepAliveRef.current);
+              }
+              dgKeepAliveRef.current = window.setInterval(() => {
+                if (dgWsRef.current && dgWsRef.current.readyState === WebSocket.OPEN) {
+                  try {
+                    dgWsRef.current.send(JSON.stringify({ type: "KeepAlive" }));
+                  } catch {
+                    // Ignore
+                  }
+                }
+              }, 8000);
+            };
+
+            ws.onmessage = (event) => {
+              if (!isListeningRef.current || !isEngineRunningRef.current) return;
+              if (typeof event.data !== "string") return;
+              try {
+                const msg = JSON.parse(event.data) as {
+                  type?: string;
+                  is_final?: boolean;
+                  speech_final?: boolean;
+                  channel?: {
+                    alternatives?: Array<{ transcript?: string }>;
+                  };
+                };
+
+                if (msg.type === "Results") {
+                  const transcript = (
+                    msg.channel?.alternatives?.[0]?.transcript || ""
+                  ).trim();
+
+                  if (transcript) {
+                    if (msg.is_final) {
+                      const prev = liveTranscriptRef.current.trim();
+                      liveTranscriptRef.current = prev
+                        ? `${prev} ${transcript}`.replace(/\s+/g, " ").trim()
+                        : transcript;
+                      interimTextRef.current = "";
+                    } else {
+                      interimTextRef.current = transcript;
+                    }
+
+                    const liveCombined = [
+                      liveTranscriptRef.current,
+                      interimTextRef.current,
+                    ]
+                      .filter(Boolean)
+                      .join(" ")
+                      .replace(/\s+/g, " ")
+                      .trim();
+
+                    if (liveCombined) {
+                      upsertLiveQuestionCard(liveCombined);
+                    }
+
+                    // Crisp 500ms silence pause timer after latest spoken word
+                    if (pauseTriggerTimerRef.current !== null) {
+                      window.clearTimeout(pauseTriggerTimerRef.current);
+                    }
+                    pauseTriggerTimerRef.current = window.setTimeout(() => {
+                      if (
+                        liveTranscriptRef.current ||
+                        interimTextRef.current
+                      ) {
+                        pendingFinalizeRef.current = { fastMode: false };
+                        commitPendingAnswerIfReady();
+                      }
+                    }, 500);
+                  }
+
+                  if (
+                    msg.speech_final &&
+                    (liveTranscriptRef.current || interimTextRef.current)
+                  ) {
+                    if (pauseTriggerTimerRef.current !== null) {
+                      window.clearTimeout(pauseTriggerTimerRef.current);
+                      pauseTriggerTimerRef.current = null;
+                    }
+                    pendingFinalizeRef.current = { fastMode: false };
+                    commitPendingAnswerIfReady();
+                  }
+                } else if (
+                  msg.type === "UtteranceEnd" &&
+                  (liveTranscriptRef.current || interimTextRef.current)
+                ) {
+                  if (pauseTriggerTimerRef.current !== null) {
+                    window.clearTimeout(pauseTriggerTimerRef.current);
+                    pauseTriggerTimerRef.current = null;
+                  }
+                  pendingFinalizeRef.current = { fastMode: false };
+                  commitPendingAnswerIfReady();
+                }
+              } catch {
+                // Ignore non-JSON frames
+              }
+            };
+
+            ws.onerror = () => {
+              dgWsActiveRef.current = false;
+            };
+
+            ws.onclose = () => {
+              if (dgKeepAliveRef.current !== null) {
+                window.clearInterval(dgKeepAliveRef.current);
+                dgKeepAliveRef.current = null;
+              }
+              if (dgWsRef.current === ws) {
+                dgWsRef.current = null;
+              }
+              dgWsActiveRef.current = false;
+              if (
+                isListeningRef.current &&
+                isEngineRunningRef.current &&
+                attempt < 3
+              ) {
+                dgReconnectTimerRef.current = window.setTimeout(() => {
+                  void openDeepgramLiveSocket(attempt + 1);
+                }, 1200);
+              }
+            };
+          } catch (wsErr) {
+            console.warn("[Crackpilot Audio] Deepgram live WS fallback:", wsErr);
+          }
+        };
+
+        void openDeepgramLiveSocket(0);
+
+        // Emergency fast-utterance fallback (500ms pause trigger, ONLY used if Deepgram WS is unavailable)
+        const FALLBACK_PAUSE_MS = 500;
+        const FALLBACK_MAX_UTTERANCE_MS = 1_800;
+
         const maxPreRollFrames = Math.max(
           1,
-          Math.ceil((ctx.sampleRate * 0.25) / 4096)
+          Math.ceil((ctx.sampleRate * 0.2) / bufferSize)
         );
 
-        // Adaptive room/speaker ambient noise floor calibration (first 300ms + gentle idle tracking)
-        const calibrationEndsAt = Date.now() + 300;
+        const calibrationEndsAt = Date.now() + 250;
         let isCalibratingNoise = true;
         let noiseSampleSum = 0;
         let noiseSampleCount = 0;
-        let noiseFloorRms = 0.008;
+        let noiseFloorRms = 0.006;
 
         const flushSpeechToWav = (opts?: {
           isFinalFlush?: boolean;
@@ -1546,11 +1879,10 @@ export function SoftwareOverlay({
             speechActiveRef.current = false;
           }
 
-          // Strictly non-overlapping slice: splice out all buffered frames so nothing is re-sent
           const frames = speechPcmRef.current.splice(0);
           chunkStartedAtRef.current = Date.now();
 
-          if (recognitionWorkingRef.current) {
+          if (dgWsActiveRef.current || recognitionWorkingRef.current) {
             if (isFinalFlush) {
               pendingFinalizeRef.current = { fastMode };
               commitPendingAnswerIfReady();
@@ -1592,6 +1924,21 @@ export function SoftwareOverlay({
           const input = ev.inputBuffer.getChannelData(0);
           if (!input || input.length === 0) return;
 
+          // Primary zero-lag path: stream continuous 16kHz Int16 PCM directly over Deepgram Nova-3 WebSocket
+          const ws = dgWsRef.current;
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            const pcm16 = downsampleFloat32ToInt16(input, ctx.sampleRate, 16000);
+            try {
+              ws.send(pcm16.buffer as ArrayBuffer);
+            } catch {
+              // Ignore transient send error
+            }
+            return;
+          }
+
+          // Secondary fallback ONLY if WebSocket is unavailable and Web Speech is not running
+          if (recognitionWorkingRef.current) return;
+
           const frameCopy = new Float32Array(input.length);
           frameCopy.set(input);
 
@@ -1602,7 +1949,6 @@ export function SoftwareOverlay({
           const rms = Math.sqrt(sumSq / frameCopy.length);
           const now = Date.now();
 
-          // Phase 1: 300ms ambient noise floor calibration so room/speaker hum never sticks "Speech detected"
           if (isCalibratingNoise) {
             noiseSampleSum += rms;
             noiseSampleCount += 1;
@@ -1612,21 +1958,20 @@ export function SoftwareOverlay({
             }
             if (now >= calibrationEndsAt) {
               const avgAmbient =
-                noiseSampleCount > 0 ? noiseSampleSum / noiseSampleCount : 0.008;
-              noiseFloorRms = Math.min(0.045, Math.max(0.004, avgAmbient));
+                noiseSampleCount > 0 ? noiseSampleSum / noiseSampleCount : 0.006;
+              noiseFloorRms = Math.min(0.04, Math.max(0.003, avgAmbient));
               isCalibratingNoise = false;
             }
             return;
           }
 
-          // Dynamic hysteresis thresholds above calibrated ambient floor
           const speechStartThreshold = Math.min(
-            0.14,
-            Math.max(0.018, noiseFloorRms * 2.5 + 0.008)
+            0.12,
+            Math.max(0.015, noiseFloorRms * 2.2 + 0.006)
           );
           const speechSustainThreshold = Math.min(
-            0.11,
-            Math.max(0.014, noiseFloorRms * 2.0 + 0.006)
+            0.09,
+            Math.max(0.012, noiseFloorRms * 1.8 + 0.005)
           );
           const activeThreshold = speechActiveRef.current
             ? speechSustainThreshold
@@ -1650,8 +1995,7 @@ export function SoftwareOverlay({
             }
             lastSpeechAtRef.current = now;
 
-            // Non-overlapping 3-second live micro-chunk slice during continuous speech
-            if (now - chunkStartedAtRef.current >= ROLLING_CHUNK_MS) {
+            if (now - chunkStartedAtRef.current >= FALLBACK_MAX_UTTERANCE_MS) {
               flushSpeechToWav({ isFinalFlush: false, fastMode: false });
             }
           } else if (speechActiveRef.current) {
@@ -1659,18 +2003,15 @@ export function SoftwareOverlay({
             const silenceMs = now - lastSpeechAtRef.current;
             const chunkMs = now - chunkStartedAtRef.current;
 
-            if (silenceMs >= PAUSE_TRIGGER_MS) {
-              // Fast 850ms silence pause -> flush trailing audio and stream AI answer immediately
+            if (silenceMs >= FALLBACK_PAUSE_MS) {
               flushSpeechToWav({ isFinalFlush: true, fastMode: false });
-            } else if (chunkMs >= ROLLING_CHUNK_MS) {
-              // Brief breath pause inside continuous speech -> slice 3s non-overlapping micro-chunk
+            } else if (chunkMs >= FALLBACK_MAX_UTTERANCE_MS) {
               flushSpeechToWav({ isFinalFlush: false, fastMode: false });
             }
           } else {
-            // Gently adapt ambient floor while silent so AC/fan/speaker hum never triggers false speech
             noiseFloorRms = Math.min(
-              0.045,
-              Math.max(0.004, noiseFloorRms * 0.96 + rms * 0.04)
+              0.04,
+              Math.max(0.003, noiseFloorRms * 0.96 + rms * 0.04)
             );
             preRollPcmRef.current.push(frameCopy);
             if (preRollPcmRef.current.length > maxPreRollFrames) {
@@ -1681,13 +2022,13 @@ export function SoftwareOverlay({
 
         // Audio level animation is isolated inside memoized AudioLevelMeter (GPU scaleX, 0 parent re-renders)
       } catch (err) {
-        console.warn("[Crackpilot Audio] Web Audio PCM WAV init warning:", err);
+        console.warn("[Crackpilot Audio] Web Audio live stream init warning:", err);
       }
     },
-    [commitPendingAnswerIfReady, transcribeWavBlob]
+    [commitPendingAnswerIfReady, transcribeWavBlob, upsertLiveQuestionCard]
   );
 
-  // Capture Microphone audio (captures nearby speaker / interviewer laptop voice & works out of the box in Electron + Browser)
+  // Capture Microphone audio with noiseSuppression: false so external laptop speaker audio across the desk is never suppressed
   const startMicrophoneAudio = useCallback(
     async (deviceId?: string) => {
       if (!isEngineRunningRef.current || !isConnectedRef.current) {
@@ -1699,7 +2040,7 @@ export function SoftwareOverlay({
       try {
         const audioConstraint: MediaTrackConstraints = {
           echoCancellation: true,
-          noiseSuppression: true,
+          noiseSuppression: false,
           autoGainControl: true,
         };
         if (deviceId && deviceId !== "default" && deviceId !== "system-loopback") {
@@ -1715,7 +2056,7 @@ export function SoftwareOverlay({
           micStream = await navigator.mediaDevices.getUserMedia({
             audio: {
               echoCancellation: true,
-              noiseSuppression: true,
+              noiseSuppression: false,
               autoGainControl: true,
             },
           });
@@ -1737,8 +2078,7 @@ export function SoftwareOverlay({
 
         attachAudioMeter(micStream, false);
 
-        // Start real-time Web Speech Recognition when supported (instant live Q streaming in Chrome/Edge)
-        // Automatically falls back to VAD + /api/transcribe in Electron if Web Speech API errors
+        // Browser Web Speech backup ONLY if Deepgram live WebSocket hasn't taken over
         const SpeechRecCtor =
           (
             window as unknown as {
@@ -1760,6 +2100,7 @@ export function SoftwareOverlay({
             rec.lang = "en-IN";
 
             rec.onresult = (event) => {
+              if (dgWsActiveRef.current) return;
               recognitionWorkingRef.current = true;
               let interim = "";
               let finalChunk = "";
@@ -1786,7 +2127,20 @@ export function SoftwareOverlay({
                 interimTextRef.current = "";
               }
 
-              // Reset 750ms silence trigger on every live word for fast response after speech ends
+              const liveCombined = [
+                liveTranscriptRef.current,
+                interimTextRef.current,
+              ]
+                .filter(Boolean)
+                .join(" ")
+                .replace(/\s+/g, " ")
+                .trim();
+
+              if (liveCombined) {
+                upsertLiveQuestionCard(liveCombined);
+              }
+
+              // Crisp 500ms silence trigger after latest word
               if (pauseTriggerTimerRef.current !== null) {
                 window.clearTimeout(pauseTriggerTimerRef.current);
               }
@@ -1794,7 +2148,7 @@ export function SoftwareOverlay({
                 pauseTriggerTimerRef.current = window.setTimeout(() => {
                   pendingFinalizeRef.current = { fastMode: false };
                   commitPendingAnswerIfReady();
-                }, 750);
+                }, 500);
               }
             };
 
@@ -1815,7 +2169,11 @@ export function SoftwareOverlay({
             };
 
             rec.onend = () => {
-              if (isListeningRef.current && isEngineRunningRef.current) {
+              if (
+                isListeningRef.current &&
+                isEngineRunningRef.current &&
+                !dgWsActiveRef.current
+              ) {
                 try {
                   rec.start();
                 } catch {
@@ -1855,6 +2213,7 @@ export function SoftwareOverlay({
       rebuildLiveTranscript,
       refreshAudioInputDevices,
       stopAudioListening,
+      upsertLiveQuestionCard,
     ]
   );
 
@@ -1873,8 +2232,8 @@ export function SoftwareOverlay({
           video: true,
           audio: {
             echoCancellation: false,
-            noiseSuppression: true,
-            autoGainControl: true,
+            noiseSuppression: false,
+            autoGainControl: false,
             suppressLocalAudioPlayback: false,
           } as MediaTrackConstraints,
         });
@@ -1934,10 +2293,23 @@ export function SoftwareOverlay({
 
     // 1) Try Electron/Browser System Loopback Audio (Zoom / Google Meet / Teams incoming call audio)
     try {
-      const displayStream = await navigator.mediaDevices.getDisplayMedia({
-        video: true,
-        audio: true,
-      });
+      let displayStream: MediaStream;
+      try {
+        displayStream = await navigator.mediaDevices.getDisplayMedia({
+          video: true,
+          audio: {
+            echoCancellation: false,
+            noiseSuppression: false,
+            autoGainControl: false,
+            suppressLocalAudioPlayback: false,
+          } as MediaTrackConstraints,
+        });
+      } catch {
+        displayStream = await navigator.mediaDevices.getDisplayMedia({
+          video: true,
+          audio: true,
+        });
+      }
       if (!isEngineRunningRef.current) {
         displayStream.getTracks().forEach((t) => t.stop());
         return;
@@ -1961,12 +2333,13 @@ export function SoftwareOverlay({
       console.warn("[Crackpilot Audio] Loopback display capture unavailable, continuing with mic:", err);
     }
 
-    // 2) Also attach Physical Microphone so external Laptop B / Mobile B speaker audio is captured
+    // 2) Also attach Physical Microphone with noiseSuppression: false so external Laptop B / Mobile B speaker audio is never suppressed
+    let micStreamAcquired: MediaStream | null = null;
     try {
       const micStream = await navigator.mediaDevices.getUserMedia({
         audio: {
           echoCancellation: true,
-          noiseSuppression: true,
+          noiseSuppression: false,
           autoGainControl: true,
         },
       });
@@ -1976,6 +2349,7 @@ export function SoftwareOverlay({
         return;
       }
       void refreshAudioInputDevices();
+      micStreamAcquired = micStream;
       acquiredStreams.push(micStream);
       setMicDiagError(null);
     } catch (err) {
@@ -1992,7 +2366,7 @@ export function SoftwareOverlay({
       return;
     }
 
-    // Mix all acquired streams cleanly if both Loopback + Mic succeeded
+    // Properly merge System Loopback + Physical Microphone via AudioContext GainNodes without muting the physical mic
     let finalStream: MediaStream = acquiredStreams[0];
     if (acquiredStreams.length > 1) {
       try {
@@ -2003,12 +2377,19 @@ export function SoftwareOverlay({
         const mixCtx = new AudioCtx();
         mixAudioCtxRef.current = mixCtx;
         if (mixCtx.state === "suspended") {
-          void mixCtx.resume().catch(() => {});
+          await mixCtx.resume().catch(() => {});
         }
         const dest = mixCtx.createMediaStreamDestination();
         for (const s of acquiredStreams) {
+          s.getAudioTracks().forEach((t) => {
+            t.enabled = true;
+          });
           const src = mixCtx.createMediaStreamSource(s);
-          src.connect(dest);
+          const trackGain = mixCtx.createGain();
+          // Preserve full physical mic level (slight 1.2x lift for external speaker across the desk)
+          trackGain.gain.value = s === micStreamAcquired ? 1.2 : 1.0;
+          src.connect(trackGain);
+          trackGain.connect(dest);
         }
         extraAudioStreamsRef.current = acquiredStreams;
         finalStream = dest.stream;
@@ -3186,7 +3567,6 @@ export function SoftwareOverlay({
                     item={item}
                     fontSizePx={fontSizePx}
                     questionFontPx={questionFontPx}
-                    dsaModeEnabled={Boolean(profile.dsaModeEnabled)}
                     isCopied={copiedId === item.id}
                     isSpeaking={speakingId === item.id}
                     onCopy={handleCopyCard}

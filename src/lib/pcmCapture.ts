@@ -102,7 +102,7 @@ export async function startPcm16Capture(
         channelCount: 1,
         sampleRate: TARGET_SAMPLE_RATE,
         echoCancellation: true,
-        noiseSuppression: true,
+        noiseSuppression: false,
         autoGainControl: true,
       },
     });

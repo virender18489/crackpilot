@@ -195,7 +195,6 @@ interface QACardItemProps {
   item: QAItem;
   fontSizePx: number;
   questionFontPx: number;
-  dsaModeEnabled: boolean;
   isCopied: boolean;
   isSpeaking: boolean;
   onCopy: (item: QAItem) => void;
@@ -210,7 +209,6 @@ export const QACardItem = React.memo(function QACardItem({
   item,
   fontSizePx,
   questionFontPx,
-  dsaModeEnabled,
   isCopied,
   isSpeaking,
   onCopy,
@@ -295,12 +293,10 @@ export const QACardItem = React.memo(function QACardItem({
               isStreaming={item.isStreaming}
               fontSizePx={fontSizePx}
             />
+          ) : item.isStreaming ? (
+            <span className="inline-block h-4 w-1.5 animate-pulse rounded-sm bg-sky-400/80 align-middle" />
           ) : (
-            <p className="text-xs text-slate-400">
-              {dsaModeEnabled
-                ? "Parsing problem & preparing structured DSA teleprompter..."
-                : "Generating personalized human answer..."}
-            </p>
+            <span className="text-xs text-slate-500/80">...</span>
           )}
         </div>
       </div>

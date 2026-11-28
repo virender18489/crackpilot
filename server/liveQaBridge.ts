@@ -4,7 +4,6 @@ import { WebSocket, WebSocketServer } from "ws";
 import {
   GoogleGenAI,
   Modality,
-  ThinkingLevel,
   type LiveServerMessage,
 } from "@google/genai";
 import {
@@ -126,14 +125,122 @@ export function attachLiveQaWebSocketServer(
   };
 
   const wss = new WebSocketServer({ noServer: true });
+  const dgProxyWss = new WebSocketServer({ noServer: true });
 
   httpServer.on("upgrade", (req, socket, head) => {
     const pathname = (req.url || "").split("?")[0];
-    if (pathname !== "/ws/live-qa") {
+    if (pathname === "/ws/live-qa") {
+      wss.handleUpgrade(req, socket, head, (ws) => {
+        wss.emit("connection", ws, req);
+      });
       return;
     }
-    wss.handleUpgrade(req, socket, head, (ws) => {
-      wss.emit("connection", ws, req);
+    if (pathname === "/ws/deepgram") {
+      dgProxyWss.handleUpgrade(req, socket, head, (ws) => {
+        dgProxyWss.emit("connection", ws, req);
+      });
+      return;
+    }
+  });
+
+  // Ultra-low-latency raw 16kHz linear16 PCM WebSocket proxy to Deepgram Nova-3
+  dgProxyWss.on("connection", (clientWs) => {
+    const dgKey = readCleanKey("DEEPGRAM_API_KEY");
+    if (!dgKey) {
+      try {
+        clientWs.send(
+          JSON.stringify({ type: "Error", message: "DEEPGRAM_API_KEY not configured." })
+        );
+      } catch {
+        // Ignore
+      }
+      clientWs.close(1011, "Missing DEEPGRAM_API_KEY");
+      return;
+    }
+
+    let upstream: WebSocket | null = null;
+    let triedFallbackLang = false;
+    let closedByClient = false;
+    const pendingBuffers: Buffer[] = [];
+
+    const connectUpstream = (lang: "en-IN" | "en") => {
+      if (closedByClient) return;
+      const dgUrl = buildDeepgramLiveWsUrl(lang, true);
+      const ws = new WebSocket(dgUrl, {
+        headers: {
+          Authorization: `Token ${dgKey}`,
+        },
+      });
+      upstream = ws;
+
+      ws.on("open", () => {
+        if (closedByClient) {
+          ws.close();
+          return;
+        }
+        if (clientWs.readyState === WebSocket.OPEN) {
+          clientWs.send(
+            JSON.stringify({ type: "DeepgramReady", model: "nova-3", language: lang })
+          );
+        }
+        while (pendingBuffers.length > 0 && ws.readyState === WebSocket.OPEN) {
+          const buf = pendingBuffers.shift();
+          if (buf) ws.send(buf);
+        }
+      });
+
+      ws.on("message", (data, isBinary) => {
+        if (clientWs.readyState === WebSocket.OPEN) {
+          clientWs.send(isBinary ? data : data.toString());
+        }
+      });
+
+      ws.on("error", () => {
+        if (!triedFallbackLang && lang === "en-IN" && !closedByClient) {
+          triedFallbackLang = true;
+          connectUpstream("en");
+        }
+      });
+
+      ws.on("close", (code) => {
+        if (
+          !triedFallbackLang &&
+          lang === "en-IN" &&
+          !closedByClient &&
+          code !== 1000
+        ) {
+          triedFallbackLang = true;
+          connectUpstream("en");
+          return;
+        }
+        if (!closedByClient && clientWs.readyState === WebSocket.OPEN) {
+          clientWs.close();
+        }
+      });
+    };
+
+    connectUpstream("en-IN");
+
+    clientWs.on("message", (data, isBinary) => {
+      if (upstream && upstream.readyState === WebSocket.OPEN) {
+        upstream.send(isBinary ? data : data.toString());
+      } else if (isBinary && pendingBuffers.length < 40) {
+        pendingBuffers.push(
+          Buffer.isBuffer(data) ? data : Buffer.from(data as ArrayBuffer)
+        );
+      }
+    });
+
+    clientWs.on("close", () => {
+      closedByClient = true;
+      if (upstream && upstream.readyState === WebSocket.OPEN) {
+        try {
+          upstream.send(JSON.stringify({ type: "CloseStream" }));
+        } catch {
+          // Ignore
+        }
+        upstream.close();
+      }
     });
   });
 
@@ -226,8 +333,8 @@ export function attachLiveQaWebSocketServer(
             const { emittedChars } = await streamGroqChatCompletion({
               apiKey: groqKey,
               signal: abortController.signal,
-              temperature: 0.72,
-              maxTokens: 340,
+              temperature: 0.75,
+              maxTokens: 220,
               messages: [
                 { role: "system", content: systemPrompt },
                 ...conversationHistory.slice(-4),
@@ -262,7 +369,9 @@ export function attachLiveQaWebSocketServer(
               contents: geminiPrompt,
               config: {
                 systemInstruction: systemPrompt,
-                thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+                temperature: 0.75,
+                maxOutputTokens: 240,
+                thinkingConfig: { thinkingBudget: 0 },
               },
             });
 

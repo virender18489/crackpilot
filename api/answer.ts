@@ -258,8 +258,8 @@ export default async function handler(
           { role: "system", content: systemPrompt },
           { role: "user", content: userPrompt },
         ],
-        temperature: 0.2,
-        maxTokens: isCodeReq || useDsaFollowUp ? 1400 : 150,
+        temperature: 0.75,
+        maxTokens: isCodeReq || useDsaFollowUp ? 1400 : 220,
         onMeta: (model) => {
           sendEvent({ meta: { engine: "groq", model } });
         },
@@ -327,8 +327,8 @@ export default async function handler(
         contents: userPrompt,
         config: {
           systemInstruction: systemPrompt,
-          temperature: 0.2,
-          maxOutputTokens: isCodeReq || useDsaFollowUp ? 1400 : 220,
+          temperature: 0.75,
+          maxOutputTokens: isCodeReq || useDsaFollowUp ? 1400 : 240,
           thinkingConfig: { thinkingBudget: 0 },
         },
       });

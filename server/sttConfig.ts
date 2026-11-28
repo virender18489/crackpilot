@@ -55,7 +55,10 @@ export function buildDeepgramListenUrl(
   return `https://api.deepgram.com/v1/listen?${params.toString()}`;
 }
 
-export function buildDeepgramLiveWsUrl(langCode: "en-IN" | "en" = "en-IN"): string {
+export function buildDeepgramLiveWsUrl(
+  langCode: "en-IN" | "en" = "en-IN",
+  includeKeyterms = true
+): string {
   const params = new URLSearchParams();
   params.set("model", "nova-3");
   params.set("language", langCode);
@@ -63,13 +66,53 @@ export function buildDeepgramLiveWsUrl(langCode: "en-IN" | "en" = "en-IN"): stri
   params.set("sample_rate", "16000");
   params.set("channels", "1");
   params.set("smart_format", "true");
+  params.set("punctuate", "true");
   params.set("interim_results", "true");
-  params.set("endpointing", "550");
-  params.set("utterance_end_ms", "850");
-  for (const term of TECH_KEYTERMS) {
-    params.append("keyterm", term);
+  params.set("endpointing", "500");
+  params.set("utterance_end_ms", "1000");
+  if (includeKeyterms) {
+    for (const term of TECH_KEYTERMS) {
+      params.append("keyterm", term);
+    }
   }
   return `wss://api.deepgram.com/v1/listen?${params.toString()}`;
+}
+
+/**
+ * Mints a short-lived Deepgram temporary JWT (60s TTL) via /v1/auth/grant so browser/Electron
+ * clients can stream continuous 16kHz PCM directly to wss://api.deepgram.com/v1/listen
+ * without ever exposing the permanent DEEPGRAM_API_KEY.
+ */
+export async function requestDeepgramShortLivedToken(
+  apiKey: string,
+  ttlSeconds = 60
+): Promise<{ accessToken: string; expiresIn: number } | null> {
+  try {
+    const resp = await fetch("https://api.deepgram.com/v1/auth/grant", {
+      method: "POST",
+      headers: {
+        Authorization: `Token ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ ttl_seconds: ttlSeconds }),
+    });
+    if (!resp.ok) {
+      return null;
+    }
+    const payload = (await resp.json()) as {
+      access_token?: string;
+      expires_in?: number;
+    };
+    if (payload.access_token && typeof payload.access_token === "string") {
+      return {
+        accessToken: payload.access_token,
+        expiresIn: Number(payload.expires_in) || ttlSeconds,
+      };
+    }
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 /**

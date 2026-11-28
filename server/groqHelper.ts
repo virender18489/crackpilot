@@ -2,9 +2,10 @@ export const GROQ_MODELS_URL = "https://api.groq.com/openai/v1/models";
 export const GROQ_CHAT_COMPLETIONS_URL =
   "https://api.groq.com/openai/v1/chat/completions";
 
-export const DEFAULT_GROQ_CHAT_MODEL = "openai/gpt-oss-20b";
+export const DEFAULT_GROQ_CHAT_MODEL = "llama-3.3-70b-versatile";
 
 export const PREFERRED_GROQ_MODELS = [
+  "llama-3.3-70b-versatile",
   "openai/gpt-oss-20b",
   "llama-3.1-8b-instant",
   "openai/gpt-oss-120b",
@@ -145,8 +146,8 @@ export async function streamGroqChatCompletion(
     const requestPayload: Record<string, unknown> = {
       model,
       stream: true,
-      temperature: params.temperature ?? 0.2,
-      max_tokens: params.maxTokens ?? 180,
+      temperature: params.temperature ?? 0.75,
+      max_tokens: params.maxTokens ?? 220,
       messages: params.messages,
     };
     if (isGptOssReasoning) {
