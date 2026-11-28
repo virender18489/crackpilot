@@ -192,16 +192,44 @@ function createWindow() {
     logError("CRITICAL preload-error in", preloadFile, error);
   });
 
-  const distIndex = path.join(__dirname, "../dist/index.html");
-  let fellBackToLocal = false;
+  // Always load the live hosted Vercel URL (never stale local file:// dist/index.html)
+  // so every Vercel deployment appears immediately inside the desktop app without rebuilding .exe.
+  const configuredUrl = (
+    process.env.CRACKPILOT_APP_URL || PRODUCTION_OVERLAY_URL
+  ).trim();
+  const targetUrl = configuredUrl.includes("mode=software")
+    ? configuredUrl
+    : configuredUrl.includes("?")
+      ? `${configuredUrl}&mode=software`
+      : `${configuredUrl}?mode=software`;
 
-  const loadLocalFallback = (reason) => {
-    if (fellBackToLocal || win.isDestroyed()) return;
-    fellBackToLocal = true;
-    logError("Falling back to local packaged UI:", reason);
-    win.loadFile(distIndex, { query: { mode: "software" } }).catch((loadErr) => {
-      logError("Fallback loadFile failed:", loadErr);
-    });
+  let retryCount = 0;
+  const loadLiveVercelUrl = async () => {
+    if (win.isDestroyed()) return;
+    try {
+      await session.defaultSession.clearCache();
+      await session.defaultSession.clearStorageData({
+        storages: ["cachestorage", "serviceworkers"],
+      });
+    } catch (cacheErr) {
+      logError("clearCache warning:", cacheErr);
+    }
+    if (win.isDestroyed()) return;
+    logInfo("Loading live hosted Vercel overlay:", targetUrl);
+    try {
+      await win.loadURL(targetUrl, {
+        extraHeaders:
+          "pragma: no-cache\nCache-Control: no-cache, no-store, must-revalidate\n",
+      });
+    } catch (err) {
+      logError("loadURL failed:", err?.message || String(err));
+      if (retryCount < 2 && !win.isDestroyed()) {
+        retryCount += 1;
+        setTimeout(() => {
+          void loadLiveVercelUrl();
+        }, 1500);
+      }
+    }
   };
 
   win.webContents.on(
@@ -212,8 +240,11 @@ function createWindow() {
       logError(
         `did-fail-load (${errorCode}): ${errorDescription} | URL: ${validatedURL}`
       );
-      if (isMainFrame && /^https?:\/\//i.test(validatedURL || "")) {
-        loadLocalFallback(`${errorDescription} (${errorCode})`);
+      if (isMainFrame && retryCount < 2 && !win.isDestroyed()) {
+        retryCount += 1;
+        setTimeout(() => {
+          void loadLiveVercelUrl();
+        }, 1500);
       }
     }
   );
@@ -222,45 +253,7 @@ function createWindow() {
     logError("Renderer process gone:", details);
   });
 
-  // Always load the live hosted Vercel overlay URL in production so UI/API updates
-  // appear automatically in the .exe without re-downloading, while keeping preload.cjs attached.
-  const useLocalOnly = process.env.CRACKPILOT_USE_LOCAL === "1";
-  const configuredUrl = (
-    process.env.CRACKPILOT_APP_URL || PRODUCTION_OVERLAY_URL
-  ).trim();
-
-  if (!useLocalOnly && /^https?:\/\//i.test(configuredUrl)) {
-    const targetUrl = configuredUrl.includes("mode=software")
-      ? configuredUrl
-      : configuredUrl.includes("?")
-        ? `${configuredUrl}&mode=software`
-        : `${configuredUrl}?mode=software`;
-    logInfo("Clearing Electron HTTP/asset cache before loading live overlay:", targetUrl);
-    (async () => {
-      try {
-        await session.defaultSession.clearCache();
-        await session.defaultSession.clearStorageData({
-          storages: ["cachestorage", "serviceworkers"],
-        });
-      } catch (cacheErr) {
-        logError("clearCache warning:", cacheErr);
-      }
-      if (win.isDestroyed()) return;
-      try {
-        await win.loadURL(targetUrl, {
-          extraHeaders:
-            "pragma: no-cache\nCache-Control: no-cache, no-store, must-revalidate\n",
-        });
-      } catch (err) {
-        loadLocalFallback(err?.message || String(err));
-      }
-    })();
-  } else {
-    logInfo("Loading local packaged UI:", distIndex);
-    win.loadFile(distIndex, { query: { mode: "software" } }).catch((err) => {
-      logError("loadFile failed:", err);
-    });
-  }
+  void loadLiveVercelUrl();
 
   // Enforce fresh authentication gate on every .exe launch (never auto-login from saved storage)
   win.webContents.on("dom-ready", () => {
@@ -522,8 +515,17 @@ function registerIpcHandlers() {
   });
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
   logInfo(`Electron app ready (v${APP_VERSION}, platform=${process.platform}).`);
+  try {
+    await session.defaultSession.clearCache();
+    await session.defaultSession.clearStorageData({
+      storages: ["cachestorage", "serviceworkers"],
+    });
+    logInfo("Session cache cleared on launch.");
+  } catch (cacheErr) {
+    logError("Launch clearCache warning:", cacheErr);
+  }
 
   const allowedPermissions = new Set([
     "media",
